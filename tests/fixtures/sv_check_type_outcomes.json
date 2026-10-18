@@ -1,0 +1,353 @@
+[
+  {
+    "case": "any",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "none",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "none_type",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "none_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type None, got 0"
+    }
+  },
+  {
+    "case": "plain_int",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "plain_int_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type <class 'int'>, got '3'"
+    }
+  },
+  {
+    "case": "bool_is_int",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "int_not_bool",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type <class 'bool'>, got 1"
+    }
+  },
+  {
+    "case": "plain_list",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "class_tuple_hint",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "union",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "union_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type int | str, got 1.5"
+    }
+  },
+  {
+    "case": "pipe_union",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "pipe_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type int | None, got 'x'"
+    }
+  },
+  {
+    "case": "literal_int",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "literal_str",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "literal_bool_not_int",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type typing.Literal[1], got True"
+    }
+  },
+  {
+    "case": "literal_int_not_bool",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type typing.Literal[True], got 1"
+    }
+  },
+  {
+    "case": "literal_eq_raises",
+    "outcome": {
+      "exception": "ValueError",
+      "message": "eq boom"
+    }
+  },
+  {
+    "case": "tuple_fixed",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "tuple_length",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type tuple[int, str], got (1,)"
+    }
+  },
+  {
+    "case": "tuple_element",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type tuple[int, str], got (1, 2)"
+    }
+  },
+  {
+    "case": "tuple_variadic",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "tuple_variadic_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type tuple[int, ...], got (1, 'x')"
+    }
+  },
+  {
+    "case": "tuple_empty_hint_empty",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "tuple_empty_hint_nonempty",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "tuple_wrong_origin",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type tuple[int], got []"
+    }
+  },
+  {
+    "case": "list_nested",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "list_nested_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type list[list[int]], got [[1], ['x']]"
+    }
+  },
+  {
+    "case": "set",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "set_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type set[int], got {'x'}"
+    }
+  },
+  {
+    "case": "frozenset",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "frozenset_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type frozenset[int], got frozenset({'x'})"
+    }
+  },
+  {
+    "case": "dict",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "dict_key_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type dict[str, list[int]], got {1: [2]}"
+    }
+  },
+  {
+    "case": "dict_value_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type dict[str, list[int]], got {'x': ['bad']}"
+    }
+  },
+  {
+    "case": "mapping",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "iterable",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "iterable_nested",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "iterable_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type collections.abc.Iterable[int], got ['x']"
+    }
+  },
+  {
+    "case": "iterator_consumed",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "user_iter_raises",
+    "outcome": {
+      "exception": "RuntimeError",
+      "message": "iter boom"
+    }
+  },
+  {
+    "case": "callable_signature_ignored",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "callable_ellipsis",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "callable_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type typing.Callable[[int], str], got 3"
+    }
+  },
+  {
+    "case": "user_class",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "user_subclass",
+    "outcome": {
+      "return": null
+    }
+  },
+  {
+    "case": "user_class_mismatch",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type <class 'sv_check_type_cases.User'>, got 3"
+    }
+  },
+  {
+    "case": "unsupported_hint",
+    "outcome": {
+      "exception": "NotImplementedError",
+      "message": "check_type: unsupported type hint sv_check_type_cases.Box[int]"
+    }
+  },
+  {
+    "case": "unsupported_wrong_origin",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "expected value of type sv_check_type_cases.Box[int], got 3"
+    }
+  },
+  {
+    "case": "malformed_not_class",
+    "outcome": {
+      "exception": "TypeError",
+      "message": "isinstance() arg 2 must be a type, a tuple of types, or a union"
+    }
+  },
+  {
+    "case": "malformed_list_arity",
+    "outcome": {
+      "exception": "ValueError",
+      "message": "too many values to unpack (expected 1, got 2)"
+    }
+  },
+  {
+    "case": "malformed_mapping_short",
+    "outcome": {
+      "exception": "ValueError",
+      "message": "not enough values to unpack (expected 2, got 1)"
+    }
+  },
+  {
+    "case": "malformed_mapping_long",
+    "outcome": {
+      "exception": "ValueError",
+      "message": "too many values to unpack (expected 2, got 3)"
+    }
+  }
+]

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tharkun"
+version = "0.2.0"  # keep in sync with tharkun.__version__ (tests/test_version_sync.py)
+description = "Python branch guard solver and analysis toolkit"
+readme = "README.md"
+requires-python = ">=3.10"  # PEP 604 unions and `match` are used unguarded (#0605)
+license = {text = "EUPL-1.2"}
+
+dependencies = ["hypothesis>=6.0", "z3-solver>=4.12", "PyYAML>=6.0"]
+
+[project.optional-dependencies]
+# Layer-named extras (0.2.0; the layer table is docs/LAYERS.md).  The core,
+# tharkun.solve, needs nothing beyond the stdlib.
+search     = ["hypothesis>=6.0"]   # property search
+avengers   = ["hypothesis>=6.0"]                              # object recipes + boundary search
+# Live object-synthesis backends. Each is availability-gated at runtime, so the
+# portfolio degrades to whatever is installed rather than failing; black is
+# ghostwriter's formatter and pynguin needs it too.
+backends   = ["hypothesis>=6.0", "pynguin>=0.46", "black"]
+# fuzz: Atheris 3.1.0 and the FDP codec are verified on CPython 3.14.4.
+# Hypothesis supplies regex and property search.
+fuzz       = ["atheris>=3.0,<4", "hypothesis>=6.0"]
+# Pre-0.2.0 extra names: kept for one release as aliases of the above.
+hypothesis = ["hypothesis>=6.0"]
+hybrid     = ["atheris>=3.0,<4", "hypothesis>=6.0"]
+all        = ["hypothesis>=6.0"]
+dev        = ["pytest>=7.0", "hypothesis>=6.0"]
+
+[project.scripts]
+tharkun = "tharkun.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+.hypothesis/
+.pytest_cache/
+*.egg
+__pycache__/
+tests/__pycache__/
+*.pyc
+.pytest_cache/
+.claude/
+
+# IDE
+.idea/
+.benchmark-venvs/
+benchmarks/avengers/results*.jsonl
+# Pynguin's statistics directory, written relative to the project it analyses.
+pynguin-report/
+proofs/

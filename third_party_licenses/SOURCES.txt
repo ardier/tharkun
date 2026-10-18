@@ -1,0 +1,26 @@
+Sources of the licence texts in this directory (fetched 2026-10-16; SHA-256 of each file below):
+- *-LICENSE.txt of OpenSSL, SQLite, zlib, bzip2, liblzma, Expat, mpdecimal, libffi, ncurses, libedit, libuuid:
+  python/licenses/ of https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.14.4%2B20260414-x86_64-unknown-linux-gnu-pgo%2Blto-full.tar.zst
+  (SHA-256 fe3c06110450ec03eec298b69dfb888baf746ad17b8fd83916ee3ebab7d04621, as listed in that release's SHA256SUMS), unchanged, renamed.
+- Zstandard-1.5.7-LICENSE.txt: https://raw.githubusercontent.com/facebook/zstd/v1.5.7/LICENSE (that full archive carries no zstd text).
+- LibYAML-0.2.5-LICENSE.txt: https://raw.githubusercontent.com/yaml/libyaml/0.2.5/License (the PyYAML 6.0.3 wheel links LibYAML 0.2.5).
+- libFuzzer-LLVM-compiler-rt-LICENSE.txt: https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-20.1.0/compiler-rt/LICENSE.TXT
+  (fetched 2026-10-19; the libFuzzer that the Atheris 3.1.0 wheel embeds; the wheel does not state its LLVM version).
+- Not listed below: CPython-3.14.4, hypothesis-6.168.5, PyYAML-6.0.3 and sortedcontainers-2.4.0 LICENSE texts are copied by the build from the bundled distributions themselves (python/lib/python3.14/LICENSE.txt and the wheels' dist-info); see LICENSE.
+
+074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff  Apache-2.0.txt
+1f38bbc7caacafd65169276d759c0d88c991b753b643ce35d0e45ea1971dd441  bzip2-1.0.8-LICENSE.txt
+122f2c27000472a201d337b9b31f7eb2b52d091b02857061a8880371612d9534  Expat-2.6.3-LICENSE.txt
+29cea33c32bbc9785142386377915612a2fa786482c46843383384aded2e09b1  libedit-LICENSE.txt
+deaf3a42effb551a5b140fa9afefed183a27f1341c6d1bf430d106a5e6931fc0  libffi-LICENSE.txt
+9a4062de0a2c388a98cf35a35d348b62fa97c838a71c3c28ee1a2d7d0a565b02  liblzma-5.8.1-LICENSE.txt
+122ee1f7e258f2c3c0e538a75c037684f420454bf3850ddc74ce750bbf5fe86b  libuuid-LICENSE.txt
+c40112449f254b9753045925248313e9270efa36d226b22d82d4cc6c43c57f29  LibYAML-0.2.5-LICENSE.txt
+1a8f1058753f1ba890de984e48f0242a3a5c29a6a8f2ed9fd813f36985387e8d  libFuzzer-LLVM-compiler-rt-LICENSE.txt
+669512af7219f58be03a398766d7c9da11a3b3df9d3f05cb74c5ceca25c8da3b  mpdecimal-4.0.0-LICENSE.txt
+87a4c4442337b8968ef956031c406b74f9cb7149b7ba87311bdaba534816201c  ncurses-6.5-LICENSE.txt
+7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a  OpenSSL-3.5.6-LICENSE.txt
+38bef3d28b24f145ea293bd3b6eb4b20396982abc8303128fb493986ea5bc719  SQLite-3.50.4-LICENSE.txt
+e617cad2ab9347e3129c2b171e87909332174e17961c5c3412d0799469111337  z3-solver-5.1.0.0-LICENSE.txt
+818922b2620f12801a12bf78e399644a30990e66824abd8ca8ec24d451d6f92c  zlib-1.3.1-LICENSE.txt
+7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8  Zstandard-1.5.7-LICENSE.txt

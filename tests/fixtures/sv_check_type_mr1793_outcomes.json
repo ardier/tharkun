@@ -1,0 +1,88 @@
+{
+  "outcomes": {
+    "binding:duplicate-value": {
+      "exception": "TypeError"
+    },
+    "binding:extra-positional": {
+      "exception": "TypeError"
+    },
+    "binding:missing-value": {
+      "exception": "TypeError"
+    },
+    "hook:class-attribute:AssertionError": {
+      "exception": "AssertionError"
+    },
+    "hook:class-attribute:AttributeError": {
+      "exception": "TypeError"
+    },
+    "hook:class-attribute:FloatingPointError": {
+      "exception": "FloatingPointError"
+    },
+    "hook:class-attribute:IndexError": {
+      "exception": "IndexError"
+    },
+    "hook:class-attribute:KeyError": {
+      "exception": "KeyError"
+    },
+    "hook:class-attribute:TypeError": {
+      "exception": "TypeError"
+    },
+    "hook:class-attribute:ZeroDivisionError": {
+      "exception": "ZeroDivisionError"
+    },
+    "hook:metaclass:AssertionError": {
+      "exception": "AssertionError"
+    },
+    "hook:metaclass:AttributeError": {
+      "exception": "AttributeError"
+    },
+    "hook:metaclass:FloatingPointError": {
+      "exception": "FloatingPointError"
+    },
+    "hook:metaclass:IndexError": {
+      "exception": "IndexError"
+    },
+    "hook:metaclass:KeyError": {
+      "exception": "KeyError"
+    },
+    "hook:metaclass:TypeError": {
+      "exception": "TypeError"
+    },
+    "hook:metaclass:ZeroDivisionError": {
+      "exception": "ZeroDivisionError"
+    },
+    "match:bool": {
+      "return": null
+    },
+    "match:bool-as-int": {
+      "return": null
+    },
+    "match:dict": {
+      "return": null
+    },
+    "match:float": {
+      "return": null
+    },
+    "match:int": {
+      "return": null
+    },
+    "match:list": {
+      "return": null
+    },
+    "match:str": {
+      "return": null
+    },
+    "mismatch:int-as-str": {
+      "exception": "TypeError"
+    },
+    "repr:list-mismatch": {
+      "exception": "AssertionError"
+    },
+    "repr:tuple-mismatch": {
+      "exception": "AssertionError"
+    }
+  },
+  "probe_sha256": "18ad16dc76c50f4861a5a1a8d901d7b8efa6d14546fee7d8b2a09c400d989f74",
+  "upstream": "SV-Benchmarks python/_sv_verifier.py (MR1793)::check_type",
+  "upstream_sha256": "05250b420e1f0c69a7ef4d7e4c1f09c5b550c41de1c3d75c4a293d1baa5c4100"
+}

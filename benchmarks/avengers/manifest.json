@@ -1,0 +1,74 @@
+{
+  "$comment": [
+    "Subjects for the Avengers object-synthesis benchmark.",
+    "",
+    "These ten packages are the pure-Python Pynguin corpus from Lukasczyk et al.,",
+    "'An empirical study of automated unit test generation for Python' (EMSE 2023).",
+    "They are NOT the DS-C corpus of Berg et al. (arXiv:2603.06107), which targets",
+    "C-extension modules; that paper is followed here for its crash handling and its",
+    "statistical protocol, not for its subjects. Saying which corpus a number came",
+    "from is the difference between a comparable result and a misleading one.",
+    "",
+    "Two profiles. 'emse-3.10' pins the versions that study used, on the interpreter",
+    "it used, so coverage numbers are comparable to the published baseline.",
+    "'current-3.12' takes whatever installs today and exists for fast iteration and",
+    "smoke runs; its numbers are NOT comparable to the published ones.",
+    "The smoke set is codetiming (the case study) and docstring_parser. python-string-utils is deliberately not in it: every class it defines is private, so it has no object-synthesis subjects at all -- a fine thing for the full corpus to report, and a useless smoke test."
+  ],
+  "profiles": {
+    "emse-3.10": {
+      "python": "3.10",
+      "comparable_to": "Lukasczyk et al., EMSE 2023",
+      "subjects": {
+        "apimd": "apimd==1.2.1",
+        "codetiming": "codetiming==1.3.0",
+        "dataclasses-json": "dataclasses-json==0.5.2",
+        "docstring_parser": "docstring_parser==0.7.3",
+        "flake8": "flake8==3.9.0",
+        "flutes": "flutes==0.3.0",
+        "flutils": "flutils==0.7",
+        "httpie": "httpie==2.4.0",
+        "pdir2": "pdir2==0.3.2",
+        "python-string-utils": "python-string-utils==1.0.0"
+      }
+    },
+    "current-3.12": {
+      "python": "3.12",
+      "comparable_to": null,
+      "subjects": {
+        "apimd": "apimd",
+        "codetiming": "codetiming",
+        "dataclasses-json": "dataclasses-json",
+        "docstring_parser": "docstring_parser",
+        "flake8": "flake8",
+        "flutes": "flutes",
+        "flutils": "flutils",
+        "httpie": "httpie",
+        "pdir2": "pdir2",
+        "python-string-utils": "python-string-utils"
+      }
+    }
+  },
+  "import_names": {
+    "apimd": "apimd",
+    "codetiming": "codetiming",
+    "dataclasses-json": "dataclasses_json",
+    "docstring_parser": "docstring_parser",
+    "flake8": "flake8",
+    "flutes": "flutes",
+    "flutils": "flutils",
+    "httpie": "httpie",
+    "pdir2": "pdir",
+    "python-string-utils": "string_utils"
+  },
+  "smoke": [
+    "codetiming",
+    "docstring_parser"
+  ],
+  "backends": [
+    "hypothesis>=6.0",
+    "crosshair-tool>=0.0.110",
+    "pynguin>=0.46",
+    "black"
+  ]
+}

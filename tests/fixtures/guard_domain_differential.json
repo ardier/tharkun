@@ -1,0 +1,220 @@
+{
+ "corpus": "eregion-toys/toys/packs/*/fixtures/02_ir.json (guard assumes) + source.py",
+ "pool_size": 117,
+ "totals": {
+  "cases": 1051,
+  "decidable": 666,
+  "eregion_unsound_by_type_cases": 423,
+  "eregion_unsound_by_type_values": 8593,
+  "from_rendered": 142,
+  "from_source": 563,
+  "tighter_cases": 70,
+  "tighter_values": 3901,
+  "undecided": 39,
+  "units_multi": 116,
+  "units_single": 589,
+  "wider_eregion_unsound_cases": 423,
+  "wider_eregion_unsound_values": 8593,
+  "wider_other_type_cases": 402,
+  "wider_other_type_values": 6939
+ },
+ "label_agreement": {
+  "same": 1017,
+  "cases": 1051
+ },
+ "label_pairs": {
+  "guard_only -> guard_only": 512,
+  "int_set -> int_set": 198,
+  "int_neq -> int_neq": 106,
+  "int_range_low_open -> int_range_low_open": 62,
+  "int_range_closed -> int_range_closed": 55,
+  "int_range_high_open -> int_range_high_open": 53,
+  "guard_only -> container_length": 12,
+  "str_set -> str_set": 9,
+  "guard_only -> int_neq": 9,
+  "guard_only -> int_set": 8,
+  "str_neq -> str_neq": 7,
+  "is_none -> is_none": 4,
+  "bytes_set -> bytes_set": 4,
+  "float_set -> float_set": 4,
+  "top -> guard_only": 3,
+  "bytes_neq -> bytes_neq": 3,
+  "guard_only -> top": 2
+ },
+ "label_mismatch_examples": {
+  "guard_only -> container_length": [
+   "0091_eqsat_u64_rounds: inp: len(inp) < 8",
+   "0091_eqsat_u64_rounds: inp: not isinstance(inp, str) and len(inp) < 8",
+   "0091_eqsat_u64_rounds: inp: not len(inp) < 8",
+   "0091_eqsat_u64_rounds: inp: not isinstance(inp, str) and (not len(inp) < 8)",
+   "0091_eqsat_u64_rounds: s: not not (len(s) >= 3 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X'))"
+  ],
+  "guard_only -> int_neq": [
+   "0158_power_const_small: x: x not in (0, 1, 2)",
+   "0479_bit_packed_tag_3subfield: is_constructed: not not (0 <= tag_class and tag_class <= 3) and is_constructed not in (0, 1)",
+   "0479_bit_packed_tag_3subfield: is_constructed: is_constructed not in (0, 1)",
+   "0479_bit_packed_tag_3subfield: is_constructed: (not not (0 <= tag_class and tag_class <= 3) and is_constructed not in (0, 1)) and is_constructed not in (0, 1)",
+   "0480_indefinite_trailer_coherence: length_form: length_form not in (0, 1, 2)"
+  ],
+  "guard_only -> int_set": [
+   "0158_power_const_small: x: not x not in (0, 1, 2)",
+   "0479_bit_packed_tag_3subfield: is_constructed: not not (0 <= tag_class and tag_class <= 3) and (not is_constructed not in (0, 1))",
+   "0479_bit_packed_tag_3subfield: is_constructed: not is_constructed not in (0, 1)",
+   "0479_bit_packed_tag_3subfield: is_constructed: (not not (0 <= tag_class and tag_class <= 3) and (not is_constructed not in (0, 1))) and (not is_constructed not in (0, 1)) and (not 0 <= tag_number <= 30)",
+   "0479_bit_packed_tag_3subfield: is_constructed: (not not (0 <= tag_class and tag_class <= 3) and (not is_constructed not in (0, 1))) and (not is_constructed not in (0, 1)) and (not not 0 <= tag_number <= 30)"
+  ],
+  "guard_only -> top": [
+   "0460_composite_json_shape: int: isinstance(x, str)",
+   "0460_composite_json_shape: int: isinstance(x, str) and isinstance(x, str)"
+  ],
+  "top -> guard_only": [
+   "0091_eqsat_u64_rounds: parsed: not parsed is None",
+   "0227_numpy_bool_optional: np: not np is None",
+   "0228_numpy_int_optional: np: not np is None"
+  ]
+ },
+ "eregion_unsound_by_type_breakdown": {
+  "doc": "eregion domain kind : class of a value that takes the arm but is outside the kind's type family -> number of cases",
+  "counts": {
+   "int_set:float-integral": 166,
+   "int_set:bool": 147,
+   "int_neq:float": 89,
+   "int_neq:float-integral": 89,
+   "int_neq:float-nan": 89,
+   "int_neq:NoneType": 89,
+   "int_neq:str": 89,
+   "int_neq:bytes": 89,
+   "int_neq:list": 89,
+   "int_neq:tuple": 89,
+   "int_neq:set": 89,
+   "int_neq:frozenset": 89,
+   "int_neq:dict": 89,
+   "int_neq:bool": 85,
+   "int_range_low_open:float-integral": 62,
+   "int_range_low_open:float": 61,
+   "int_range_high_open:float": 53,
+   "int_range_high_open:float-integral": 51,
+   "int_range_closed:float-integral": 43,
+   "int_range_high_open:bool": 42,
+   "int_range_low_open:float-nan": 30,
+   "int_range_high_open:float-nan": 26,
+   "int_range_closed:float": 25,
+   "int_range_closed:bool": 25,
+   "int_range_low_open:bool": 16,
+   "str_neq:int": 7,
+   "str_neq:float": 7,
+   "str_neq:float-integral": 7,
+   "str_neq:float-nan": 7,
+   "str_neq:bool": 7,
+   "str_neq:NoneType": 7,
+   "str_neq:bytes": 7,
+   "str_neq:list": 7,
+   "str_neq:tuple": 7,
+   "str_neq:set": 7,
+   "str_neq:frozenset": 7,
+   "str_neq:dict": 7,
+   "int_range_closed:float-nan": 5,
+   "bytes_neq:int": 3,
+   "bytes_neq:float": 3,
+   "bytes_neq:float-integral": 3,
+   "bytes_neq:float-nan": 3,
+   "bytes_neq:bool": 3,
+   "bytes_neq:NoneType": 3,
+   "bytes_neq:str": 3,
+   "bytes_neq:list": 3,
+   "bytes_neq:tuple": 3,
+   "bytes_neq:set": 3,
+   "bytes_neq:frozenset": 3,
+   "bytes_neq:dict": 3
+  }
+ },
+ "random_guards": {
+  "cases": 8334,
+  "guards": 3570,
+  "reduce_domain_raised": 10,
+  "unconvertible": 430,
+  "unsound_by_type_cases": 1706,
+  "unsound_in_family_cases": 199,
+  "in_family_examples": {
+   "float_range": [
+    {
+     "guard": "not (x > 2.5)",
+     "var": "x",
+     "domain": {
+      "domain_kind": "float_range",
+      "hi": 2.5,
+      "hi_open": false,
+      "guard_only": false
+     },
+     "dropped": [
+      "nan"
+     ]
+    },
+    {
+     "guard": "not (not (not (-0.0 >= x)))",
+     "var": "x",
+     "domain": {
+      "domain_kind": "float_range",
+      "lo": -0.0,
+      "lo_open": true,
+      "guard_only": false
+     },
+     "dropped": [
+      "nan"
+     ]
+    },
+    {
+     "guard": "not (x < -2.5)",
+     "var": "x",
+     "domain": {
+      "domain_kind": "float_range",
+      "lo": -2.5,
+      "lo_open": false,
+      "guard_only": false
+     },
+     "dropped": [
+      "nan"
+     ]
+    },
+    {
+     "guard": "not (x > 1e+300)",
+     "var": "x",
+     "domain": {
+      "domain_kind": "float_range",
+      "hi": 1e+300,
+      "hi_open": false,
+      "guard_only": false
+     },
+     "dropped": [
+      "nan"
+     ]
+    }
+   ],
+   "RAISED": [
+    {
+     "guard": "not ((((y not in (None,)) and (-3 < x <= 10) and (x >= \"a\")) or ((x == 0.0) or (x <= \"m\")) or ((x not in ()) or (len(y) == 1))) or (len(x) != 0) or ((not (x)) or ((x <= -2.5) and (len(y) > 1) and (x < 'm')) or ((x != 255) or (len(x) == 0))))",
+     "var": "x",
+     "error": "TypeError(\"'>' not supported between instances of 'int' and 'str'\")"
+    },
+    {
+     "guard": "not (not (((x <= \"b\") and (x in (1,))) and ((y) and (x))))",
+     "var": "x",
+     "error": "TypeError(\"'<=' not supported between instances of 'int' and 'str'\")"
+    },
+    {
+     "guard": "((x >= 2) and (y <= b'a') and ((x > 9007199254740993) and (y == -2.5) and (not (len(y) > 2.5))))",
+     "var": "y",
+     "error": "TypeError(\"'<=' not supported between instances of 'float' and 'bytes'\")"
+    },
+    {
+     "guard": "not ((((x is not False) and (x > 10) and (x < 1)) or (x != 5)) or (not ((y) and (x <= 'a'))) or (y in range(10, 0, -3)))",
+     "var": "x",
+     "error": "TypeError(\"'<=' not supported between instances of 'int' and 'str'\")"
+    }
+   ]
+  }
+ },
+ "tharkun_unsound_or_narrower": [],
+ "eregion_unsound_in_family": [],
+ "wider_precision_or_undecided": []
+}
