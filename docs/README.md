@@ -19,6 +19,8 @@ public workflows and the boundaries between its internal layers:
   runtime flow, data models, solver chain, extension points, and current gaps.
 - [TESTING.md](TESTING.md) is the test-suite policy: one tier, long tests chunked into parallel nodes, and how the
   kind matrix and the Avengers searches are split.
+- [ZENODO-RELEASES.md](ZENODO-RELEASES.md) describes preparing a validated release
+  as a Zenodo draft for manual review and publication.
 
 ## Recommended Reading Order
 

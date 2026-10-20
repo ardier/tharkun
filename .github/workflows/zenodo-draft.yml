@@ -1,0 +1,53 @@
+name: Prepare Zenodo draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: GitHub release tag with a validated tharkun.zip asset
+        required: true
+        type: string
+      sha256:
+        description: SHA256 of the validated tharkun.zip
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zenodo-draft
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    if: github.repository == 'ardier/tharkun'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check draft-only behavior without credentials
+        run: python3 -m unittest discover -s tests -p test_zenodo_draft.py
+      - name: Download the selected release archive and source tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECTED_SHA256: ${{ inputs.sha256 }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+          [[ "$EXPECTED_SHA256" =~ ^[[:xdigit:]]{64}$ ]]
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern tharkun.zip --dir "$RUNNER_TEMP/zenodo-release"
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+      - name: Create or resume the Zenodo draft
+        env:
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECTED_SHA256: ${{ inputs.sha256 }}
+        run: |
+          python3 scripts/zenodo_draft.py \
+            --archive "$RUNNER_TEMP/zenodo-release/tharkun.zip" \
+            --tag "$RELEASE_TAG" --sha256 "$EXPECTED_SHA256"
