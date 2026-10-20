@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tharkun"
-version = "0.2.0"  # keep in sync with tharkun.__version__ (tests/test_version_sync.py)
+version = "0.2.1"  # keep in sync with tharkun.__version__ (tests/test_version_sync.py)
 description = "Python branch guard solver and analysis toolkit"
 readme = "README.md"
 requires-python = ">=3.10"  # PEP 604 unions and `match` are used unguarded (#0605)

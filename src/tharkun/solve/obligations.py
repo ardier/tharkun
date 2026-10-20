@@ -92,7 +92,7 @@ def witness(source: str, filename: str, specification: str, invariants, *,
     return [{"entry_type": "invariant_set", "metadata": {
         "format_version": "2.3", "uuid": str(uuid4()),
         "creation_time": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        "producer": {"name": "Tharkun", "version": "0.2.0"},
+        "producer": {"name": "Tharkun", "version": "0.2.1"},
         "task": {"input_files": [filename], "input_file_hashes": {filename: digest},
             "specification": specification, "language": "Python"}},
         "content": [i.entry() for i in invariants]}]

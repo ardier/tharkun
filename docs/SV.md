@@ -6,7 +6,8 @@ the verdict as its last line: `TRUE`, `FALSE(E)` or `UNKNOWN(reason)`. The eregi
 BenchExec solver column (the `repos/eregion-sv` submodule, tool-info `eregion_sv.tools.tharkun_sv`).
 
 ```
-python -m tharkun.sv PROGRAM.py|TASK.yml --property P.prp [--python PY] [--budget-seconds S]
+python -m tharkun.sv PROGRAM.py|TASK.yml --property P.prp [--python PY] [--cpu-limit-seconds S]
+                     [--memory-limit-bytes B] [--budget-seconds S] [--run-memory-mb M]
                      [--canary-seconds S] [--run-timeout S] [--witness-out W.json]
 python -m tharkun.sv PROGRAM.py --property P.prp --replay W.json      # CONFIRMED / NOT CONFIRMED
 ```
@@ -458,6 +459,12 @@ unbounded draw (one chain). `--budget-seconds` counts **CPU seconds** of the ver
 which is what BenchExec limits; it also caps the wall clock. Each of a batch's children may run for its
 share of the remaining budget, so a batch of long runs cannot overshoot it. `--run-memory-mb` is shared
 evenly by the concurrent children.
+`--cpu-limit-seconds S` and `--memory-limit-bytes B` are the limits of the whole run (verifier and children), as
+BenchExec enforces them, and the tool-info module passes them unchanged. The verifier derives its own budgets from them
+(`__main__.py::effective_limits`): without `--budget-seconds` the search stops at `max(5, int(0.9 * S))` CPU seconds,
+without `--run-memory-mb` the children together get `max(64, int(0.6 * B) // 2**20)` MiB (the values the tool-info
+module of 0.2.0 passed; 810 s and 8583 MiB at SV-COMP's 900 s and 15 GB). An explicit `--budget-seconds` or
+`--run-memory-mb` takes precedence; without limits the defaults stay 600 s and no cap.
 Concurrent runs reserve that share until completion; ordinary runs have no one-second minimum.
 Fork-server startup consumes the same share before the target's deadline is assigned.
 

@@ -686,6 +686,17 @@ eregion-synthesis) pin them. `tests/test_public_surface.py` is the contract.
   int_constraints` now computes its interval through `refine`, so the static
   solver and the fact domain share one interval intersection.
 
+## [0.2.1] — 2026-10-20
+
+### Added
+
+- `python -m tharkun.sv --cpu-limit-seconds S --memory-limit-bytes B`: the CPU-time and memory limits of the whole run,
+  as BenchExec enforces them. The verifier derives its budgets from them (`sv/__main__.py::effective_limits`): without
+  `--budget-seconds` the search stops at `max(5, int(0.9 * S))` CPU seconds, without `--run-memory-mb` the program's runs
+  together get `max(64, int(0.6 * B) // 2**20)` MiB. These are the values the BenchExec tool-info module of 0.2.0 passed,
+  which now passes the full limits instead. `--budget-seconds` and `--run-memory-mb` keep their meaning and take
+  precedence; without limits the defaults stay 600 seconds and no cap.
+
 ## [0.2.0] — 2026-09-08
 
 The solving core is fenced into `tharkun.solve` and the layering is

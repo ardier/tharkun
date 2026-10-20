@@ -239,3 +239,69 @@ def test_quoted_primary_and_helper_bind_the_real_program_without_output(tmp_path
                          "--budget-seconds", "60", "--max-runs", "5", "--jobs", "1",
                          "--proof-dir", str(tmp_path / "proofs")]) == 0
     assert capsys.readouterr().out.rstrip().endswith("FALSE(IndexError)")
+
+
+# ---------------------------------------------------------------- outer limits (--cpu-limit-seconds, --memory-limit-bytes)
+
+def _tool_info_020(cputime, memory):
+    """What the BenchExec tool-info module of 0.2.0 passed for BenchExec's limits (seconds, bytes)."""
+    budget = max(5, int(cputime * 0.9)) if cputime else None
+    run_memory = max(64, int(memory * 0.6) // 2**20) if memory else None
+    return budget, run_memory
+
+
+@pytest.mark.parametrize("cputime", [None, 1, 5, 6, 60, 899, 900, 901, 1800, 3600, 86400])
+@pytest.mark.parametrize("memory", [None, 1, 100 * 10**6, 2**30, 7 * 10**9, 15 * 10**9, 15 * 2**30, 64 * 10**9])
+def test_limits_give_the_budgets_the_020_tool_info_module_passed(cputime, memory):
+    budget, run_memory = _tool_info_020(cputime, memory)
+    assert sv_main.effective_limits(None, None, cputime and float(cputime), memory) == (
+        600.0 if budget is None else float(budget), 0 if run_memory is None else run_memory)
+
+
+def test_limits_at_sv_comp_values():
+    assert sv_main.effective_limits(None, None, 900.0, 15 * 10**9) == (810.0, 8583)
+
+
+def test_explicit_budgets_take_precedence_over_the_limits():
+    assert sv_main.effective_limits(120.0, 1000, 900.0, 15 * 10**9) == (120.0, 1000)
+    assert sv_main.effective_limits(None, 0, 900.0, 15 * 10**9) == (810.0, 0)  # 0 stays "no cap"
+    assert sv_main.effective_limits(2000.0, None, 900.0, None) == (2000.0, 0)  # used as given, not capped
+
+
+def _captured_limits(tmp_path, monkeypatch, *flags):
+    _, _, args = _task(tmp_path)
+    seen = {}
+
+    def verify(*args, **kwargs):
+        seen.update(budget=kwargs["budget_seconds"], memory=kwargs["run_memory_bytes"])
+        return Verdict("true")
+
+    monkeypatch.setattr(sv_main, "verify", verify)
+    assert sv_main.main([*args, *flags, "--proof-dir", str(tmp_path / "proofs")]) == 0
+    return seen["budget"], seen["memory"]
+
+
+@pytest.mark.parametrize("flags, budget, memory", [
+    ((), 600.0, None),
+    (("--budget-seconds", "810", "--run-memory-mb", "8583"), 810.0, 8583 * 2**20),
+    (("--cpu-limit-seconds", "900", "--memory-limit-bytes", "15000000000"), 810.0, 8583 * 2**20),
+    (("--cpu-limit-seconds", "900"), 810.0, None),
+    (("--memory-limit-bytes", "15000000000"), 600.0, 8583 * 2**20),
+    (("--cpu-limit-seconds", "900", "--budget-seconds", "100"), 100.0, None),
+    (("--memory-limit-bytes", "15000000000", "--run-memory-mb", "0"), 600.0, None),
+    (("--budget-seconds", "100", "--cpu-limit-seconds", "900"), 100.0, None),
+])
+def test_cli_resolves_the_limits(tmp_path, monkeypatch, flags, budget, memory):
+    assert _captured_limits(tmp_path, monkeypatch, *flags) == (budget, memory)
+
+
+@pytest.mark.parametrize("flag, value", [
+    ("--cpu-limit-seconds", "0"), ("--cpu-limit-seconds", "-1"), ("--cpu-limit-seconds", "nan"),
+    ("--cpu-limit-seconds", "inf"), ("--memory-limit-bytes", "0"), ("--memory-limit-bytes", "1.5e10"),
+])
+def test_cli_rejects_a_limit_that_is_not_positive(tmp_path, monkeypatch, flag, value):
+    _, _, args = _task(tmp_path)
+    monkeypatch.setattr(sv_main, "verify", lambda *a, **k: pytest.fail("must not verify"))
+    with pytest.raises(SystemExit) as exit_info:
+        sv_main.main([*args, flag, value])
+    assert exit_info.value.code == 2

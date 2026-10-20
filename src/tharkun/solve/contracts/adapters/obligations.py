@@ -190,7 +190,7 @@ def witness(source: str, filename: str, specification: str, invariants: list[Inv
     return [{"entry_type": "invariant_set", "metadata": {
         "format_version": "2.0", "uuid": str(uuid.uuid4()),
         "creation_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "producer": {"name": "Tharkun", "version": "0.2.0"},
+        "producer": {"name": "Tharkun", "version": "0.2.1"},
         "task": {"input_files": [filename], "input_file_hashes": {
             filename: hashlib.sha256(source.encode("utf-8")).hexdigest()},
             "specification": specification, "data_model": "CPython-3.14-binary64",

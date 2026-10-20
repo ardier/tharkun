@@ -46,7 +46,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-__version__ = "0.2.0"  # keep in sync with pyproject.toml (tests/test_version_sync.py)
+__version__ = "0.2.1"  # keep in sync with pyproject.toml (tests/test_version_sync.py)
 
 # Public name -> home module.  Order mirrors the historical eager import
 # block so ``__all__`` reads the same way the old module did.

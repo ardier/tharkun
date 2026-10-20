@@ -1,7 +1,7 @@
 # Tharkun — SV-COMP 2027 build
 
 This repository is the public release of Tharkun's SV-COMP 2027 build (release
-`svcomp27`, package version 0.2.0). It contains Tharkun's solve, knowledge, drive
+`svcomp27-0.2.1`, package version 0.2.1). It contains Tharkun's solve, knowledge, drive
 and search layers, the static analyser in solve/absint, and the sv front end.
 Hypothesis and z3 are required dependencies.
 
