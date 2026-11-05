@@ -4,12 +4,14 @@ SOLVING, by ``docs/LAYERS.md``'s rule: the input is a program's source, the
 output is a claim about how its ``_sv_verifier.nondet_int()`` draws can
 influence the execution, computed from the AST alone, with nothing executed.
 
-The claim this module makes is narrow on purpose.  A draw is classified as
+The claim this module makes is narrow on purpose. A classification is not a proof. A draw is classified as
 
 * ``trip`` with offset ``c`` -- its value reaches the program ONLY as the trip
   count ``c + abs(d)`` of one or more ``for _ in range(...)`` loops whose target
   variable is dead (never read).  No other code reads the value: not the loop
   body, not the code after the loop, not a return value, not a container.
+* ``value`` -- an ordinary integer expression retains the full integer domain. It has
+  no finite representative set; the caller must use an exact whole-program proof.
 * ``quotient`` -- the draw appears only as ``abs(d) % M`` (the modulus ``M``
   mentions no draw), so the program depends on ``d`` only through the residue:
   ``abs(d) % M`` for ``d`` in ``range(abs(M))`` takes every value it can take.
@@ -33,7 +35,7 @@ anything it cannot see through, so that a refusal is always the safe answer:
   proof cannot snapshot), a relative import;
 * a draw kind other than ``nondet_int`` / ``nondet_bool`` (``bool`` is finite:
   the caller enumerates it), an aliased ``_sv_verifier`` name;
-* a draw value flowing anywhere but ``abs(...)`` -> ``+ k`` -> ``range(...)``
+* a trip-classified value flowing anywhere but ``abs(...)`` -> ``+ k`` -> ``range(...)``
   of a ``for`` loop, a plain local/global variable read only in such places,
   or a positional/keyword argument of a module-level function (called by name,
   never rebound, undecorated, no ``*args``/``**kwargs`` involved), or of the ``__init__`` of a class
@@ -47,6 +49,7 @@ import ast
 from dataclasses import dataclass, field
 
 from tharkun.solve.call_targets import call_target_index
+from tharkun.solve.check_type_hints import check_type_arguments, check_type_contract
 
 #: imported modules whose run-time state the stationarity snapshot covers (``random``:
 #: ``getstate()``) or that carry no program-visible state (``re``: only a compile cache).
@@ -82,8 +85,12 @@ FORBIDDEN_ATTRS = frozenset({
 _BUILTIN_CLASSES = frozenset({"int", "float", "str", "bool", "list", "tuple", "dict", "set", "frozenset",
                               "bytes", "bytearray", "complex", "object"})
 
-_FINITE_DRAWS = frozenset({"nondet_bool"})
-_INT_DRAWS = frozenset({"nondet_int"})
+#: The verifier API's CONTRACT for the value set of each draw function it offers (what the call returns, never a property the
+#: proof infers from the spelling at a use): ``nondet_bool`` takes exactly False and True ("finite": the caller enumerates it),
+#: ``nondet_int`` any integer.  The first implementation (c2d0ba96/2a1e1f0a, 2026-09-24, an AI session, Claude Opus 5.5) was wrong:
+#: it tested the function name against two frozensets inline and, for a value DERIVED from an int draw (``d % 2 == 0``), had no
+#: way to say it takes finitely many values; a draw reduced by ``d % M`` is now ``quotient`` like ``abs(d) % M``.
+DRAW_DOMAIN = {"nondet_bool": "finite", "nondet_int": "int"}
 
 
 class Refuse(Exception):
@@ -104,7 +111,7 @@ class DrawSite:
     """One ``nondet_*()`` call, keyed by the call expression's (line, col)."""
     line: int
     col: int
-    kind: str                  # "trip" | "quotient" | "finite"
+    kind: str                  # "trip" | "quotient" | "finite" | "value"
     offset: int = 0            # trip only
     loops: tuple[tuple[int, int], ...] = ()
 
@@ -701,13 +708,23 @@ class _Planner:
     def _resolve_str_callee(self, call: ast.Call) -> tuple[ast.FunctionDef, list[str]] | None:
         """The ``FunctionDef`` ``call`` invokes and its own plain positional parameter names
         (``self`` already dropped for a method) -- a plain call to a module-level function
-        (``prog.funcs``) or a method call on a receiver ``_recv_class`` resolves -- else
+        (``prog.funcs``), a method call on a receiver ``_recv_class`` resolves, a proven user
+        class's constructor (the trip machinery's own ``_ctor``: ``MyClass(str_draw)``, the first
+        positional parameter past ``self`` receives the draw), or a def REFERENCE the program
+        bound exactly once (``f = func; f(draw)``) -- else
         ``None``, never guessed. No ``*args``/``**kwargs``/positional-only params on either
         side: this stays a plain, countable positional mapping throughout."""
         f = call.func
         if isinstance(f, ast.Name):
             fn = self.p.funcs.get(f.id)
             if fn is None or fn.args.vararg or fn.args.kwarg or fn.args.posonlyargs:
+                if fn is None:
+                    alias = self._def_reference_callee(f.id)
+                    if alias is not None:
+                        return alias
+                    ctor = self._str_ctor(call)
+                    if ctor is not None:
+                        return ctor
                 return None
             return fn, [x.arg for x in fn.args.args]
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
@@ -731,6 +748,40 @@ class _Planner:
                 return None
             return fn, [x.arg for x in fn.args.args[1:]]     # drop `self`
         return None
+
+    def _def_reference_callee(self, name: str) -> tuple[ast.FunctionDef, list[str]] | None:
+        """``(fn, params)`` when the program binds ``name`` EXACTLY once, to a bare reference of a
+        module-level ``def`` (``f = func``), and never declares it global/nonlocal or binds it in a
+        class body: then every call ``f(...)`` runs that def, and the str draw passes positionally
+        as for any plain call. Any second binding, a conditional assignment, or a rebinding refused
+        by :meth:`_Program.occurrences`'s own checks answers ``None`` (never guessed)."""
+        try:
+            self.occurrences(name, self.p.tree)
+        except Refuse:
+            return None
+        bound = [n for n in ast.walk(self.p.tree) if name in _bound_names(n)]
+        if len(bound) != 1 or not (isinstance(bound[0], ast.Name) and isinstance(bound[0].ctx, ast.Store)):
+            return None
+        par = self.p.parent[bound[0]]
+        if not (isinstance(par, ast.Assign) and len(par.targets) == 1 and isinstance(par.value, ast.Name)
+                and par.value.id in self.p.funcs):
+            return None
+        fn = self.p.funcs[par.value.id]
+        if fn.args.vararg or fn.args.kwarg or fn.args.posonlyargs:
+            return None
+        return fn, [x.arg for x in fn.args.args]
+
+    def _str_ctor(self, call: ast.Call) -> tuple[ast.FunctionDef, list[str]] | None:
+        """``(init, params past self)`` when the call is a proven user class's constructor and the
+        draw is a POSITIONAL argument (``MyClass(str_draw, ...)``): the machinery of the trip path's
+        own :meth:`_ctor` (nothing is guessed, a built-in or unproven callee answers ``None``)."""
+        try:
+            fn = self._ctor(call)
+        except Refuse as e:
+            if "unresolved callee" in str(e):
+                return None  # no fact at all: the usual before-behaviour (a plain refusal), not a guess
+            return None
+        return fn, [x.arg for x in fn.args.args[1:]]
 
     def str_restricted(self, name: str, scope: ast.AST, origin: ast.AST | None,
                        depth: int = 0) -> None:
@@ -778,7 +829,7 @@ class _Planner:
 
 def plan_draws(source: str, filename: str = "<program>", call_targets=None) -> DrawPlan:
     """Classify every draw of ``source``; refuse unless every draw is ``trip``,
-    ``quotient`` or ``finite`` (see the module docstring).  ``call_targets`` are the program's ``call_target``
+    ``quotient``, ``finite`` or full-domain ``value`` (see the module docstring).  ``call_targets`` are the program's ``call_target``
     records (``solve/call_targets.py``): with them a trip value passed to a proven user class's constructor is
     followed into its ``__init__``."""
     try:
@@ -791,9 +842,13 @@ def plan_draws(source: str, filename: str = "<program>", call_targets=None) -> D
     try:
         prog.screen()
         for call, kind in prog.draw_calls():
+            if kind == "check_type":
+                if check_type_contract() is None or check_type_arguments(call) is None:
+                    raise Refuse(f"line {call.lineno}: check_type has no closed call contract")
+                continue  # A checker consumes arguments; it does not draw another value.
             if call.args or call.keywords:
                 raise Refuse(f"line {call.lineno}: {kind} with arguments")
-            if kind in _FINITE_DRAWS:
+            if DRAW_DOMAIN.get(kind) == "finite":
                 draws.append(DrawSite(call.lineno, call.col_offset, "finite"))
                 continue
             if kind == "nondet_str":
@@ -822,20 +877,43 @@ def plan_draws(source: str, filename: str = "<program>", call_targets=None) -> D
                 a = prog.parent.get(call)
                 if not (isinstance(a, ast.Assign) and len(a.targets) == 1
                         and isinstance(a.targets[0], ast.Name)):
+                    # a draw inside a call position (`Canvas(nondet_str())`) follows inside the callee's
+                    # positional parameter exactly when _resolve_str_callee can resolve that callee
+                    # (a proven user class's constructor included); anything else stays refused
+                    par = prog.parent.get(call)
+                    if isinstance(par, ast.Call) and call in par.args and not par.keywords \
+                            and not any(isinstance(x, ast.Starred) for x in par.args):
+                        resolved = planner._resolve_str_callee(par)
+                        if resolved is not None:
+                            fn, params = resolved
+                            i = par.args.index(call)
+                            if i < len(params):
+                                planner.str_restricted(params[i], fn, None)
+                                draws.append(DrawSite(call.lineno, call.col_offset, "str_truthy"))
+                                continue
                     raise Refuse(f"line {call.lineno}: nondet_str is not assigned to a plain name")
                 name = a.targets[0].id
                 scope = prog.function_of(a)
                 planner.str_restricted(name, scope, a)
                 draws.append(DrawSite(call.lineno, call.col_offset, "str_truthy"))
                 continue
-            if kind not in _INT_DRAWS:
+            if DRAW_DOMAIN.get(kind) != "int":
                 raise Refuse(f"line {call.lineno}: {kind} (an unbounded draw kind)")
             a = prog.parent.get(call)
+            if isinstance(a, ast.BinOp) and isinstance(a.op, ast.Mod) and a.left is call:
+                # ``d % M``: the program depends on d only through its residue (Python's % takes the sign of M, and
+                # d in range(abs(M)) reaches every residue, as for ``abs(d) % M``)
+                if any(isinstance(n, ast.Call) and _mentions_draw(n, prog) for n in ast.walk(a.right)):
+                    raise Refuse(f"line {call.lineno}: the modulus draws")
+                draws.append(DrawSite(call.lineno, call.col_offset, "quotient"))
+                continue
             if not (_is_call_to(a, "abs") and len(a.args) == 1):
-                raise Refuse(f"line {call.lineno}: the draw is not taken abs(): a nondet_int used as a value (a "
-                             f"precondition-guarded `if not (lo <= n <= hi): return` one included) is no trip count, "
-                             f"and stationarity covers trip counts abs(d) only")
+                draws.append(DrawSite(call.lineno, call.col_offset, "value"))
+                continue
             up = prog.parent.get(a)
+            if isinstance(up, ast.UnaryOp) and isinstance(up.op, (ast.USub, ast.UAdd)):
+                draws.append(DrawSite(call.lineno, call.col_offset, "value"))
+                continue
             if isinstance(up, ast.BinOp) and isinstance(up.op, ast.Mod) and up.left is a:
                 if any(isinstance(n, ast.Call) and _mentions_draw(n, prog)
                        for n in ast.walk(up.right)):

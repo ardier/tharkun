@@ -51,6 +51,7 @@ import importlib
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -64,6 +65,12 @@ _TARGETS_DISABLED: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 EXEC_TARGET_NAME = "_tharkun_exec_target"
+
+
+def _module_path_present(name: str, paths) -> bool:
+    """Inspect top-level finder metadata without importing or executing the target."""
+    from importlib.machinery import PathFinder
+    return PathFinder.find_spec(name, paths) is not None
 
 
 def targets_disabled() -> bool:
@@ -168,8 +175,18 @@ def exec_source(path: str) -> dict[str, Any] | None:
         return None
 
 
+def _is_dunder(name: str) -> bool:
+    """``__name__``, ``__file__``, ``__builtins__`` ...: interpreter metadata, not a binding of the module's own.
+
+    A module-PRIVATE name such as python-string-utils' ``__ISBNChecker`` is NOT one: name mangling never applies at
+    module scope, so ``class __ISBNChecker`` binds exactly that global and the module's own code calls it by it.
+    Dropping every ``__``-prefixed name (the pre-[internal ref] filter) made such a class unreachable through this namespace,
+    so ``avengers/_worker.py::_load_class`` raised ``KeyError('__ISBNChecker')`` on every replay of it."""
+    return len(name) > 4 and name.startswith("__") and name.endswith("__")
+
+
 def _globals_of(mod: types.ModuleType) -> dict[str, Any]:
-    module_globals = {k: getattr(mod, k) for k in dir(mod) if not k.startswith("__")}
+    module_globals = {k: getattr(mod, k) for k in dir(mod) if not _is_dunder(k)}
     module_globals["__builtins__"] = __builtins__
     return module_globals
 
@@ -462,16 +479,25 @@ def import_project_isolated(source_path: str, roots: Sequence[str] = (), files: 
     env = dict(subprocess_environment(), THARKUN_PROJECT_IMPORT_REQ=json.dumps(request), PYTHONDONTWRITEBYTECODE="1")
     with tempfile.TemporaryDirectory(prefix="tharkun-project-import-") as scratch:
         try:
-            proc = subprocess.run([sys.executable, "-c", _ISOLATED_CHILD], cwd=scratch, env=env,
-                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
-                                  start_new_session=True)
-        except subprocess.TimeoutExpired:
-            out["error"] = "timeout"
-            return out
+            proc = subprocess.Popen([sys.executable, "-c", _ISOLATED_CHILD], cwd=scratch, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, start_new_session=True)
         except OSError as exc:
             out["error"] = f"could not start the child: {exc}"
             return out
-    for line in reversed(proc.stdout.splitlines()):
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            out["error"] = "timeout"
+            return out
+        finally:
+            # subprocess.run's timeout kills only the child; whatever it forked would outlive it ([internal ref]).
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+    for line in reversed(stdout.splitlines()):
         if line.startswith("{"):
             try:
                 report = json.loads(line)
@@ -479,5 +505,5 @@ def import_project_isolated(source_path: str, roots: Sequence[str] = (), files: 
                 break
             out.update(report)
             return out
-    out["error"] = f"the child exited with status {proc.returncode} and no report: {proc.stderr.strip()[-300:]}"
+    out["error"] = f"the child exited with status {proc.returncode} and no report: {stderr.strip()[-300:]}"
     return out

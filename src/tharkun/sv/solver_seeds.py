@@ -7,7 +7,7 @@ boundary draws, and bounded composition. Values are proposals, replayed by SV.
 import ast
 import math
 
-from tharkun.sv.guard_values import _Scope
+from tharkun.sv.guard_values import _Scope, proved_lines, record_seeds
 
 
 def _literal(node):
@@ -24,8 +24,9 @@ def seed_values(program: str, trick: str, records=None) -> dict[str, list]:
         tree = ast.parse(read_source(program))
     except (OSError, SyntaxError, ValueError):
         return {}
-    out: dict[str, list] = {}
-    seen = set()
+    out: dict[str, list] = record_seeds(tree, records) if records and trick in ("comparison", "boundaries") else {}
+    seen = {(kind, repr(value)) for kind, values in out.items() for value in values}
+    safe = proved_lines(records)
 
     def add(kind, value):
         if kind not in ("int", "float", "str") or len(out.get(kind, [])) >= 64:
@@ -56,7 +57,7 @@ def seed_values(program: str, trick: str, records=None) -> dict[str, list]:
         if not scope.draws:
             continue
         comparisons = [n for st in body for n in ast.walk(st)
-                       if isinstance(n, ast.Compare) and id(n) not in ignored]
+                       if isinstance(n, ast.Compare) and id(n) not in ignored and n.lineno not in safe]
         if trick == "comparison":
             for cmp in comparisons:
                 if len(cmp.ops) != 1:
@@ -133,6 +134,8 @@ def seed_values(program: str, trick: str, records=None) -> dict[str, list]:
                         add("str", a + b)
     if trick == "boundaries":
         for rec in records or ():
+            if rec.get("status") in ("safe", "may_raise"):
+                continue  # Complete records use the site-local domains above.
             types = rec.get("types", {})
             for fact in rec.get("scope", ()):
                 try:

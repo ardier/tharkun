@@ -13,6 +13,7 @@ import operator
 import re
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 from enum import Enum
 
 from .predicates import InvalidPredicate, check_predicate
@@ -297,6 +298,22 @@ def _variables(term):
 
 
 def from_canon(text: str) -> Term | Refused:
+    """Decode only our bounded, versioned grammar; require exact canonical round trip.
+
+    Memoized (PERF, lane 1518): the result is a frozen ``Term`` (tuples of immutables) or a frozen ``Refused``, a pure function of ``text``;
+    the exit-summary builder decodes the same few thousand canonical conditions hundreds of thousands of times (``bm_regex_v8_det``'s
+    census spent 35 of 78 s here)."""
+    if type(text) is not str:
+        return Refused("canonical text must be nonempty and at most 65536 characters")
+    return _from_canon_cached(text)
+
+
+@lru_cache(maxsize=1 << 16)
+def _from_canon_cached(text: str) -> Term | Refused:
+    return _from_canon(text)
+
+
+def _from_canon(text: str) -> Term | Refused:
     """Decode only our bounded, versioned grammar; require exact canonical round trip."""
     if type(text) is not str or not text or len(text) > _MAX_TEXT:
         return Refused("canonical text must be nonempty and at most 65536 characters")
@@ -439,6 +456,15 @@ def eval_term(term: Term | Refused, env: dict):
                 return snapshot
             if isinstance(key, Refused):
                 return key
+            if type(snapshot) is _Snapshot and args[0].sort == MAP and snapshot.domain is None:
+                _map_scalars = (int, bool, float, str, bytes, type(None))
+                if (not any(type(key) is kind for kind in _map_scalars)
+                        or (type(key) is float and not math.isfinite(key))
+                        or any(not any(type(item) is kind for kind in _map_scalars)
+                               or (type(item) is float and not math.isfinite(item))
+                               for item in snapshot.items)):
+                    return Refused("membership requires checked exact primitive contents and key")
+                return key in snapshot.items
             if (type(snapshot) is not _Snapshot or snapshot.domain not in _PRIMITIVES
                     or not any(type(key) is kind for kind in (int, bool, str, bytes))
                     or any(type(item) is not _TYPE_BY_NAME[snapshot.domain] for item in snapshot.items)):
@@ -699,6 +725,8 @@ def to_python(term: Term | Refused, *, types=None, builtin_names=()) -> str | Re
                 return Refused("provided binding contradicts term sort")
         env.update(provided)
 
+    lookup = [False]   # set when a bare exact dict is rendered as the lookup `key in d` (dict.__getitem__)
+
     def render(value, guards):
         op, args = value.op, value.args
         if op == "var":
@@ -725,10 +753,17 @@ def to_python(term: Term | Refused, *, types=None, builtin_names=()) -> str | Re
                     raise ValueError("string length lacks dominating exact str/bytes guard")
             return f"len({render(args[0], guards)})"
         if op == "contains":
-            _checked_domain(args[0], env)
+            name, kind, domain = _view_info(args[0])
+            unparametrized_dict = (args[0].sort == MAP and domain is None
+                                   and (name, "dict") in guards and types is None)
+            if not unparametrized_dict:
+                _checked_domain(args[0], env)
+            else:
+                lookup[0] = True
             key = args[1]
+            allowed_keys = ("int", "bool", "float", "str", "bytes") if unparametrized_dict else ("str", "bytes")
             if key.sort == PY and key.op != "key":
-                if key.op != "var" or not any((key.args[0], k) in guards for k in ("str", "bytes")):
+                if key.op != "var" or not any((key.args[0], k) in guards for k in allowed_keys):
                     raise ValueError("membership key lacks exact primitive guard")
             return f"({render(key, guards)} in {render(args[0], guards)})"
         if op == "typeis":
@@ -785,7 +820,7 @@ def to_python(term: Term | Refused, *, types=None, builtin_names=()) -> str | Re
 
     try:
         text = render(term, set())
-        check_predicate(text, env, builtin_names=builtin_names)
+        check_predicate(text, env, builtin_names=builtin_names, dict_lookup=lookup[0])
         return text
     except (ValueError, TypeError, KeyError, OverflowError, RecursionError, InvalidPredicate) as exc:
         return Refused(str(exc))

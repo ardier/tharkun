@@ -26,8 +26,9 @@ the two constructors.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from tharkun.facts import FactStore
 from tharkun.lattice import BOTTOM, FactState, FactIndex
@@ -188,6 +189,59 @@ class KnowledgeBase(FactStore):
             if kinds is None or identity[0] in kinds
         )
         return len(self._evidence_log), selected
+
+    # --- the persisted log ([internal ref]) ------------------------------------------------
+    def export_evidence(
+        self, kinds: set[str] | frozenset[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """The evidence list in first-publication order, as plain JSON records.
+
+        This is the persisted log of the bootstrap loop (docs/BOOTSTRAP.md "Determinism and replay"): one
+        ``{"kind", "key", "value", "derivations": [{"producer", "parents": [[kind, key], ...]}]}`` record per
+        canonical item.  A value that is not JSON (a live Avengers recipe object) raises ``TypeError`` naming
+        the item: a log that silently dropped items could not be replayed.  Filter with ``kinds`` to export
+        only the JSON-valued kinds of a mixed knowledge base.
+        """
+
+        records: list[dict[str, Any]] = []
+        for item in self.evidence():
+            if kinds is not None and item.kind not in kinds:
+                continue
+            try:
+                json.dumps(item.value, allow_nan=False)
+            except (TypeError, ValueError) as error:
+                raise TypeError(f"evidence {item.identity!r} is not JSON and cannot be logged: {error}") from error
+            records.append({
+                "kind": item.kind,
+                "key": item.key,
+                "value": item.value,
+                "derivations": [
+                    {"producer": d.producer, "parents": [list(parent) for parent in d.parents]}
+                    for d in item.derivations
+                ],
+            })
+        return records
+
+    def import_evidence(self, records: Iterable[dict[str, Any]]) -> int:
+        """Publish exported records in order (every derivation kept); the number of new items.
+
+        Importing into a knowledge base that already holds an item with another value raises, as
+        :meth:`publish` does: a log is replayed into an empty hub, not merged into a divergent one.
+        """
+
+        added = 0
+        for record in records:
+            derivations = record.get("derivations") or [{"producer": "import", "parents": []}]
+            for derivation in derivations:
+                parents = tuple((str(kind), str(key)) for kind, key in derivation.get("parents", ()))
+                added += self.publish(
+                    record["kind"],
+                    record["key"],
+                    record["value"],
+                    producer=derivation["producer"],
+                    parents=parents,
+                )
+        return added
 
     # --- diagnostics ------------------------------------------------------------
     def knowledge_report(self) -> dict:

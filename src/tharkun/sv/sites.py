@@ -69,12 +69,56 @@ def _matches(name: str | None, classes) -> str | None:
 
 
 def _is_main_guard(node: ast.stmt) -> bool:
+    """``if __name__ == "__main__":``, in either operand order."""
     if not isinstance(node, ast.If):
         return False
     t = node.test
-    return (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and t.left.id == "__name__"
-            and len(t.comparators) == 1 and isinstance(t.comparators[0], ast.Constant)
-            and t.comparators[0].value == "__main__")
+    if not (isinstance(t, ast.Compare) and len(t.ops) == 1 and isinstance(t.ops[0], ast.Eq)
+            and len(t.comparators) == 1):
+        return False
+    pair = (t.left, t.comparators[0])
+    return any(isinstance(a, ast.Name) and a.id == "__name__" and isinstance(b, ast.Constant) and b.value == "__main__"
+               for a, b in (pair, pair[::-1]))
+
+
+def _draw_helpers(tree: ast.Module, aliases: set[str], direct: dict[str, str]) -> dict[str, str]:
+    """``{helper: draw name}`` for module-level defs that only forward to a verifier draw:
+    ``def h(*a): return _sv_verifier.nondet_int(*a)`` (or ``def h(x, y): return nondet_float_range(x, y)``).
+
+    ``h(args)`` then IS ``nondet_X(args)``: same value, same effects, whatever the spelling of the call.  The def must be
+    the one binding of its name in the whole program (nothing rebinds it), undecorated, with no defaults or keywords and
+    forwarding its parameters unchanged and in order."""
+    from tharkun.sv.exact_unroll import _bindings
+    count = _bindings(tree)
+    out: dict[str, str] = {}
+    for fn in tree.body:
+        if not isinstance(fn, ast.FunctionDef) or fn.decorator_list or count.get(fn.name) != 1:
+            continue
+        body = fn.body[1:] if (fn.body and isinstance(fn.body[0], ast.Expr) and isinstance(fn.body[0].value, ast.Constant)
+                               and isinstance(fn.body[0].value.value, str)) else fn.body
+        if len(body) != 1 or not isinstance(body[0], ast.Return) or not isinstance(body[0].value, ast.Call):
+            continue
+        call, a = body[0].value, fn.args
+        f = call.func
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in aliases:
+            name = f.attr
+        elif isinstance(f, ast.Name) and f.id in direct:
+            name = direct[f.id]
+        else:
+            continue
+        if name not in LIFTED or call.keywords or a.defaults or a.kwonlyargs or a.kwarg:
+            continue
+        if a.vararg and not (a.args or a.posonlyargs):
+            forwarded = len(call.args) == 1 and isinstance(call.args[0], ast.Starred) \
+                and isinstance(call.args[0].value, ast.Name) and call.args[0].value.id == a.vararg.arg
+        elif not a.vararg:
+            params = [p.arg for p in a.posonlyargs + a.args]
+            forwarded = [x.id if isinstance(x, ast.Name) else None for x in call.args] == params
+        else:
+            forwarded = False
+        if forwarded:
+            out[fn.name] = name
+    return out
 
 
 def _sites_in(tree: ast.Module, classes) -> list[dict]:
@@ -648,7 +692,7 @@ def _moved_refusal(moved, hoisted, fn) -> str:
     return ""
 
 
-def _build(source: str, classes, extra_sites=None, call_targets=None):
+def _build(source: str, classes, extra_sites=None, call_targets=None, *, world=False):
     """A :class:`Harness`, or the reason there is none (a string)."""
     try:
         tree = ast.parse(source)
@@ -678,6 +722,7 @@ def _build(source: str, classes, extra_sites=None, call_targets=None):
         or (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "seed"
             and isinstance(n.func.value, ast.Name) and n.func.value.id in random_aliases)
         for n in ast.walk(tree))
+    direct = {**direct, **_draw_helpers(tree, aliases, direct)}
     probe = _Lift(aliases, direct)
     plan, refusal = _plan(tree, probe, call_targets)
     if plan is None:
@@ -693,7 +738,7 @@ def _build(source: str, classes, extra_sites=None, call_targets=None):
             taken.add(n)
     lift = _Lift(aliases, direct, named, sys_aliases, argv_names, random_aliases, random_choice_ok)
     body = [lift.visit(st) for st in plan.body]
-    if not lift.params:
+    if not lift.params and not world:
         if not _draws_in(tree, probe):
             return "no liftable draw"
         if not refusal and plan.entry.startswith("entry ") and any(
@@ -727,12 +772,13 @@ def _build(source: str, classes, extra_sites=None, call_targets=None):
     except (SyntaxError, ValueError) as e:
         return f"the harness does not compile ({type(e).__name__}: {e})"[:200]
     h = Harness(text, lift.params, lift.kinds, lift.unlifted, entry=plan.entry, entry_fn=plan.entry_fn)
-    h.sites = violation_sites(text, classes) + _marker_sites(text, marks)
+    # an explicit assert's site is its marker ([internal ref]): the statement's own record would be a line no guard encloses
+    h.sites = [r for r in violation_sites(text, classes) if r["kind"] != "assert"] + _marker_sites(text, marks)
     h.feeds = _feeds(body, {st.name: st for st in plan.rest if isinstance(st, ast.FunctionDef)})
     return h
 
 
-def build_harness(source: str, classes, extra_sites=None, call_targets=None) -> Harness | None:
+def build_harness(source: str, classes, extra_sites=None, call_targets=None, *, world=False) -> Harness | None:
     """The draw-parameterised harness of ``source``, or ``None`` when the program has
     no entry code with a draw the harness can lift (:func:`harness_refusal` says why).
 
@@ -742,13 +788,13 @@ def build_harness(source: str, classes, extra_sites=None, call_targets=None) -> 
     site whose every record is ``safe`` gets no marker (nothing to solve).  ``call_targets``
     are the program's ``call_target`` records (``solve/call_targets.py``): without them an entry function
     (``def main(): ...`` then ``main()``) is not inlined, since nothing says what ``main`` is."""
-    built = _build(source, classes, extra_sites, call_targets)
+    built = _build(source, classes, extra_sites, call_targets, world=world)
     return built if isinstance(built, Harness) else None
 
 
-def harness_refusal(source: str, classes, extra_sites=None, call_targets=None) -> str:
+def harness_refusal(source: str, classes, extra_sites=None, call_targets=None, *, world=False) -> str:
     """Why :func:`build_harness` returned ``None``: the NAMED condition that failed, for the log."""
-    built = _build(source, classes, extra_sites, call_targets)
+    built = _build(source, classes, extra_sites, call_targets, world=world)
     return built if isinstance(built, str) else ""
 
 
@@ -1015,6 +1061,14 @@ class _Instrument:
                         st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.For,
                              ast.While, ast.With, ast.Try)):
                     checks.append(rec)
+            if (isinstance(st, ast.Assert) and "AssertionError" in self.classes
+                    and (line, "assert") not in self.safe
+                    and not any(c[1] == "assert" for c in checks)):
+                # [internal ref]: an explicit assert is a site like the implicit ones -- its marker is the guard that fails
+                # it, so a site is a LINE inside an if-guard that drive_to_line can flip (before, the per-site drive
+                # answered "line N is not inside any if-guard").  The marker re-evaluates the test, as every marker
+                # re-evaluates its condition; the harness only proposes, the unmodified program decides.
+                checks.append(("AssertionError", "assert", f"not ({ast.unparse(st.test)})"))
             for exc, kind, cond in checks:
                 if any(_caught(hs, exc) for hs in handlers):
                     continue

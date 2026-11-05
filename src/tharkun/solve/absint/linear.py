@@ -81,21 +81,29 @@ class Lin:
     def norm(self, z: Zone) -> "Lin":
         """``subst_consts`` plus elimination of ``x - y`` pairs whose difference the
         zone pins to one value."""
-        lin = self.subst_consts(z)
+        lin = self
+        if z.affine is not None:
+            reduced = z.affine.reduce(lin.terms, lin.c)
+            if reduced is not None and not reduced[0]:
+                lin = Lin(*reduced)
+        lin = lin.subst_consts(z)
         changed = True
         while changed and len(lin.terms) >= 2:
             changed = False
             d = dict(lin.terms)
-            pos = [k for k, v in d.items() if v == 1]
-            neg = [k for k, v in d.items() if v == -1]
+            pos = [k for k, v in d.items() if v > 0]
+            neg = [k for k, v in d.items() if v < 0]
             for x in pos:
                 for y in neg:
+                    if d[x] != -d[y]:
+                        continue
                     up = z.get(x, y)
                     dn = z.get(y, x)
                     if up is not None and dn is not None and up == -dn:
+                        coefficient = d[x]
                         del d[x]
                         del d[y]
-                        lin = Lin(d, lin.c + up)
+                        lin = Lin(d, lin.c + coefficient * up)
                         changed = True
                         break
                 if changed:
@@ -119,24 +127,35 @@ def lin_bounds(lin: Lin, z: Zone) -> tuple[int | None, int | None]:
     """Constant bounds of a linear form under a zone (DBM-exact for ``x - y + c``)."""
     if z.bottom:
         return (0, 0)
-    t = lin.terms
-    if not t:
-        return (lin.c, lin.c)
-    if len(t) == 2 and {t[0][1], t[1][1]} == {1, -1}:
-        (x, _), (y, _) = (t[0], t[1]) if t[0][1] == 1 else (t[1], t[0])
-        hi = z.get(x, y)
-        lo = z.get(y, x)
-        return (None if lo is None else lin.c - lo, None if hi is None else lin.c + hi)
-    lo: int | None = lin.c
-    hi: int | None = lin.c
-    for k, v in t:
-        klo, khi = z.bounds(k)
-        if v > 0:
-            lo = None if lo is None or klo is None else lo + v * klo
-            hi = None if hi is None or khi is None else hi + v * khi
-        else:
-            lo = None if lo is None or khi is None else lo + v * khi
-            hi = None if hi is None or klo is None else hi + v * klo
+    def bounds(form):
+        t = form.terms
+        if not t:
+            return (form.c, form.c)
+        if len(t) == 2 and {t[0][1], t[1][1]} == {1, -1}:
+            (x, _), (y, _) = (t[0], t[1]) if t[0][1] == 1 else (t[1], t[0])
+            hi = z.get(x, y)
+            lo = z.get(y, x)
+            return (None if lo is None else form.c - lo, None if hi is None else form.c + hi)
+        lo = hi = form.c
+        for k, v in t:
+            klo, khi = z.bounds(k)
+            if v > 0:
+                lo = None if lo is None or klo is None else lo + v * klo
+                hi = None if hi is None or khi is None else hi + v * khi
+            else:
+                lo = None if lo is None or khi is None else lo + v * khi
+                hi = None if hi is None or klo is None else hi + v * klo
+        return (lo, hi)
+
+    lo, hi = bounds(lin)
+    if z.affine is not None:
+        reduced = z.affine.reduce(lin.terms, lin.c)
+        if reduced is not None:
+            alo, ahi = bounds(Lin(*reduced).norm(z))
+            if alo is not None:
+                lo = alo if lo is None else max(lo, alo)
+            if ahi is not None:
+                hi = ahi if hi is None else min(hi, ahi)
     return (lo, hi)
 
 

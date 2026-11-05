@@ -2,11 +2,30 @@
 
 > *Module paths in this document predate 0.2.0. The current layout, the layer rule and the move map (every old path is a permanent shim) are in [LAYERS.md](LAYERS.md).*
 
+> **Branches and what this document describes (owner ruling and measurement, 2026-10-19).**
+> - **The branches.** `main` is the development line and always a superset of `sv_2027`, the competition subset.
+>   Features land on `main` from feature branches rebased onto `main` and then merged.
+> - **The pin.** Eregion pins a validated `main` revision and repins after each validated landing
+>   ([README.md](../README.md), "Branches").
+> - **What changed.** On 2026-10-19 `main` was fast-forwarded to the `sv_2027` tip, so its tree no longer has the
+>   Touchstone and CrossHair adapters (`touchstone_adapter.py` and `crosshair_adapter.py`, last present at
+>   a72086156).
+> - **What this document describes.** The sections below that describe touchstone as a portfolio member, or a
+>   touchstone-first flip order, describe that earlier tree. Whether `main` gets the adapters back is an owner
+>   decision that has not been made.
+
 This document explains *why* tharkun is shaped the way it is. It is not an API reference;
 `CLAUDE.md` already lists the modules and `docs/HOW_IT_WORKS.md` walks through the
 single-guard techniques with examples. What follows is the reasoning a new maintainer
 needs before changing anything: what each layer is for, what forced its shape, and where
 it is known to fall short.
+
+**Static exception knowledge (ruled 2026-10-29).**
+[EXCEPTION_SITES.md](EXCEPTION_SITES.md) owns the ORIGINAL-source site record,
+the existing-contract typed condition projection, and the built shared source
+discovery used by census/entry views. The inventory carries no evaluation order or path
+feasibility; Eregion owns DFS and inversion. This remains a standalone SOLVE
+surface and does not use the dynamic driver loop described below.
 
 Every quantitative claim below is sourced from this repository — a test docstring, a
 commit message, or `CLAUDE.md`. Where a number is a measurement on one target it says so;
@@ -58,10 +77,48 @@ nothing."*
 | one guard | `branch_solver.solve_branch(file, line, branch)` | the chain's own verification post-step |
 | one line | `driver.drive_to_line(file, fn, line, seed)` | the tracer, every round |
 | one fuzz target | `hybrid.HybridFuzzer(spec).run()` | Atheris's own coverage counters |
+| one entry and a wanted observation | `inputs.find_inputs(request)` ([internal ref], [INPUTS.md](INPUTS.md)) | a fresh-child replay of every row; SV's scheduler inside |
 
-`differential.differential_kill` is the driver's sibling: the same touchstone-first,
-search-behind structure with a divergence goal (`orig(*args) != mut(*args)`) instead of a
-line target. It has no internal callers by design; it is consumed externally.
+`inputs.find_inputs` sits above the other three. It takes a plain-JSON question about one entry function (typed
+parameters, fixed values and a wanted observation) and builds an SV harness from it with Tharkun's own
+generator. It lets SV's scheduler run the whole portfolio on that harness, and it returns only rows that
+replay. It is the door callers outside tharkun use at run time (docs/LAYERS.md "What eregion may import").
+
+`differential.differential_kill` is no longer a search of its own ([internal ref]). It is a TOOLS-tier compatibility
+facade that sends ONE `differs` request to `inputs.find_inputs`, with the guard (`source_path:guard_line`) as
+`hints.targets`. Owner ruling 2026-10-19: "Drive_to_line and differential kill can combine for forward stuff, but
+our shared machinery MUST be used. No rogue side tools."
+- **The forward half.** The ladder's `reach` rung drives the entry toward the guard with `drive_to_line`, in
+  SV's confined drive worker ([INPUTS.md](INPUTS.md) "The ladder"). A reached state is then used one of three
+  ways: replayed as a row; walked to the result over the paths through the reached line
+  (`preimage_candidates(through=)`); or handed to `sv` as a seed vector.
+- **Comparison and exceptions.** The comparison is `find_inputs`' `differs`: the return value, or the class of
+  the exception raised. Both callables run only in fresh children, never in the caller's process.
+- **What went.** The in-process Hypothesis loop, its `!=` and `auto_differential_target` are gone.
+- **Arguments.** `strategies` are `find_inputs` parameter specs (or `int`/`bool`/`float`/`str`/`bytes`), and a
+  Hypothesis strategy is a `TypeError`. `timeout_s` is the budget. `max_examples` is accepted and unused.
+- **Callers.** It has no internal callers. Its external consumers are four demo scripts under Eregion's
+  `eregion_experiments` (`mutation/mutant_killing_eregion_demo/`), and `tests/test_public_surface.py` pins its
+  name. Those demos pass Hypothesis strategies and `exec`-compiled functions with no module file, so the facade
+  refuses them by name (a `TypeError` and a `ValueError`) until they send parameter specs and import their
+  pairs from files.
+
+**What the differential kill is to be (owner rulings 2026-09-29 and 2026-10-19; the search half is built, the
+kill is the caller's).**
+- **The kill.** A KILL is decided only by fresh-process native replay of the REAL mutant
+  against the original on the same input. A difference may be in the return value, the
+  raised exception (type and message), the printed output or the receiver's `repr`.
+- **What Tharkun answers count for.** A Tharkun TRUE on a product program is evidence. It
+  becomes EQUIVALENT only with an exact deciding component (`symbolic:product`) plus Eregion's
+  equivalence premise.
+- **The search.** It uses the latest absint, the hybrid fuzzer, `drive_to_line` with minleaf,
+  Avengers, the contracts and `_symexec`. It is reached from Eregion's emitted `solve_`
+  through ONE Tharkun entry: R1, `tharkun.inputs.find_inputs`, above DRIVE/FUZZ. R1 is built
+  ([internal ref] G1, [INPUTS.md](INPUTS.md)) as the Eregion manager's default, and the owner's
+  confirmation is pending ([LAYERS.md](LAYERS.md), "What eregion may import"). `differential_kill`
+  reaches the same entry ([internal ref]).
+- **The owners.** Eregion's `docs/design/16_mutant_resolution.md` owns the kill definition.
+  A `differential_kill` witness is a `differs` row, a candidate for that replay, not a kill.
 
 ---
 
@@ -165,8 +222,10 @@ Its limit is the modeled fragment, and that limit is large. Everything below exi
 cover it.
 
 `driver._flip_touchstone` does one thing the adapter does not: it decides the guard under
-each *likely joint typing* rather than one guessed type, using the distribution built by
-`type_hints.gather_hints` / `candidate_typings`. A fuzzer field read as `int` on one seed
+each *likely joint typing* rather than one guessed type, using the joint typings of
+`tharkun.typeinfer.candidate_typings` (docs/TYPEINFER.md; it replaced `type_hints.gather_hints`,
+[internal ref] A2; neither `_flip_touchstone` nor `touchstone_adapter` is in this tree, so this section
+describes an intent the code no longer has: recorded in docs/TYPEINFER.md "Findings"). A fuzzer field read as `int` on one seed
 and `str` on another has a genuinely ambiguous type, and satisfiability tolerates a wrong
 guess because execution verifies downstream. **Infeasibility is only reported when every
 candidate typing agrees the branch is dead**, so ambiguity can never license a false prune.
@@ -276,10 +335,7 @@ so the conjunction still means what it meant.
 `driver._flip_hypothesis` is the plain property search, 500 examples, last of the
 per-guard tier.
 
-CrossHair is deliberately **off** the default heavy tier (`_HEAVY_FLIPPERS =
-[_flip_hypothesis]`). In the driver's portfolio it is redundant — touchstone already covers
-sound SMT and the drive loop is itself concolic — and it is the slowest option (subprocess
-plus timeout). `_flip_crosshair` remains available for a caller that wants it back.
+The heavy tier is `_HEAVY_FLIPPERS = [_flip_hypothesis]`; CrossHair is not part of Tharkun (owner 2026-10-28).
 
 ### reach-search — the last resort, and the one that does not need the dataflow inverted
 
@@ -792,6 +848,27 @@ The two partial answers already in place — width targeting (§7) and `_reach_b
 and the other by searching entry parameters with execution as the predicate. Neither
 inverts the dataflow.
 
+For str and regex dataflow the backward direction now exists. `solve/preimage/` ([internal ref],
+docs/contracts/FORMAT.md "Preimages") maps a demand on a derived local to forward-checked
+candidate values of the entry string. An example demand is `head.startswith('"')`, where
+`head` comes from `s.split('@')[0]` then `replace`.
+
+`driver.py::_flip_preimage` is the drive's preimage tier. It runs right after the cheap
+flippers and before minleaf and the searches. It works in four steps:
+1. It turns the blocking guard into a demand per local: `And`/`Or`/`not`, comparisons with
+   constants, `in`, `is None`, and str/len/set/regex calls are read; anything else abstains.
+2. It walks the function's straight-line definitions backward, reaching the call sites'
+   simple pass-throughs through `call_mapper`. Single and tuple assignments are followed;
+   a loop, a branch or an augmented assignment that defines a wanted local abstains.
+3. It proposes values for the entry parameters.
+4. `_verified` executes every proposal before the drive commits it.
+
+Python string_utils' is_email is the measured case (tk-str-work/PHASE_A.md):
+* line 233 plateaued with "guard at line 233 depends on non-parameter state";
+* the preimage tier reaches line 234 in one flip, and line 229 behind line 228 likewise.
+
+Byte widths (`des.py`) remain as described above.
+
 ### Operand banking from failed searches — wired, unverified
 
 `_reach_by_search` runs the program hundreds of times, and every run passes through the
@@ -818,10 +895,11 @@ power schedule needs. Nothing consumes it. The portfolio order is currently stat
 hand-justified (§3). Given the measured asymmetry — 1158 invocations for 0 committed
 answers on one member, against snapshot's 309 — this is the most obvious next lever.
 
-### `structure_infer` is not wired in
+### The shape recovery is not wired in
 
-`structure_infer.infer_shapes` / `synthesize` recover an input's nested shape from how the
-code uses it, and its docstring names the case it is for: the driver plateaus when a
+`tharkun.typeinfer.core.shape` (`infer_shapes` / `synthesize`, and `Report.shape` of
+`infer_params`; it was `structure_infer` until [internal ref] A2) recovers an input's nested shape from
+how the code uses it, and its docstring names the case it is for: the driver plateaus when a
 parameter has no live value to mutate, and a synthesized shape gives the loop something to
 start from. It has a test file and no callers in `src/`.
 

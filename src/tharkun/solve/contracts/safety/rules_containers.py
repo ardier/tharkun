@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from tharkun.solve.terms import (
-    BOOL, F64, INT, PY, Refused, Term, and_, as_bool, as_int, as_seq, b2i,
-    eq, ge, length, literal, lt, neg, or_, typeis,
+    BOOL, F64, INT, PY, Refused, Term, and_, as_bool, as_int, as_map, as_seq, b2i,
+    contains, eq, ge, length, literal, lt, neg, not_, or_, typeis,
 )
 from tharkun.solve.contracts.safety import Binding, Case
 from tharkun.solve.contracts.safety.rules_protocols import _source_operand
@@ -86,6 +86,43 @@ def list_pop_cases(qualname: str, exception: str, binding: Binding):
     return (Case(domain, raises),)
 
 
+_DICT_KEY_TAGS = ("int", "bool", "float", "str", "NoneType")
+_DICT_UNHASHABLE_TAGS = ("list", "dict")
+
+
+def dict_getitem_cases(qualname: str, exception: str, binding: Binding):
+    """Build exact-dict subscription cases for primitive and unhashable builtin keys."""
+    if qualname != "dict.__getitem__" or exception not in {"KeyError", "TypeError"}:
+        return Refused("dict.__getitem__ cases cover KeyError and TypeError only")
+    if (binding.receiver is None or binding.receiver.op != "var"
+            or binding.receiver.sort != PY or len(binding.args) != 1
+            or binding.op is not None or not _source_operand(binding.args[0])):
+        return Refused("dict subscription binding requires a source receiver, one stable key, and no operator")
+    receiver, key = binding.receiver, binding.args[0]
+    receiver_domain = typeis(receiver, "dict")
+    if isinstance(receiver_domain, Refused):
+        return receiver_domain
+    view = as_map(receiver)
+    if isinstance(view, Refused):
+        return view
+    result = []
+    for key_tag in _DICT_KEY_TAGS:
+        domain = and_(receiver_domain, typeis(key, key_tag))
+        if exception == "KeyError":
+            member = contains(view, key)
+            if isinstance(member, Refused):
+                return member
+            raises = not_(member)
+        else:
+            raises = None
+        result.append(Case(domain, raises))
+    for key_tag in _DICT_UNHASHABLE_TAGS:
+        domain = and_(receiver_domain, typeis(key, key_tag))
+        raises = literal(True) if exception == "TypeError" else None
+        result.append(Case(domain, raises))
+    return tuple(result)
+
+
 CASES_BUILDERS = {
     (qualname, exception): sequence_getitem_cases
     for qualname in _SEQUENCES
@@ -94,4 +131,8 @@ CASES_BUILDERS = {
 CASES_BUILDERS.update({
     ("list.pop", exception): list_pop_cases
     for exception in ("IndexError", "TypeError")
+})
+CASES_BUILDERS.update({
+    ("dict.__getitem__", exception): dict_getitem_cases
+    for exception in ("KeyError", "TypeError")
 })

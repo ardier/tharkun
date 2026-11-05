@@ -81,6 +81,26 @@ def finish(verdict, source, filename, specification, census, *, directory=None, 
     else:
         result = check_candidates(source, filename, specification, census, candidates,
                                   seconds=deadline - time.monotonic())
+        if not result.confirmed and time.monotonic() < deadline:
+            # Optional local claims can fail outside caller preconditions; keep
+            # induction facts and independently re-prove the entire source.
+            minimal = [inv for inv in candidates if inv.type == "loop_invariant"]
+            if not minimal:
+                tree = ast.parse(source, filename)
+                loc = source_points(tree, source, filename)[tree.body[0]][1] if tree.body else (filename, 1, 1, "<module>")
+                minimal = [Invariant(*loc, "True")]
+            if minimal != candidates and time.monotonic() < deadline:
+                if knowledge is not None:
+                    from tharkun.facts import Fact
+                    for inv in minimal:
+                        knowledge.add(Fact(kind="candidate_invariant",
+                                           subject=f"{inv.file_name}:{inv.line}:{inv.column}",
+                                           value=inv.value, source="finish", certified=False))
+                retried = check_candidates(source, filename, specification, census, minimal,
+                                           seconds=deadline - time.monotonic())
+                if retried.confirmed:
+                    result = retried
+                    doc = witness(source, filename, specification, minimal, source_bytes=source_bytes)
     opened = result.open_obligations
     if not result.confirmed and not opened:
         opened = (Obligation(hashlib.sha256(source.encode("utf-8")).hexdigest(), "$checker", "coverage",

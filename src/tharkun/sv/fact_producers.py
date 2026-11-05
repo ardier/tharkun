@@ -7,12 +7,14 @@ publishes them into its :class:`~tharkun.knowledge.KnowledgeBase` through
 ``tharkun.sv.fact_proof`` has certified it independently (owner ruling,
 2026-09-29: "a fact counts only after the per-candidate Z3 check certifies it").
 
-Tharkun never imports or names a producer.  The charter (docs/LAYERS.md:
+External producers are never named by Tharkun. The charter (docs/LAYERS.md:
 "tharkun never depends on eregion") holds because a producer announces
 itself through the ``tharkun.sv.fact_producers`` entry-point group of its own
 distribution; Eregion's ``eregion-codegen`` registers one (``eregion``).  With
 no producer installed :func:`discover` returns ``()`` and the scheduler spends
-nothing here -- there is no switch, and none is needed.
+nothing here unless native site observations enable the builtin producer
+``observations``. It uses the same child, store and independent certification
+boundary as external producers.
 
 Why a child process, not an in-process call:
 
@@ -147,6 +149,11 @@ def run(producer: Producer, request: dict, *, timeout: float, memory_bytes: int 
 def _child(name: str) -> int:
     """The child side: load the named producer, run it on the stdin request."""
     request = json.load(sys.stdin)
+    from tharkun.sv import observed_invariants
+    if name == observed_invariants.NAME and request.get("observations"):
+        facts = list(observed_invariants.produce(request))
+        json.dump({"schema": SCHEMA, "facts": facts}, sys.stdout)
+        return 0
     target = next((p.target for p in discover() if p.name == name), None)
     if target is None:
         print(f"no producer named {name!r}", file=sys.stderr)

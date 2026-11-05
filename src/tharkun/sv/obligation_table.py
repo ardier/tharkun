@@ -55,6 +55,8 @@ from tharkun.sv.contracts import KINDS
 
 OBLIGATION = "obligation"
 SITE_RECORD = "site_record"
+GUARD_OPERAND = "guard_operand"
+SITE_OBSERVATION = "site_observation"
 SITE_SAFETY = "site_safety"
 PROOF_ROUTE = "proof_route"
 SITE_OUTCOME = "site_outcome"
@@ -63,6 +65,7 @@ CLASS_HINTS = "class_hints"
 MODULE_CONSTANT = "module_constant"
 REGEX_PATTERN = "regex_pattern"
 CALL_TARGET = "call_target"
+WORLD_FACT = "world_fact"
 
 OPEN, DISCHARGED, VIOLATED = "open", "discharged", "violated"
 
@@ -113,6 +116,12 @@ class ObligationTable:
         for o in self._rows:
             self.kb.add(Fact(kind=OBLIGATION, subject=subject_of(o), value=OPEN, source="census",
                              certified=False))
+
+    def world_store(self, initial=None):
+        """The run's shared file instances; world content is never certified evidence."""
+        from tharkun.solve.world import WorldStore
+        existing = self.kb.get(WORLD_FACT, "files")
+        return existing[0].value if existing else WorldStore(initial, self.kb)
 
     def bind_source(self, sites, *, source_sha256: str, classes, location) -> None:
         """Bind the scheduler's once-built original AST map, including an empty census."""
@@ -285,7 +294,20 @@ class ObligationTable:
         self._cursors[(consumer, kind)] = new_cursor
         return items
 
+    # --- what the solver compared, for the fuzzer ---------------------------------------------------
+    def publish_operand(self, kind: str, value, *, producer: str) -> None:
+        """A ``{kind, value}`` the solver or driver compared (``guard_operand`` evidence), once per distinct value."""
+        self._put(GUARD_OPERAND, f"{kind}:{value!r}", {"kind": kind, "value": value}, producer=producer)
+
+    def operands(self) -> list:
+        return [dict(e.value) for e in self.kb.evidence(kind=GUARD_OPERAND)]
+
     # --- absint's site records ---------------------------------------------------------------------
+    def publish_observations(self, observations, *, producer="execution") -> None:
+        for record in observations:
+            key = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+            self._put(SITE_OBSERVATION, key, record, producer=producer)
+
     def publish_site_records(self, records, *, producer: str) -> None:
         """One absint run's per-site records (``solve/absint/__init__.py::AbsintResult.records``;
         docs/ABSINT.md "Site records").  Each non-empty run is one generation; a later run, seeing more

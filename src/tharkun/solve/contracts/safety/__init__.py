@@ -79,6 +79,7 @@ def _case_builders():
     from tharkun.solve.contracts.safety.rules_containers import CASES_BUILDERS as CONTAINER_BUILDERS
     from tharkun.solve.contracts.safety.rules_builtins import CASES_BUILDERS as BUILTIN_BUILDERS
     from tharkun.solve.contracts.safety.rules_protocols import CASES_BUILDERS as PROTOCOL_BUILDERS
+    from tharkun.solve.contracts.safety.rules_str import CASES_BUILDERS as STR_BUILDERS
     from tharkun.solve.contracts.safety.rules_protocol_call import CASES_BUILDERS as CALL_BUILDERS
     from tharkun.solve.contracts.safety.rules_verifier import CASES_BUILDERS as VERIFIER_BUILDERS
     builder_modules = (
@@ -89,6 +90,7 @@ def _case_builders():
         CONTAINER_BUILDERS,
         BUILTIN_BUILDERS,
         VERIFIER_BUILDERS,
+        STR_BUILDERS,
     )
     merged = {}
     for builders in builder_modules:
@@ -103,7 +105,9 @@ def _checked_claim(qualname: str, exception: str):
     try:
         claim = contract.raise_claim(exception)
     except KeyError:
-        return None
+        claim = next((c for c in contract.other_raises if c.exc == exception), None)
+        if claim is None:
+            return None
     return claim if claim.tested and claim.condition != "unknown" else None
 
 

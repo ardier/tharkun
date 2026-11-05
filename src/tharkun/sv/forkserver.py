@@ -36,8 +36,12 @@ class ForkServer:
 
     def close(self):
         if self.proc is not None:
-            self.stream.close()
+            try:
+                self.stream.close()
+            except OSError:
+                pass  # A failed request may also leave buffered bytes that cannot flush.
             self.sock.close()
+            self.proc.terminate()  # Cancel the active target through the server's descendant drain.
             try:
                 self.proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -46,11 +50,14 @@ class ForkServer:
             self.proc = None
             self.cpu = 0.0  # os.times now includes the reaped server and its children
 
-    def run(self, python, program, vector, *, timeout, hashseed=0, memory_bytes=None, files=None):
+    def run(self, python, program, vector, *, timeout, hashseed=0, memory_bytes=None, files=None, box=False, world=None,
+            observe_invariants=()):
         from tharkun.sv.engine import Outcome, run_once
         if sys.platform != 'linux' or hashseed != 0:
             return run_once(python, program, vector, timeout=timeout, hashseed=hashseed,
-                            memory_bytes=memory_bytes, files=files)
+                            memory_bytes=memory_bytes, files=files, **({"box": True} if box else {}),
+                            **({"observe_invariants": observe_invariants} if observe_invariants else {}),
+                            **({"world": world} if world is not None else {}))
         # ponytail: one in-flight vector per server; callers use one server per batch slot.
         with self.lock, tempfile.TemporaryDirectory(prefix='tharkun-sv-fork-') as tmp:
             t0 = time.monotonic()
@@ -58,7 +65,9 @@ class ForkServer:
             sent = False
             try:
                 with open(req, 'w') as fh:
-                    json.dump({'program': os.path.abspath(program), 'vector': vector, 'out': out, **({'files': files} if files is not None else {})}, fh)
+                    json.dump({'program': os.path.abspath(program), 'vector': vector, 'out': out, **({'files': files} if files is not None else {}),
+                               **({'observe_invariants': observe_invariants} if observe_invariants else {}),
+                               **({'box': True} if box else {}), **({'world': world} if world is not None else {})}, fh)
                 if self.proc is None:
                     if timeout <= time.monotonic() - t0:
                         return Outcome('timeout', seconds=time.monotonic() - t0)
@@ -81,7 +90,7 @@ class ForkServer:
                 # A partial write can start a child, so its server must still drain it.
                 sent = True
                 self.stream.write(json.dumps({'path': req, 'tmp': tmp, 'timeout': left,
-                                              'memory_bytes': memory_bytes}).encode() + b'\n')
+                                              'memory_bytes': memory_bytes, **({'box': True} if box else {})}).encode() + b'\n')
                 self.stream.flush()
                 result = json.loads(self.stream.readline())
                 self.cpu = result['cpu']
@@ -94,7 +103,8 @@ class ForkServer:
                                record.get('msg', ''), record.get('site'), record.get('draws', []),
                                record.get('flags', []) + ['forked'], time.monotonic() - t0,
                                invalid_draw=record.get('invalid_draw', False),
-                               ranges=record.get('ranges', []), absent_imports=record.get('absent_imports', []))
+                               ranges=record.get('ranges', []), absent_imports=record.get('absent_imports', []),
+                               world=record.get('world', []), observations=record.get('observations', []))
             except (OSError, ValueError, KeyError) as error:
                 if not sent and self.proc is not None:
                     self.proc.kill()

@@ -68,6 +68,39 @@ def _terminates(body):
     return False
 
 
+def stable_module_name(child, name, resolvers):
+    """The top-level ``Assign`` that is the ONLY binding of ``name`` in the source module ``child`` and that nothing can change:
+    no other binding, ``global`` or ``del`` in the module, no attribute store spelled ``name`` in any scanned file (``alias.name =
+    v`` rebinds a module global from outside).  ``None`` otherwise."""
+    if name not in child.public_names() or child._rebound(name):
+        return None
+    for sub in resolvers:
+        for node in ast.walk(sub.tree):
+            if isinstance(node, ast.Attribute) and node.attr == name and not isinstance(node.ctx, ast.Load):
+                return None
+    for node in ast.walk(child.tree):
+        if isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            return None
+        if isinstance(node, ast.Delete) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return None
+    for st in child.tree.body:
+        if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                and st.targets[0].id == name):
+            return st
+    return None
+
+
+def module_constant(child, name, resolvers):
+    """``{(type,)}`` when ``name`` is bound in the source module ``child`` exactly once, at the top level, to a literal
+    ``int`` / ``float`` / ``str`` / ``bytes`` / ``bool`` / ``None`` (:func:`stable_module_name`) -- a scalar nothing in this task
+    can change."""
+    st = stable_module_name(child, name, resolvers)
+    if st is not None and isinstance(st.value, ast.Constant) and type(st.value.value) in (
+            int, float, str, bytes, bool, type(None)):
+        return {(type(st.value.value).__name__,)}
+    return None
+
+
 class Provenance:
     def __init__(self, resolver, *, class_only=False):
         self.r = resolver
@@ -155,6 +188,8 @@ class Provenance:
         for n in self.nodes:
             if isinstance(n, ast.Global):
                 self.globals[self.r.function_of(n)].update(n.names)
+        own = {c: dict(self.methods[c]) for c in self.classes}
+        self.linearization = {}
         pending = set(self.classes)
         while pending:
             progressed = False
@@ -163,7 +198,26 @@ class Provenance:
                     isinstance(b, ast.Name) and b.id == "object" and resolver.is_builtin(b))]
                 matches = [{k for k in self.classes if isinstance(b, ast.Name) and k.name == b.id}
                            for b in bases]
-                if len(matches) > 1 or any(len(m) != 1 for m in matches):
+                if len(matches) > 1 and all(len(m) == 1 for m in matches):
+                    # Multiple inheritance among classes of this file: the C3 linearization (``type.mro``), exact when every base
+                    # is a plain, unrebound class that is itself resolved; an inconsistent order (a TypeError at class creation)
+                    # or an opaque base keeps the class opaque.
+                    parents = [next(iter(m)) for m in matches]
+                    if any(base in pending for base in parents):
+                        continue
+                    rebound = any((isinstance(n, ast.Name) and n.id in {b.name for b in parents} and isinstance(n.ctx, (ast.Store, ast.Del)))
+                                  or (isinstance(n, ast.arg) and n.arg in {b.name for b in parents})
+                                  or (isinstance(n, ast.FunctionDef) and n.name in {b.name for b in parents})
+                                  for n in self.nodes)
+                    order = None if rebound or any(base in self.opaque for base in parents) else self._c3(c, parents)
+                    if order is None:
+                        self.opaque.add(c)
+                    else:
+                        merged = {}
+                        for k in reversed(order):
+                            merged.update(own[k])
+                        self.methods[c] = merged
+                elif len(matches) > 1 or any(len(m) != 1 for m in matches):
                     self.opaque.add(c)
                 elif matches:
                     base = next(iter(matches[0]))
@@ -180,6 +234,8 @@ class Provenance:
                     self.methods[c] = self.methods[base] | self.methods[c]
                     if base in self.opaque:
                         self.opaque.add(c)
+                self.linearization[c] = self._c3(c, [next(iter(m)) for m in matches]) if (
+                    matches and all(len(m) == 1 for m in matches)) else [c]
                 pending.remove(c)
                 progressed = True
             if not progressed:
@@ -198,6 +254,25 @@ class Provenance:
             else:
                 self.unsafe = True
                 return
+
+    def _c3(self, c, parents):
+        """``[c, ...]`` in C3 order for a class whose ``parents`` (classes of this file) are already linearized, or ``None``."""
+        sequences = [list(self.linearization.get(p, [p])) for p in parents] + [list(parents)]
+        order = [c]
+        while True:
+            sequences = [q for q in sequences if q]
+            if not sequences:
+                return order
+            for q in sequences:
+                head = q[0]
+                if not any(head in other[1:] for other in sequences):
+                    break
+            else:
+                return None
+            order.append(head)
+            for q in sequences:
+                if q[0] is head:
+                    del q[0]
 
     def add(self, key, values):
         old = self.facts[key]
@@ -284,6 +359,28 @@ class Provenance:
 
     def scalar(self, values):
         return bool(values) and all(len(v) == 1 and v[0] in SCALARS for v in values)
+
+    def scalar_container(self, values, seen=frozenset()):
+        """Every value is a builtin list/tuple/dict whose elements (and keys) are scalars or such containers, none of them a set (its
+        order is the hash order of its elements) and none cyclic: iterating it, or calling ``.items()``, runs no program code and
+        visits the same elements in the same order on every run."""
+        if self.unsafe or not values:
+            return False
+        for v in values:
+            if v[0] == "set" and v not in seen:
+                # a set of ints (bools) iterates in an order fixed by the values and the insertion history: no hash seed, no address
+                if not all(e in {("int",), ("bool",)} for e in self.get(("elem", v[1]))):
+                    return False
+                continue
+            if v[0] not in {"seq", "dict"} or v in seen:
+                return False
+            elements = self.get(("elem", v[1]))
+            if v[0] == "dict":
+                elements = elements | self.get(("key", v[1]))
+            for e in elements:
+                if not ((len(e) == 1 and e[0] in SCALARS) or self.scalar_container({e}, seen | {v})):
+                    return False
+        return True
 
     def closed_deques(self):
         """A closed transport/effect domain, checked after the all-write fixpoint.
@@ -516,6 +613,8 @@ class Provenance:
             if mode == "format":
                 f = methods.get("__format__", f)
             return f is not None and self.scalar(self.get(("return", f)))
+        if value[0] == "set" and mode in {"repr", "str"}:
+            return all(e in {("int",), ("bool",)} for e in self.get(("elem", value[1])))     # an int set's repr order is fixed
         if value[0] in {"seq", "dict"}:
             elements = self.get(("elem", value[1]))
             if value[0] == "dict":
@@ -649,6 +748,9 @@ class Provenance:
                 return {("str",)}
             if self.r.is_builtin(n):
                 return {("builtin", n.id)}
+            constant = self._extern_constant(n)
+            if constant is not None:
+                return constant
             return self.get(self.key(n))
         if isinstance(n, (ast.List, ast.Tuple, ast.Set, ast.ListComp, ast.SetComp, ast.GeneratorExp)):
             if hasattr(n, "elts"):
@@ -662,16 +764,39 @@ class Provenance:
             return {("iterator" if isinstance(n, ast.GeneratorExp) else "seq", n)}
         if isinstance(n, ast.Dict):
             for k, v in zip(n.keys, n.values):
-                self.add(("key", n), self.value(k) if k is not None else {UNKNOWN})
-                self.add(("elem", n), self.value(v) if k is not None else {UNKNOWN})
+                if k is None:
+                    mappings = self.value(v)
+                    self.add(("key", n), set().union(*(self.get(("key", ob[1]))
+                        if ob[0] == "dict" else {UNKNOWN} for ob in mappings)))
+                    self.add(("elem", n), self.elements_mapping(mappings))
+                else:
+                    self.add(("key", n), self.value(k))
+                    self.add(("elem", n), self.value(v))
             return {("dict", n)}
-        if self.lambda_defaultdicts and isinstance(n, ast.DictComp):
+        if isinstance(n, ast.DictComp) and (self.lambda_defaultdicts or self.dict_projection(n)):
+            if not self.lambda_defaultdicts:
+                call = n.generators[0].iter
+                views = self.value(call)
+                if not views and not self.final:
+                    return set()
+                if views != {("iterator", call)}:
+                    return {UNKNOWN}
+                keys, values = self.value(n.key), self.value(n.value)
+                if (not keys or not values) and not self.final:
+                    return set()
+                if not self.scalar(keys) or not self.scalar(values):
+                    return {UNKNOWN}
             self.add(("key", n), self.value(n.key))
             self.add(("elem", n), self.value(n.value))
             return {("dict", n)}
         if isinstance(n, ast.Attribute):
             if isinstance(n.value, ast.Name) and (self.r.imports.modules.get(n.value.id), n.attr) in STRING_CONSTANTS:
                 return {("str",)}
+            child = self.r.source_module(n.value)
+            if child is not None and isinstance(n.ctx, ast.Load):
+                constant = self._module_constant(child, n.attr)
+                if constant is not None:
+                    return constant
             out = set()
             for ob in self.value(n.value):
                 if ob[0] == "inst":
@@ -784,6 +909,64 @@ class Provenance:
             return self.call(n)
         return {UNKNOWN}
 
+    def _module_constant(self, child, name):
+        return module_constant(child, name, self.r.all_resolvers())
+
+    def _extern_constant(self, n):
+        """The scalar type of a name imported (``from ext import key``) from a source module, when this file binds it nowhere
+        else and the module's own binding is a literal (:meth:`_module_constant`)."""
+        module, exported = self.r.imports.names.get(n.id, (None, None))
+        child = self.r.externs.get(n.id)
+        if child is None or module != f"$extern:{child.filename}" or self.r._rebound(n.id):
+            return None
+        return self._module_constant(child, exported)
+
+    def dict_projection(self, node):
+        """A nonescaping items view projected into a dict, with an optional key truth filter."""
+        if not isinstance(node, ast.DictComp) or len(node.generators) != 1:
+            return False
+        clause = node.generators[0]
+        target, call = clause.target, clause.iter
+        if (clause.is_async or not isinstance(target, ast.Tuple) or len(target.elts) != 2
+                or not all(isinstance(n, ast.Name) for n in target.elts)
+                or target.elts[0].id == target.elts[1].id
+                or not isinstance(node.key, ast.Name) or not isinstance(node.value, ast.Name)
+                or self.key(node.key) != self.key(target.elts[0])
+                or self.key(node.value) != self.key(target.elts[1])
+                or len(clause.ifs) > 1
+                or any(not isinstance(n, ast.Name) or self.key(n) != self.key(target.elts[0])
+                       for n in clause.ifs)):
+            return False
+        return (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "items" and not call.args and not call.keywords)
+
+    def verifier_dict_callbacks(self, call):
+        """The tested dict draw with two direct, resolved native scalar callbacks."""
+        from .contracts import get
+
+        contract = get("_sv_verifier.nondet_dict")
+        if (contract is None or not contract.tested or contract.returns is None
+                or not contract.returns.tested or contract.returns.type != "dict"):
+            return None
+        if (any(isinstance(a, ast.Starred) for a in call.args)
+                or any(k.arg is None for k in call.keywords)
+                or len({k.arg for k in call.keywords}) != len(call.keywords)):
+            return None
+        parameters = [Parameter(name, Parameter.POSITIONAL_OR_KEYWORD)
+                      for name in ("nondet_key", "nondet_value")]
+        try:
+            bound = Signature(parameters).bind(*call.args, **{k.arg: k.value for k in call.keywords})
+        except TypeError:
+            return None
+        kinds = []
+        for callback in (bound.arguments["nondet_key"], bound.arguments["nondet_value"]):
+            name = self.r.call_name(ast.Call(func=callback, args=[], keywords=[]))
+            if name not in {"_sv_verifier.nondet_int", "_sv_verifier.nondet_bool",
+                            "_sv_verifier.nondet_float", "_sv_verifier.nondet_str"}:
+                return None
+            kinds.append((name.rsplit("_", 1)[1],))
+        return tuple(kinds)
+
     def _synthetic_pair(self, call):
         key = ("pair", call)
         if key not in self.slices:
@@ -792,6 +975,21 @@ class Provenance:
 
     def call(self, n):
         name = self.r.call_name(n)
+        if name == "_sv_verifier.check_type":
+            from .check_type_hints import check_type_arguments, check_type_contract
+            if check_type_arguments(n) is not None and check_type_contract() is not None:
+                # It reads its arguments and returns None (the tested contract).  The census admits a call only when no program code
+                # can run inside it (``determinism.py::_Census.check_type_call``), so nothing reachable from the arguments is
+                # mutated: it is no escape.  A call the census refuses refuses the whole program anyway.
+                return {("NoneType",)}
+        if name == "_sv_verifier.nondet_dict":
+            callbacks = self.verifier_dict_callbacks(n)
+            if callbacks is None:
+                return {UNKNOWN}
+            keys, values = callbacks
+            self.add(("key", n), {keys})
+            self.add(("elem", n), {values})
+            return {("dict", n)}
         if self.empty_counter(n):
             return {("counter", n)}
         if self.counter_values_call(n):
@@ -849,6 +1047,9 @@ class Provenance:
             return self._heapq_call(n, name, args, kwargs)
         if name == "type" and len(n.args) == 1 and not n.keywords:
             return {("type",)}
+        if (name == "hash" and len(args) == 1 and not kwargs and not starred and args[0]
+                and all(v in {("int",), ("float",), ("bool",), ("complex",)} for v in args[0])):
+            return {("int",)}       # a number hashes by value (no seed), to an int
         if name in {"math.sqrt", "math.sin", "math.cos", "math.tan", "math.fabs",
                     "math.acos", "math.asin", "math.atan", "math.atan2", "math.exp", "math.log"}:
             return {("float",)}
@@ -872,8 +1073,8 @@ class Provenance:
             return {(SCALAR_CALLS[name],)}
         if name == "range":
             return {("range",)}
-        if (self.class_only and name == "enumerate" and len(args) == 1 and not kwargs and not starred
-                and args[0] and all(v[0] in {"seq", "str", "bytes", "range", "dict"} for v in args[0])):
+        if (name == "enumerate" and len(args) == 1 and not kwargs and not starred
+                and all(v[0] in {"seq", "str", "bytes", "range", "dict"} for v in args[0])):
             # iterating a builtin container runs no program code and mutates nothing; each step is a fresh
             # (position, element) pair, modelled by one synthetic tuple per call
             pair = self._synthetic_pair(n)
@@ -961,6 +1162,32 @@ class Provenance:
                         out.add(("int",))
                     else:
                         out.add(("NoneType",))
+                elif (ob[0] == "dict" and method == "items"
+                      and isinstance((clause := self.r.parent.get(n)), ast.comprehension)
+                      and clause.iter is n and self.dict_projection(self.r.parent.get(clause))):
+                    from .contracts import get
+
+                    contract = get("dict.items")
+                    keys, values = self.get(("key", ob[1])), self.get(("elem", ob[1]))
+                    if (not keys or not values) and not self.final:
+                        continue
+                    if (contract is None or not contract.tested or contract.returns is None
+                            or not contract.returns.tested or contract.returns.type != "dict_items"
+                            or not self.scalar(keys) or not self.scalar(values)):
+                        self.escape({ob})
+                        out.add(UNKNOWN)
+                    else:
+                        pair = self._synthetic_pair(n)
+                        self.add(("item", pair, 0), keys)
+                        self.add(("item", pair, 1), values)
+                        self.add(("elem", pair), keys | values)
+                        self.add(("elem", n), {("seq", pair)})
+                        out.add(("iterator", n))
+                elif ob[0] == "dict" and method == "copy" and not args and not kwargs:
+                    # a new dict of the same keys and values; the receiver is only read
+                    self.add(("key", n), self.get(("key", ob[1])))
+                    self.add(("elem", n), self.get(("elem", ob[1])))
+                    out.add(("dict", n))
                 elif ob[0] == "dict" and method in {"get", "pop", "setdefault"}:
                     if method != "get":
                         self.invalidate({ob})

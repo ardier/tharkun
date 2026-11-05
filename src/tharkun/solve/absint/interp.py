@@ -1,8 +1,8 @@
 """The absint interpreter: an abstract interpretation of one whole Python program.
 
 It walks the program's AST from the module body, inlining every call to the
-program's own functions (context-sensitive by call string; recursion is not
-modelled and aborts).  Loops are solved by a widening fixpoint followed by one
+program's own functions (context-sensitive by call string, including finite
+recursive activations). Loops are solved by a widening fixpoint followed by one
 *verified* narrowing step: the narrowed head is kept only when the loop body
 maps it into itself, so soundness never depends on the transfer functions
 being monotone.
@@ -17,7 +17,7 @@ the program, so they cannot reach a later site).
 
 Anything the interpreter does not model raises :class:`Unsupported`, and the
 verdict is UNKNOWN: absint never guesses.  Aborting constructs include
-``try``/``with``, generators, closures and unsupported lambda forms, recursion, ``eval``/``exec``,
+``try``/``with``, generators, closures and unsupported lambda forms, unfinished recursion, ``eval``/``exec``,
 ``getattr``/``setattr``, unmodelled builtins and library calls, and user
 classes with dunder methods it does not model.
 """
@@ -34,18 +34,19 @@ import sys
 from .. import values as fv
 from ..contracts.adapters import math_model as _mm
 from ..loop_family import ACCUMULATOR, AFFINE, ITERATOR, KERNEL, SEARCH, classify_loop_family
-from . import lemmas
-from ..lowering.provenance import ROLE_ATTR, path_of
+from . import exactfloat, lemmas
+from ..lowering.provenance import EVAL_SITE_ATTR, ROLE_ATTR, path_of
 
 from .errors import Unsupported
 from .rand import RandomMixin
 from .reducers import NO_HOOK_CLASSES, ReducersMixin
 from .sets import FROZENSET_METHODS, SET_METHODS, SetsMixin
+from tharkun.solve.pyresolve import Top
 from .state import Frame, Incompatible, State, iv_of_len, vjoin
-from .visitor import (AbsintVisitor, CallCtx, LengthHintCtx, MethodCtx, OutfileCtx, ProtocolCtx, SubscriptCtx, exact_int_value,
+from .visitor import (_FLOAT_CONVERSION_MAX_INT, AbsintVisitor, CallCtx, LengthHintCtx, MethodCtx, OutfileCtx, ProtocolCtx, SubscriptCtx, exact_int_value,
                       hook_free_value, int_or_none_value, non_int_value, serve_module_functions, serve_set_operations)
 from .aval import (ANYSTR, ANY_STR, BOOL, BOT, FLOAT, FloatInfo, NONE, V, const_bool, const_int, const_str, int_iv)
-from .heap import (ArrayObj, DefaultDictObj, DictObj, DictView, BoundMethod, BuiltinMethod, ClassObj, FuncObj, InstObj, IteratorObj, ListObj, OutFileObj, RangeObj, SetObj, StringIOObj, TupleObj, seg_var)
+from .heap import (ArrayObj, DefaultDictObj, DictObj, DictView, BoundMethod, BuiltinMethod, ClassObj, ExceptionObj, FuncObj, GeneratorFrame, GeneratorObj, InstObj, IteratorObj, ListObj, OutFileObj, ReadFileObj, RangeObj, SetObj, StringIOObj, TextWrapperObj, TupleObj, NamedTupleClassObj, NamedTupleObj, seg_var, ZipObj, EnumerateObj)
 from .linear import (IntInfo, Lin, lin_bounds, lin_entails_le)
 from .zone import ZERO
 
@@ -54,11 +55,11 @@ WIDEN_DELAY = 0
 MAX_ITERS = 40
 #: results kept per (loop, call string, analyzer scratch) for fixpoint reuse; the oldest goes first
 FIX_REUSE_WAYS = 8
-MAX_DEPTH = 24
-MAX_STAR_ARGS = 64
 #: case splits on a boolean draw one analysis may make (docs/ABSINT.md "Case splits on a boolean draw"); a full tree
 #: of depth 6 is 63 splits, and once the budget is spent the draws are analysed joined, as they always were
 MAX_DRAW_SPLITS = 64
+#: the most values of a drawn int a case split enumerates (``abs(nondet_int()) % 16`` is the widest)
+MAX_INT_SPLIT = 16
 
 # A decimal int below this limit has at most CPython's minimum enabled conversion limit (640) digits.
 _PRINT_INT_ABS_LIMIT = 10 ** 640
@@ -124,11 +125,13 @@ _METHOD_HOOKS = {
     "tuple.index": "an operand or element with a user comparison is refused (custom_comparison); the bounds are ints",
     "list.extend": "an instance's __iter__ body is analysed (iterable()) and its __len__ probe is ruled by protocol.length_hint "
                    "(consumer list.extend); a builtin iterable runs no hook",
-    "dict.get": "a key that is not a scalar is refused (check_hash_key): the hash and equality of a str, int, float, bool or None "
-                "run no user code",
+    "dict.setdefault": "non-float scalar keys and primitive fields on an exact builtin dict run no hashing, equality or cleanup hook",
+    "dict.pop": "closed builtin scalar keys run no hashing or equality hook; the removed value is returned and the unused default is primitive",
+    "dict.get": "check_hash_key admits only builtin scalar leaves or exact tuples containing them; hashing and equality run no user code",
     "dict.keys": "a view is built, no element is touched",
     "dict.values": "a view is built, no element is touched",
     "dict.items": "a view is built, no element is touched",
+    "dict.update": "exact builtin mappings with non-float scalar keys and primitive values: no mapping, hashing, equality or cleanup hook runs",
     "io.StringIO.write": "a class deriving from str is refused where it is defined (a builtin base other than object and the "
                          "exceptions is), so no __str__ of a str subclass runs",
     "io.StringIO.read": _NO_USER_DUNDER.format("__index__"),
@@ -137,13 +140,15 @@ _METHOD_HOOKS = {
     "list.__getitem__": _NO_USER_DUNDER.format("__index__"),
     "list.__setitem__": _NO_USER_DUNDER.format("__index__"),
     "tuple.__getitem__": _NO_USER_DUNDER.format("__index__"),
-    "dict.__getitem__": "a key that is not a scalar is refused (check_hash_key): the hash and equality of a str, int, float, bool or "
-                        "None run no user code",
+    "dict.__getitem__": "check_hash_key admits only builtin scalar leaves or exact tuples containing them; hashing and equality run no user code",
     "collections.defaultdict.__getitem__": "the exact constructor model admits only the builtin list factory or None, and check_hash_key "
-                                            "refuses non-scalar keys, so neither key nor factory runs user code",
-    "dict.__setitem__": "a key that is not a scalar is refused (check_hash_key): the hash and equality of a str, int, float, bool or "
-                        "None run no user code",
+                                            "admits only builtin scalar leaves or exact tuples containing them, so neither key nor factory runs user code",
+    "dict.__setitem__": "check_hash_key admits only builtin scalar leaves or exact tuples containing them; hashing and equality run no user code",
 }
+
+
+# Exact call shapes whose tested builtin contract proves no exception under try.
+_TRY_METHOD_ALLOWLIST = frozenset({("list", "append", 1, False)})
 
 
 #: the call's own classes the model of a method argues without recording a check: rule qualname -> {class: why}
@@ -155,22 +160,24 @@ _METHOD_NATIVE = {
 
 
 #: the functions of the ``random`` module the analyzer models by hand (``rand.py``) and reads through their rules ([internal ref] step 2):
-#: rule qualname -> why no user hook runs (``Analyzer._modelled``).  ``random.random`` and ``random.seed`` have none: the contract
-#: says ``never`` for every class their call shape leaves open.
+#: rule qualname -> why no user hook runs in the model's admitted operand shapes (``Analyzer._modelled``).
 _RANDOM_NO_HOOK = ("``RandomMixin._random_args`` refuses a user object by name (instance_value): no ``{}`` of a user class runs, and "
                    "an int, float, str, bool, None, list, tuple or array runs none")
 _MODULE_HOOKS = {
-    "_sv_verifier.nondet_list": "the callback is an exact alias of a supported zero-argument verifier scalar draw; its native body invokes no user code",
+    "collections.namedtuple": "exact string declarations and builtin sequence defaults run no user hooks; construction only binds fields",
+    "_sv_verifier.nondet_list": "the callback is an exact verifier scalar draw or an authenticated source expression returning fresh dicts of primitive values; all nested calls are exact scalar draws, with no open hook or external mutation",
     "_sv_verifier.nondet_dict": "both callbacks are exact aliases of supported zero-argument verifier scalar draws; generated keys are primitive and invoke no user code",
-    "_sv_verifier.check_type": "the modeled paths use one exact builtin class hint and a primitive scalar, or an exact list/dict whose hint matches; builtin isinstance checks invoke no user hook",
+    "_sv_verifier.check_type": "the modeled paths use exact class hints or recursively checked builtin generic hints; builtin values and containers invoke no user hook",
     "collections.defaultdict": "this narrow transfer accepts only the builtin list type or None as the factory and no initializer; construction does not call the factory",
     "copy.copy": "the argument is an exact builtin list: CPython uses list.copy, so no __copy__ or pickle reducer runs",
+    "copy.deepcopy": "one int/bool/str/None argument takes CPython's atomic identity fast path; no memo, copy or pickle hook runs",
     "random.randint": _RANDOM_NO_HOOK.format("__index__"),
     "random.randrange": _RANDOM_NO_HOOK.format("__index__"),
     "random.choice": _RANDOM_NO_HOOK.format("__len__`` or ``__getitem__"),
     "random.uniform": _RANDOM_NO_HOOK.format("__sub__``, ``__mul__`` or ``__add__"),
+    "array.array": "the model admits only numeric typecodes, builtin list/tuple/array initializers and closed builtin element conversions",
     "random.random": "the call has no operand",
-    "random.seed": "seed type-checks its argument directly (None, int, float, str, bytes, bytearray): no dunder is involved",
+    "random.seed": "the seed model validates closed builtin seed kinds and scalar version comparisons; subclass hooks are refused",
 }
 
 
@@ -255,14 +262,14 @@ def _reflective_unresolved_name(name: str) -> bool:
 # transfer below. Admission without a transfer is never a proof.
 BINARY_METHODS = {
     ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "truediv",
-    ast.FloorDiv: "floordiv", ast.Mod: "mod", ast.Pow: "pow",
+    ast.FloorDiv: "floordiv", ast.Mod: "mod", ast.Pow: "pow", ast.MatMult: "matmul",
 }
 COMPARISON_METHODS = {
     ast.Eq: ("__eq__", "__eq__"), ast.NotEq: ("__ne__", "__ne__"),
     ast.Lt: ("__lt__", "__gt__"), ast.LtE: ("__le__", "__ge__"),
     ast.Gt: ("__gt__", "__lt__"), ast.GtE: ("__ge__", "__le__"),
 }
-SUPPORTED_DUNDERS = {"__getitem__", "__setitem__", "__len__", "__iter__", "__call__"} | {
+SUPPORTED_DUNDERS = {"__getitem__", "__setitem__", "__len__", "__iter__", "__next__", "__call__"} | {
     "__" + prefix + name + "__" for name in BINARY_METHODS.values() for prefix in ("", "r", "i")
 } | {name for pair in COMPARISON_METHODS.values() for name in pair}
 UNSUPPORTED_DUNDERS = (UNSUPPORTED_DUNDERS - SUPPORTED_DUNDERS) | {"__length_hint__"}
@@ -297,10 +304,10 @@ class _ProbeScope:
 
 class FuncCtx:
     __slots__ = ("node", "local_names", "global_names", "returns", "is_module", "is_class",
-                 "module_key", "raises")
+                 "module_key", "raises", "activation", "capture_frames", "mutable_cells")
 
     def __init__(self, node, local_names, global_names, is_module=False, is_class=False,
-                 module_key=""):
+                 module_key="", capture_frames=None):
         self.node = node
         self.local_names = local_names
         self.global_names = global_names
@@ -310,6 +317,9 @@ class FuncCtx:
         self.is_class = is_class
         # [internal ref]: "" is the program's own module (unchanged behaviour); see FuncObj.module_key.
         self.module_key = module_key
+        self.activation = None
+        self.capture_frames = {} if capture_frames is None else capture_frames
+        self.mutable_cells = set()
 
 
 _EXC_GROUPS = frozenset({"ExceptionGroup", "BaseExceptionGroup"})
@@ -321,9 +331,9 @@ class _Exc:
     (a builtin exception name, or the heap address of a user exception class: identity, never a name), the
     instance value, the site, and the check the site would have recorded outside a try (``op``, ``fact``,
     ``residual``, ``operand``): it is recorded only where the exception escapes (``Analyzer._route_exc``)."""
-    __slots__ = ("st", "cls", "val", "node", "op", "fact", "residual", "operand")
+    __slots__ = ("st", "cls", "val", "node", "op", "fact", "residual", "operand", "contract_qualname")
 
-    def __init__(self, st, cls, val, node, op, fact, residual=None, operand=None):
+    def __init__(self, st, cls, val, node, op, fact, residual=None, operand=None, contract_qualname=None):
         self.st = st
         self.cls = cls
         self.val = val
@@ -332,9 +342,10 @@ class _Exc:
         self.fact = fact
         self.residual = residual
         self.operand = operand
+        self.contract_qualname = contract_qualname
 
     def with_state(self, st):
-        return _Exc(st, self.cls, self.val, self.node, self.op, self.fact, self.residual, self.operand)
+        return _Exc(st, self.cls, self.val, self.node, self.op, self.fact, self.residual, self.operand, self.contract_qualname)
 
 
 class _TryFrame:
@@ -456,10 +467,175 @@ def _class_has_private_name_mangling(class_node: ast.ClassDef) -> bool:
     return visitor.found
 
 
-def _assigned_names(body) -> tuple[set[str], set[str]]:
+# ---------------------------------------------------------------- list displays that are never observed as lists
+#: names through which code reaches a module global without naming it, or builds code that does: the presence of any of them
+#: in any file of the program withdraws the whole analysis below (``frozen_list_displays``)
+_GLOBAL_CHANNEL_NAMES = frozenset({"globals", "vars", "locals", "eval", "exec", "compile", "setattr", "delattr", "getattr",
+                                   "__import__", "importlib", "__builtins__", "__main__", "breakpoint"})
+_GLOBAL_CHANNEL_ATTRS = frozenset({"modules", "__dict__", "f_globals", "f_locals", "__globals__", "__builtins__", "_getframe",
+                                   "import_module", "currentframe"})
+_GLOBAL_CHANNEL_MODULES = frozenset({"importlib", "__main__", "runpy", "inspect", "gc", "builtins", "ctypes", "code", "pdb"})
+
+
+def _identifiers(tree) -> set:
+    """Every identifier a tree spells: names, attributes, parameters, definitions, import names and string constants."""
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            out.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            out.add(n.attr)
+        elif isinstance(n, ast.arg):
+            out.add(n.arg)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(n.name)
+        elif isinstance(n, ast.alias):
+            out.update(part for part in (n.name, n.asname) if part)
+            out.update(n.name.split("."))
+        elif isinstance(n, ast.keyword) and n.arg:
+            out.add(n.arg)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            out.update(n.names)
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+            out.add(n.value)
+    return out
+
+
+def _has_global_channel(tree) -> bool:
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id in _GLOBAL_CHANNEL_NAMES:
+            return True
+        if isinstance(n, ast.Attribute) and n.attr in _GLOBAL_CHANNEL_ATTRS:
+            return True
+        if isinstance(n, ast.Import) and any(a.name.split(".")[0] in _GLOBAL_CHANNEL_MODULES for a in n.names):
+            return True
+        if isinstance(n, ast.ImportFrom) and ((n.module or "").split(".")[0] in _GLOBAL_CHANNEL_MODULES
+                                              or any(a.name == "*" for a in n.names)):
+            return True
+    return False
+
+
+def _imports_module(tree, stem: str) -> bool:
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import) and any(stem in a.name.split(".") for a in n.names):
+            return True
+        if isinstance(n, ast.ImportFrom) and (stem in (n.module or "").split(".")
+                                              or any(a.name == stem for a in n.names)):
+            return True
+    return False
+
+
+def frozen_list_displays(tree, others, stem: str) -> frozenset:
+    """The ``(line, col)`` of every list display/starred rest in module ``tree`` that nothing can observe as a list, so it may be
+    built with one element per position (as a tuple is) instead of one joined element.
+
+    A module-level name qualifies when EVERY binding of it, in every file, is a module-level (or module-level ``if``)
+    ``name = [<displays without a star>]`` or starred-rest binding, and EVERY other occurrence is one of the reads below.
+    Index errors retain the list's native exception payload even though positions use tuple storage:
+
+    * ``name[index]`` read (not a slice, not a store or ``del``, which would be a mutation);
+    * ``len(name)`` with the builtin ``len``;
+    * ``a, *b = name`` or ``a, b = name``: an unpacking (the rest is a fresh list);
+    * ``"separator".join(name)`` with a literal builtin str receiver.
+
+    Anything else (a call argument, an alias, an attribute such as ``.append``, ``for x in name``, ``name == ...``, a global
+    statement, a parameter, def, import or loop target of that name) disqualifies the name; so does any mention of the name in
+    another file of the program (a sibling can mutate the list through ``from main import name``), and ANY channel to a module
+    global that does not name it (``globals()``, ``vars()``, ``__dict__``, ``getattr``/``setattr``/``delattr``, ``eval``,
+    ``exec``, ``compile``, ``sys.modules``, ``importlib``, ``__main__``, a star import, a sibling that imports the program) withdraws
+    every name of the program."""
+    trees = [tree, *others]
+    if any(_has_global_channel(t) for t in trees) or any(_imports_module(t, stem) for t in others):
+        return frozenset()
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    candidates: dict = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1:
+            target = n.targets[0]
+            bindings = []
+            if (isinstance(target, ast.Name) and isinstance(n.value, ast.List)
+                    and not any(isinstance(e, ast.Starred) for e in n.value.elts)):
+                bindings.append((target.id, n, n.value))
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                bindings.extend((e.value.id, e, e) for e in target.elts
+                                if isinstance(e, ast.Starred) and isinstance(e.value, ast.Name))
+            up, at_module = parents.get(n), True
+            while up is not None and not isinstance(up, ast.Module):
+                at_module = at_module and isinstance(up, ast.If)
+                up = parents.get(up)
+            if at_module:
+                for name, binder, position in bindings:
+                    candidates.setdefault(name, []).append((binder, position))
+    if not candidates:
+        return frozenset()
+    elsewhere: set = set()
+    for other in others:
+        elsewhere |= _identifiers(other)
+    len_bound = False
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id == "len" and not isinstance(n.ctx, ast.Load):
+            len_bound = True
+        elif isinstance(n, ast.arg) and n.arg == "len":
+            len_bound = True
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == "len":
+            len_bound = True
+        elif isinstance(n, ast.alias) and (n.asname or n.name).split(".")[0] == "len":
+            len_bound = True
+        elif isinstance(n, (ast.Global, ast.Nonlocal)) and "len" in n.names:
+            len_bound = True
+    out = set()
+    for name, bindings in candidates.items():
+        binders = [binder for binder, _ in bindings]
+        if name in elsewhere:
+            continue
+        ok = True
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == name:
+                ok = False
+            elif isinstance(n, ast.arg) and n.arg == name:
+                ok = False
+            elif isinstance(n, ast.alias) and (n.asname or n.name).split(".")[0] == name:
+                ok = False
+            elif isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
+                ok = False
+            elif isinstance(n, ast.ExceptHandler) and n.name == name:
+                ok = False
+            elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name == name:
+                ok = False
+            elif isinstance(n, ast.MatchMapping) and n.rest == name:
+                ok = False
+            elif isinstance(n, ast.Name) and n.id == name:
+                parent = parents.get(n)
+                if isinstance(n.ctx, ast.Store):
+                    ok = ok and isinstance(parent, (ast.Assign, ast.Starred)) and parent in binders
+                elif isinstance(n.ctx, ast.Del):
+                    ok = False
+                elif isinstance(parent, ast.Subscript) and parent.value is n:
+                    ok = ok and isinstance(parent.ctx, ast.Load) and not isinstance(parent.slice, ast.Slice)
+                elif (isinstance(parent, ast.Call) and not len_bound and isinstance(parent.func, ast.Name)
+                      and parent.func.id == "len" and parent.args == [n] and not parent.keywords):
+                    pass
+                elif (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Attribute)
+                      and parent.func.attr == "join" and isinstance(parent.func.value, ast.Constant)
+                      and type(parent.func.value.value) is str and parent.args == [n] and not parent.keywords):
+                    pass
+                elif (isinstance(parent, ast.Assign) and parent.value is n
+                      and all(isinstance(t, (ast.Tuple, ast.List)) for t in parent.targets)):
+                    pass
+                else:
+                    ok = False
+            if not ok:
+                break
+        if ok:
+            out.update((position.lineno, position.col_offset) for _, position in bindings)
+    return frozenset(out)
+
+
+def _assigned_names(body, *, allow_nonlocal=False) -> tuple[set[str], set[str]]:
     """Local names of a function body (Python scoping) and its ``global`` names."""
     loc: set[str] = set()
     glo: set[str] = set()
+    nonlocal_names: set[str] = set()
 
     class V_(ast.NodeVisitor):
         def visit_FunctionDef(self, n):
@@ -482,7 +658,9 @@ def _assigned_names(body) -> tuple[set[str], set[str]]:
             glo.update(n.names)
 
         def visit_Nonlocal(self, n):
-            raise Unsupported("nonlocal", n)
+            if not allow_nonlocal:
+                raise Unsupported("nonlocal", n)
+            nonlocal_names.update(n.names)
 
         def visit_Name(self, n):
             if isinstance(n.ctx, (ast.Store, ast.Del)):
@@ -507,14 +685,26 @@ def _assigned_names(body) -> tuple[set[str], set[str]]:
     vis = V_()
     for s in body:
         vis.visit(s)
-    return loc - glo, glo
+    return loc - glo - nonlocal_names, glo
 
 
 def _is_generator(fnode) -> bool:
-    for n in ast.walk(fnode):
+    pending = [fnode.body] if isinstance(fnode, ast.Lambda) else list(fnode.body)
+    while pending:
+        n = pending.pop()
         if isinstance(n, (ast.Yield, ast.YieldFrom, ast.Await)):
-            # only count yields of this function, not nested ones
             return True
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            # Defaults and decorators run in this scope; the nested body does not.
+            pending.extend(n.args.defaults)
+            pending.extend(value for value in n.args.kw_defaults if value is not None)
+            pending.extend(getattr(n, "decorator_list", ()))
+        elif isinstance(n, ast.ClassDef):
+            pending.extend(n.decorator_list)
+            pending.extend(n.bases)
+            pending.extend(keyword.value for keyword in n.keywords)
+        else:
+            pending.extend(ast.iter_child_nodes(n))
     return False
 
 
@@ -565,29 +755,55 @@ def _pow2_k(n: int) -> "int | None":
     return n.bit_length() - 1
 
 
+
+def _effect_free_arguments(call):
+    """True when evaluating the call's arguments can run no code and write nothing: each is a name or a constant, bare or
+    starred (``*args``, ``**kwargs``).  Then Python's order (look the attribute up, THEN evaluate the arguments) cannot
+    differ from evaluating the arguments first: nothing an argument does can rebind what the attribute names."""
+    def pure(n):
+        if isinstance(n, ast.Starred):
+            n = n.value
+        return isinstance(n, ast.Constant) or (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load))
+    return all(pure(a) for a in call.args) and all(pure(k.value) for k in call.keywords)
+
 class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
     def __init__(self, source: str, filename: str = "<program>", time_budget: float = 60.0,
                  class_hints=None, invariant_locations=(), lowered=None, site_source: str | None = None,
-                 declared_files=(), split_draws=False):
+                 declared_files=(), split_draws=False, frozen_lists=False, world=None):
         import time as _t
+        # docs/ABSINT.md "List displays nothing observes as a list": a display of a name that is only read by index, len and
+        # unpacking is built with one element per position
+        self.frozen_lists = frozen_lists
+        self._frozen_positions = None
         # docs/ABSINT.md "Case splits on a boolean draw": run a statement that holds one
         # ``_sv_verifier.nondet_bool()`` once per outcome and keep the rest of its block apart
         self.split_draws = split_draws
         self._forced_draws: dict = {}     # draw Call node -> (outcome, the activation it was forced in)
         self._partition_depth = 0         # >0 while a case split's outcomes run apart (see capture_invariant)
         self._split_budget = MAX_DRAW_SPLITS
+        # the joined run notes whether a retry with case splits has anything to refine (docs/ABSINT.md "Case splits on a
+        # value of a finite domain"): a statement that evaluates an input or a program function, a list display, a starred rest
+        self.split_hint = False
+        self._program_defs = None
         self.splits_done = 0
         self._clock = _t.process_time
         self.deadline = _t.process_time() + time_budget
         self.source = source
         self.filename = filename
         self.declared_files = tuple(declared_files)
+        self.world = world
         # [internal ref]: ``lowered`` is a ``solve.lowering`` result for this source.  The program that is
         # interpreted is its tree (comprehensions are loops there; every node keeps the line and
         # column of the original node it stands for), and everything this analyzer REPORTS about it
         # is put back in terms of the original program (``_orig``).
         self.lowered = lowered
         self.tree = lowered.tree if lowered is not None else ast.parse(source, filename)
+        self._value_equalities = any(
+            (isinstance(n, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq)) for op in n.ops))
+            or (isinstance(n, ast.Attribute) and n.attr in {"startswith", "endswith"})
+            or isinstance(n, (ast.If, ast.While, ast.IfExp, ast.BoolOp, ast.Assert))
+            or (isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not))
+            for n in ast.walk(self.tree))
         self.site_source = source if site_source is None else site_source
         self._record_source_tree = None
         self._record_source_nodes: dict[str, ast.AST] = {}
@@ -627,6 +843,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             self.invariant_points = source_points(self.tree, source, filename)
         self.checks: dict[tuple, Check] = {}
         self.records: dict[tuple, dict] = {}
+        self._assertion_search: dict[ast.AST, dict] = {}
         self._record_meta: dict[tuple, dict] = {}
         self._record_keys_by_node: dict[ast.AST, set[tuple]] = {}
         self._record_rules: dict[str, bool] = {}
@@ -735,7 +952,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return mapped
 
     def check(self, node, op: str, excs, ok: bool, fact: str = "", *, residual: str | None = None,
-              operand=None, st: State | None = None) -> None:
+              operand=None, st: State | None = None, exact_args=None, contract_qualname=None) -> None:
         for tap_node, seen in self._taps:
             if tap_node is node:
                 seen.append((frozenset(excs), ok))
@@ -751,18 +968,25 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 raise Unsupported(f"{op} may raise {','.join(sorted(excs))} inside a try: the raising state "
                                   "is not available at this site", node)
             for exc in sorted(excs):
-                self._route_exc(_Exc(st.copy(), exc, V(st=frozenset({("excinst", exc)})), node, op, fact,
-                                     residual, operand), self._fctx_stack[-1])
+                raising = st.copy()
+                val = V(st=frozenset({('excinst', exc)}))
+                if exact_args is not None and exc in exact_args:
+                    args = self.exception_args(raising, exact_args[exc], node)
+                    self.borrow(raising, args)
+                    addr = self.alloc(raising, node, lambda sid: ExceptionObj(exc, args), 'raised:'+exc)
+                    val = V(refs=frozenset({addr}))
+                self._route_exc(_Exc(raising, exc, val, node, op, fact,
+                                     residual, operand, contract_qualname), self._fctx_stack[-1])
             return
-        self._record_check(node, op, excs, ok, fact, residual=residual, operand=operand, st=st)
+        self._record_check(node, op, excs, ok, fact, residual=residual, operand=operand, st=st, contract_qualname=contract_qualname)
 
     def _record_check(self, node, op: str, excs, ok: bool, fact: str = "", *, residual: str | None = None,
-                      operand=None, st: State | None = None) -> None:
+                      operand=None, st: State | None = None, contract_qualname=None) -> None:
         """Record a check at its site (``checks``: the proof; ``records``: the per-site records): what
         ``check`` does outside a try, and what an exception that escaped every handler does ([internal ref])."""
         if not self.record:
             return
-        self._record(node, op, excs, ok, fact, residual, operand, st)
+        self._record(node, op, excs, ok, fact, residual, operand, st, contract_qualname)
         fact = self._orig(node, fact) or ""
         key = (getattr(node, "lineno", 0), getattr(node, "col_offset", 0), op)
         c = self.checks.get(key)
@@ -777,7 +1001,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             c.facts.append(fact)
 
     # ---------------------------------------------------------- site records
-    def _record(self, node, op, excs, ok, fact, residual, operand, st) -> None:
+    def _record(self, node, op, excs, ok, fact, residual, operand, st, contract_qualname=None) -> None:
         """The per-site record shared with lanes A and B (tharkun sv/sites.py shape):
         ``line col exc kind function guards status fact operand residual scope types
         context loop_iteration``.  ``scope`` holds MUST facts only (they hold on every
@@ -803,7 +1027,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             binding, binding_names = self._record_binding(node, site_key)
             fact_scope = None
             exact_binding_types = True
-            contract = self._record_contract(op, exc, node)
+            contract = self._record_contract(op, exc, node, contract_qualname)
             if prestate_scope(node, self._site_parents) == "statement_entry":
                 observation = self._statement_entry_observations.get(node)
                 if observation is not None and observation["valid"] and binding is not None:
@@ -822,6 +1046,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                     fact_scope = "site"
             if binding is not None and not exact_binding_types:
                 binding, binding_names, term_facts, fact_scope = None, (), [], None
+            if self._fctx_stack and getattr(self._fctx_stack[-1], "capture_frames", None):
+                # The source-bound export schema does not identify live closure owners.
+                binding, binding_names, term_facts, builtins, fact_scope = None, (), [], [], None
+                scope, types = set(), {}
             rec = self.records.get(key)
             ctx = [list(c[:2]) for c in self.callstring]
             if rec is None:
@@ -837,6 +1065,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 }
                 if binding is not None:
                     self.records[key]["fact_scope"] = fact_scope
+                if op == "assert":
+                    self.records[key].update(self._assertion_search.get(node, {}))
                 self._record_meta[key] = {"site": tuple(site) if site is not None else None,
                                           "binding": binding, "contract": contract,
                                           "fact_scope": fact_scope, "node": node}
@@ -872,11 +1102,13 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             if meta["contract"] != contract:
                 meta["contract"] = None
                 rec["contract"] = None
+            if op == "assert":
+                rec.update(self._assertion_search.get(node, {}))
 
-    def _record_contract(self, op, exc, node):
+    def _record_contract(self, op, exc, node, qualname=None):
         direct = {"binop": "protocol.binary_operator", "divide": "protocol.binary_operator",
                   "unary": "protocol.unary_operator"}
-        qualname = direct.get(op)
+        qualname = qualname or direct.get(op)
         if qualname is None and isinstance(op, str) and ":" in op:
             qualname = op.split(":", 1)[0]
         if qualname is None and op in {"operator", "compare"}:
@@ -973,10 +1205,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 resolved = self.builtin_name(name, node)
             except (Unsupported, Incompatible):
                 return []
-            # ``type`` is a builtin identity even though the value interpreter
-            # deliberately leaves its call result TOP (there is no b_type model).
+            # ``type`` is a builtin identity: ``b_type`` models its one-argument call
             if (resolved.st == frozenset({("type", name)})
-                    or (name == "type" and name in _BUILTIN_NAMES and resolved.top)):
+                    or (name == "type" and resolved.st == frozenset({("builtin", "type")}))):
                 result.append(name)
         return sorted(result)
 
@@ -1414,6 +1645,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         # program's own file or another extern file. Always "" (unchanged) for any program
         # that never triggers read-and-recurse -- a constant prefix does not change relative
         # uniqueness, so this is a no-op for every program's own allocation-site identity.
+        if (unit := getattr(node, EVAL_SITE_ATTR, None)) is not None:
+            tag += ':eval:' + unit
         return (self._cur_module_key, tuple(self.callstring), getattr(node, "lineno", 0),
                 getattr(node, "col_offset", 0), tag)
 
@@ -1513,6 +1746,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             z.add(ii.lo[0], zn, -ii.lo[1])
         if ii.hi is not None and ii.hi[0] != ZERO and ii.hi[0] in z.vars:
             z.add(zn, ii.hi[0], ii.hi[1])
+        if lin is not None:
+            equation = Lin.var(zn).sub(lin)
+            z.remember_affine(equation.terms, equation.c)
 
     def to_temp(self, st: State, ii: IntInfo) -> IntInfo:
         t = self.fresh(st)
@@ -1575,8 +1811,42 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         lo, hi = self.ibounds(st, ii)
         return v.replace(i=IntInfo(None, None if lo is None else (ZERO, lo), None if hi is None else (ZERO, hi)))
 
+    def _int_choice_demand(self):
+        """Track memberships only where the source can query this coordinate."""
+        if not self._fctx_stack or self._fctx_stack[-1].is_class:
+            return False
+        scope = self._fctx_stack[-1].node
+        cache = getattr(self, '_int_choice_demands', None)
+        if cache is None:
+            cache = self._int_choice_demands = {}
+        if scope not in cache:
+            found = False
+            for node in ast.walk(scope):
+                if self._clock() > self.deadline:
+                    raise Unsupported('integer membership demand time budget exhausted')
+                if not isinstance(node, ast.Compare):
+                    continue
+                operands = [node.left, *node.comparators]
+                for left, op, right in zip(operands, node.ops, operands[1:]):
+                    if (isinstance(op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE))
+                            and all(isinstance(x, ast.Name) or isinstance(x, ast.Constant)
+                                    and type(x.value) is int for x in (left, right))):
+                        found = True
+                        break
+                if found:
+                    break
+            cache[scope] = found
+        return cache[scope]
+
     def join_into(self, st: State, old: V, new: V) -> V:
-        return vjoin(old, st.zone, self.summarize(st, new), st.zone)
+        if new.only_int() and new.int_values is None and self._int_choice_demand():
+            lo, hi = self.ibounds(st, new.i)
+            if lo is not None and lo == hi:
+                new = new.replace(int_values=frozenset({lo}))
+        result = vjoin(old, st.zone, self.summarize(st, new), st.zone)
+        if result.int_values is not None and self._clock() > self.deadline:
+            raise Unsupported('integer membership collection time budget exhausted')
+        return result
 
     def fresh_pass(self) -> None:
         """A pass over a loop (the first iteration, a fixpoint step, the final pass) starts where a statement
@@ -1679,10 +1949,14 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         r, s = (site, "r"), (site, "s")
         st.strip_terms(lambda t: t == r)
         ob = st.heap.pop(r)
+        if self._value_equalities and any(v.value_term is not None for v in ob.values()):
+            from .state import _map_obj
+            # A summary stands for independent allocations, not one scalar snapshot.
+            ob = _map_obj(ob, lambda v: v.replace(value_term=None) if v.value_term is not None else v)
         z = st.zone
         zvs = ob.zvars()
         if ob.kind == "inst":
-            ob = InstObj(ob.cls, {k: (v, d, None) for k, (v, d, _r) in ob.attrs.items()}, ob.qf)
+            ob = InstObj(ob.cls, {k: (v, d, None) for k, (v, d, _r) in ob.attrs.items()}, ob.qf, ob.exc_args)
         if ob.kind == "list" and ob.pre is not None:
             ob = ListObj(ob.length, vjoin(ob.elem, z, ob.pre, z), None)
         if ob.kind in ("list", "tuple", "array") and isinstance(ob.length, str):
@@ -1722,7 +1996,19 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
 
         def make(sid):
             if kind == "tuple" and items is not None:
-                return TupleObj(tuple(self.summarize(st, x) for x in items))
+                if not self._value_equalities:
+                    return TupleObj(tuple(self.summarize(st, x) for x in items))
+                values = []
+                for value in items:
+                    strings = value.s
+                    if (strings is not None and value.value_term is None and value.kinds() == ['str']
+                            and (strings == ANY_STR or len(strings) != 1)):
+                        if self._clock() > self.deadline:
+                            raise Unsupported('positional string snapshot time budget exhausted', node)
+                        # Each position captures its actual value, even for shared ANYSTR views.
+                        value = value.replace(value_term=self._string_term(value))
+                    values.append(self.summarize(st, value))
+                return TupleObj(tuple(values))
             lv = f"L.{sid}"
             if length_ii is None:
                 st.zone.forget(lv)
@@ -1806,15 +2092,77 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             return ob
         return ob.replace(length=(lo, hi))
 
+    @staticmethod
+    def _identity_slot(name):
+        return "g:\x00identity=" + name
+
+    def _identity_demand(self):
+        self._track_module_identity = False
+        candidates, work = [], [self.tree]
+        while work:
+            if self._clock() > self.deadline:
+                raise Unsupported("identity demand time budget exhausted")
+            node = work.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(node, ast.Compare) and any(
+                    isinstance(op, (ast.Is, ast.IsNot)) and isinstance(left, ast.Name)
+                    and isinstance(right, ast.Name)
+                    for left, op, right in zip([node.left, *node.comparators[:-1]], node.ops, node.comparators)):
+                candidates.append(node)
+            work.extend(ast.iter_child_nodes(node))
+        if candidates:
+            from ..lowering.copy_identity import annotate_module_copies
+            annotate_module_copies(self.tree, deadline=self.deadline)
+            self._copy_identity_ready = True
+            self._track_module_identity = any(not getattr(n, '_lw_must_copy_identity', False) for n in candidates)
+
+    def _identity_copy(self, st, target, source):
+        # IDs form a separate DBM component; they never enter numeric affine recipes.
+        if self._clock() > self.deadline:
+            raise Unsupported("identity propagation time budget exhausted")
+        st.zone.forget(target)
+        st.zone.add(target, source, 0)
+        st.zone.add(source, target, 0)
+        if self._clock() > self.deadline:
+            raise Unsupported("identity propagation time budget exhausted")
+
+    def _identity_havoc(self, st):
+        if getattr(self, '_track_module_identity', False):
+            for name in [n for n in st.zone.vars if n.startswith("g:\x00identity=")]:
+                if self._clock() > self.deadline:
+                    raise Unsupported("identity effects time budget exhausted")
+                st.zone.forget(name)
+
+    def _identity_equal(self, st, left, right):
+        ctx = self._fctx_stack[-1]
+        if not (ctx.is_module and not ctx.module_key
+                and isinstance(left, ast.Name) and isinstance(right, ast.Name)):
+            return None
+        frame = st.frames[0]
+        if (left.id not in frame.env or right.id not in frame.env
+                or {left.id, right.id} & frame.maybe_unbound):
+            return None
+        a, b = self._identity_slot(left.id), self._identity_slot(right.id)
+        if a in st.zone.vars and b in st.zone.vars and st.zone.entails(a, b, 0) and st.zone.entails(b, a, 0):
+            return True
+        return None
+
     # ============================================================== entry
-    def run(self) -> None:
+    def run(self, *, module_name: str = "__main__") -> State:
+        self._identity_demand()
         st = State()
+        if any(isinstance(node, ast.Compare) and len({part.id for part in ast.walk(node)
+                if isinstance(part, ast.Name)}) >= 2
+                for assertion in ast.walk(self.tree) if isinstance(assertion, ast.Assert)
+                for node in ast.walk(assertion.test)):
+            st.zone.enable_affine(self._clock, self.deadline)
         st.frames.append(Frame("g"))
         loc, _ = _assigned_names(self.tree.body)
         ctx = FuncCtx(self.tree, loc, set(), is_module=True)
         self.module_ctx = ctx
         lemmas.reset_landmarks()
-        st.frame.env["__name__"] = const_str("__main__")
+        st.frame.env["__name__"] = const_str(module_name)
         st.frame.env["__file__"] = ANYSTR
         st.frame.env["__doc__"] = V(s=ANY_STR, n=True)
         # runpy supplies these globals; treating them as NameError would erase real paths.
@@ -1822,7 +2170,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             st.frame.env[name] = V(top=True)
         self._fctx_stack.append(ctx)
         try:
-            self.exec_block(self.tree.body, st, ctx, None)
+            return self.exec_block(self.tree.body, st, ctx, None)
         finally:
             self._fctx_stack.pop()
 
@@ -1831,8 +2179,12 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         for idx, s in enumerate(stmts):
             if st.bottom:
                 return st
+            if isinstance(s, (ast.Import, ast.ImportFrom)):
+                self._identity_havoc(st)
+            if not self.split_hint and not self.split_draws and self.record:
+                self.split_hint = self._split_hint(s, fctx)
             if self.split_draws and idx + 1 < len(stmts):
-                draw = self._draw_to_split(s, fctx, lctx)
+                draw = self._draw_to_split(s, st, fctx, lctx)
                 if draw is not None:
                     return self._exec_split(stmts, idx, st, fctx, lctx, draw)
             if self._try_stack:
@@ -1849,16 +2201,167 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 st = self.exec_stmt(s, st, fctx, lctx)
             if not st.bottom:
                 self.gc(st)
+                if self.split_draws and idx + 1 < len(stmts):
+                    outcomes = self._int_outcomes(s, st, fctx, lctx)
+                    if outcomes is not None:
+                        return self._exec_int_split(stmts, idx, outcomes, fctx, lctx)
         return st
 
+    # ---------------------------------------------------- case split on a small int drawn from nondet_int
+    def _int_outcomes(self, s, st: State, fctx: FuncCtx, lctx):
+        """Exhaustive integer post-states for the existing optional path-split retry.
+
+        Small finite intervals keep exact enumeration. Otherwise source comparison literals
+        provide partition boundaries, with both unbounded tails retained. A cut is only a
+        refinement: no assumption that a later predicate is constant within an interval.
+        The existing per-run split allowance bounds work; insufficient allowance keeps the
+        original joined domain, never a prefix of the input space.
+        """
+        if (not self.record or lctx is not None or self._try_stack or fctx.module_key != ""
+                or not isinstance(s, ast.Assign) or len(s.targets) != 1 or not isinstance(s.targets[0], ast.Name)):
+            return None
+        gov = self._governing_resolver(fctx)
+        if gov is None or not self._has_input(s.value, gov):
+            return None
+        name = s.targets[0].id
+        try:
+            value = self.load_name(name, s.targets[0], st.copy(), fctx)
+        except Unsupported:
+            return None
+        if not value.only_int():
+            return None
+        lo, hi = self.ibounds(st, value.i)
+        if lo is not None and hi is not None and 2 <= hi-lo+1 <= MAX_INT_SPLIT:
+            if hi-lo>self._split_budget:
+                return None
+            ranges=[(k,k) for k in range(lo,hi+1)]
+        else:
+            cuts=set()
+            for expression in ast.walk(self.tree):
+                if self._clock()>self.deadline:
+                    raise Unsupported('integer path partition time budget exhausted',s)
+                if not isinstance(expression,ast.Compare):
+                    continue
+                for operand in (expression.left,*expression.comparators):
+                    try:
+                        literal=ast.literal_eval(operand)
+                    except (ValueError,TypeError,SyntaxError):
+                        continue
+                    if type(literal) is not int:
+                        continue
+                    for point in (literal,literal+1):
+                        if (lo is None or point>lo) and (hi is None or point<=hi):
+                            cuts.add(point)
+                    if len(cuts)>self._split_budget:
+                        return None
+            if not cuts:
+                return None
+            ranges=[];lower=lo
+            for point in sorted(cuts):
+                ranges.append((lower,point-1));lower=point
+            ranges.append((lower,hi))
+        if len(ranges)-1>self._split_budget:
+            return None
+        outcomes=[]
+        for lower,upper in ranges:
+            if self._clock()>self.deadline:
+                raise Unsupported('integer path partition time budget exhausted',s)
+            taken=st.copy()
+            for op,bound in ((ast.GtE,lower),(ast.LtE,upper)):
+                if bound is None:
+                    continue
+                probe=ast.Compare(left=ast.Name(id=name,ctx=ast.Load()),ops=[op()],
+                                  comparators=[ast.Constant(value=bound)])
+                ast.copy_location(probe,s)
+                ast.copy_location(probe.left,s.targets[0])
+                ast.copy_location(probe.comparators[0],s)
+                taken,_other=self.cond(probe,taken,fctx)
+            if not taken.bottom:
+                outcomes.append(taken)
+        return outcomes if len(outcomes)>1 else None
+
+    def _exec_int_split(self, stmts, idx: int, outcomes, fctx: FuncCtx, lctx) -> State:
+        """Run the rest of the block, ``stmts[idx + 1:]``, once per refined post-state and join the end states at the block's end."""
+        self._split_budget -= len(outcomes) - 1
+        self.splits_done += len(outcomes) - 1
+        end = None
+        self._partition_depth += 1
+        try:
+            for taken in outcomes:
+                self.epoch = set()          # a run starts where the statement ended (``gc``)
+                self.borrowed[-1].clear()
+                done = self.exec_block(stmts[idx + 1:], taken, fctx, lctx)
+                end = done if end is None else end.join(done)
+        finally:
+            self._partition_depth -= 1
+        return end
+
     # ---------------------------------------------------- case split on a boolean draw
-    def _draw_to_split(self, s, fctx: FuncCtx, lctx):
-        """The one ``_sv_verifier.nondet_bool()`` call of statement ``s`` that a case split may force, or ``None``.
+    def _program_function_names(self) -> frozenset:
+        if self._program_defs is None:
+            self._program_defs = frozenset(n.name for n in ast.walk(self.tree)
+                                           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        return self._program_defs
+
+    def _has_input(self, e, gov) -> bool:
+        """Does evaluating ``e`` take a value from the program's INPUT: a call the import graph resolves to the verifier's
+        ``nondet_*`` family (recognition of an input by its origin, never by the spelling of a local name), or a call of a
+        function the program defines (it may return a draw)?  Only a value derived from an input is worth a case split."""
+        defs = self._program_function_names()
+        for n in ast.walk(e):
+            if isinstance(n, ast.Call):
+                try:
+                    origin = gov.call_name(n) or ""
+                except Top:         # the resolver does not certify this name: not an input it can show
+                    origin = ""
+                if origin.startswith("_sv_verifier.nondet_"):
+                    return True
+                f = n.func
+                if (isinstance(f, ast.Name) and f.id in defs) or (isinstance(f, ast.Attribute) and f.attr in defs):
+                    return True
+        return False
+
+    def _split_hint(self, s, fctx) -> bool:
+        """Would a retry with case splits refine ``s``?  A statement that evaluates an input, a list display bound by an
+        assignment, a starred rest."""
+        if isinstance(s, ast.Assign) and (isinstance(s.value, ast.List) or any(
+                isinstance(t, ast.Starred) for target in s.targets for t in ast.walk(target))):
+            return True
+        if not isinstance(s, (ast.Assign, ast.AnnAssign, ast.Expr, ast.If)):
+            return False
+        root = s.test if isinstance(s, ast.If) else s.value
+        gov = self._governing_resolver(fctx) if root is not None else None
+        return gov is not None and self._has_input(root, gov)
+
+    def _is_bool_choice(self, node, st: State, fctx) -> bool:
+        """Does ``node`` evaluate, in ``st``, to a value that is a ``bool`` and may be either?  Evaluated on a copy, unrecorded:
+        a probe of the abstract value, not a run."""
+        saved = (self.record, list(self.callstring), list(self.borrowed), list(self._fctx_stack), set(self.epoch))
+        self.record = False
+        try:
+            v = self.eval(node, st.copy(), fctx)
+        except (Unsupported, Incompatible):
+            return False
+        finally:
+            self.record = saved[0]
+            self.callstring[:] = saved[1]
+            self.borrowed[:] = saved[2]
+            self._fctx_stack[:] = saved[3]
+            self.epoch = saved[4]
+        return v.b == frozenset({True, False}) and v.replace(b=frozenset()).is_bot()
+
+    def _draw_to_split(self, s, st: State, fctx: FuncCtx, lctx):
+        """The one boolean-valued expression of statement ``s`` derived from an input that a case split may force, or ``None``.
 
         Eligible: an ``Assign``/``AnnAssign`` value, an ``Expr`` value or an ``If`` test; recording passes only (a fixpoint
         step is not the pass that proves), never inside a loop body or a try (a draw's refusal is routed there), and only
-        while the split budget lasts.  The call must sit where the statement evaluates it EXACTLY ONCE whenever it
-        evaluates it at all (:meth:`_once_draws`).  Two or more such calls, or none, give ``None``."""
+        while the split budget lasts.  The expression must sit where the statement evaluates it EXACTLY ONCE whenever it
+        evaluates it at all (:meth:`_once_choices`) and the abstract value it evaluates to must be a ``bool`` that may be
+        either (:meth:`_is_bool_choice`).  Two or more such expressions, or none, give ``None``.
+
+        The first implementation (ab64360d, an AI session, Claude Sonnet 5.5) was wrong: it recognised the one call spelled
+        ``_sv_verifier.nondet_bool`` instead of the value's domain, so ``nondet_int() % 2 == 0``, a helper that returns a
+        draw and an inline conditional were not split."""
         if (not self.record or lctx is not None or self._try_stack or self._split_budget <= 0
                 or fctx.module_key != "" or not isinstance(s, (ast.Assign, ast.AnnAssign, ast.Expr, ast.If))):
             return None
@@ -1866,54 +2369,55 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         if root is None:
             return None
         gov = self._governing_resolver(fctx)
-        if gov is None:
+        if gov is None or not self._has_input(root, gov):
             return None
         found: list = []
-        self._once_draws(root, gov, found)
+        self._once_choices(root, gov, st, fctx, found)
         return found[0] if len(found) == 1 else None
 
-    def _once_draws(self, e, gov, found: list) -> None:
-        """Collect into ``found`` the ``nondet_bool()`` calls of expression ``e`` that are evaluated at most once per
+    def _once_choices(self, e, gov, st: State, fctx, found: list) -> None:
+        """Collect into ``found`` the input-derived boolean choices of expression ``e`` that are evaluated at most once per
         evaluation of ``e``.  It descends only through operands Python always evaluates, left to right: a call's
         callee, arguments and keyword values, an operator's operands, the FIRST comparator of a comparison and the FIRST
         operand of ``and``/``or`` (later ones are conditional), the test of a conditional expression (not its arms), the
         base and index of an attribute or subscript, the elements of a display.  A lambda, a comprehension, a
-        conditional arm and everything else is not entered."""
-        if isinstance(e, ast.Call):
-            if gov.call_name(e) == "_sv_verifier.nondet_bool":
-                if not e.args and not e.keywords:
-                    found.append(e)
+        conditional arm and everything else is not entered.  A call, a comparison or a ``not`` that derives from an input and
+        evaluates to a two-valued ``bool`` is a choice and is not entered."""
+        if isinstance(e, (ast.Call, ast.Compare)) or (isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.Not)):
+            if self._has_input(e, gov) and self._is_bool_choice(e, st, fctx):
+                found.append(e)
                 return
-            self._once_draws(e.func, gov, found)
+        if isinstance(e, ast.Call):
+            self._once_choices(e.func, gov, st, fctx, found)
             for a in e.args:
-                self._once_draws(a.value if isinstance(a, ast.Starred) else a, gov, found)
+                self._once_choices(a.value if isinstance(a, ast.Starred) else a, gov, st, fctx, found)
             for k in e.keywords:
-                self._once_draws(k.value, gov, found)
+                self._once_choices(k.value, gov, st, fctx, found)
         elif isinstance(e, ast.BinOp):
-            self._once_draws(e.left, gov, found)
-            self._once_draws(e.right, gov, found)
+            self._once_choices(e.left, gov, st, fctx, found)
+            self._once_choices(e.right, gov, st, fctx, found)
         elif isinstance(e, ast.UnaryOp):
-            self._once_draws(e.operand, gov, found)
+            self._once_choices(e.operand, gov, st, fctx, found)
         elif isinstance(e, ast.Compare):
-            self._once_draws(e.left, gov, found)
-            self._once_draws(e.comparators[0], gov, found)
+            self._once_choices(e.left, gov, st, fctx, found)
+            self._once_choices(e.comparators[0], gov, st, fctx, found)
         elif isinstance(e, ast.BoolOp):
-            self._once_draws(e.values[0], gov, found)
+            self._once_choices(e.values[0], gov, st, fctx, found)
         elif isinstance(e, ast.IfExp):
-            self._once_draws(e.test, gov, found)
+            self._once_choices(e.test, gov, st, fctx, found)
         elif isinstance(e, ast.Attribute):
-            self._once_draws(e.value, gov, found)
+            self._once_choices(e.value, gov, st, fctx, found)
         elif isinstance(e, ast.Subscript):
-            self._once_draws(e.value, gov, found)
-            self._once_draws(e.slice, gov, found)
+            self._once_choices(e.value, gov, st, fctx, found)
+            self._once_choices(e.slice, gov, st, fctx, found)
         elif isinstance(e, (ast.Tuple, ast.List, ast.Set)):
             for x in e.elts:
-                self._once_draws(x.value if isinstance(x, ast.Starred) else x, gov, found)
+                self._once_choices(x.value if isinstance(x, ast.Starred) else x, gov, st, fctx, found)
         elif isinstance(e, ast.Dict):
             for k, v in zip(e.keys, e.values):
                 if k is not None:
-                    self._once_draws(k, gov, found)
-                self._once_draws(v, gov, found)
+                    self._once_choices(k, gov, st, fctx, found)
+                self._once_choices(v, gov, st, fctx, found)
 
     def _activation(self, st: State) -> tuple:
         """Which activation of which code is executing: the frame depth and the call string.  A callee, a deeper
@@ -2050,12 +2554,26 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
     def s_Global(self, s, st, fctx, lctx):
         return st
 
+    s_Nonlocal = s_Global
+
     def s_Assign(self, s, st, fctx, lctx):
+        identity = None
+        if (getattr(self, '_track_module_identity', False) and fctx.is_module and not fctx.module_key
+                and isinstance(s.value, ast.Name) and s.value.id in st.frames[0].env
+                and s.value.id not in st.frames[0].maybe_unbound
+                and all(isinstance(t, ast.Name) for t in s.targets)):
+            identity = self.fresh(st)
+            self._identity_copy(st, identity, self._identity_slot(s.value.id))
         v = self.eval(s.value, st, fctx)
         for t in s.targets:
             if st.bottom:
                 break
             self.assign(t, v, st, fctx)
+        if identity is not None:
+            if not st.bottom:
+                for target in s.targets:
+                    self._identity_copy(st, self._identity_slot(target.id), identity)
+            st.zone.forget(identity)
         return st
 
     def s_AnnAssign(self, s, st, fctx, lctx):
@@ -2159,6 +2677,32 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return st
 
     # ============================================================ exceptions ([internal ref])
+    def _generator_steps_only(self):
+        """Only lowering-owned StopIteration handlers, with no finalizers."""
+        return bool(self._try_stack) and all(
+            getattr(frame.node, "_lw_role", None) == "generator-step"
+            and isinstance(frame.node, ast.Try) and not frame.node.finalbody and not frame.node.orelse
+            and len(frame.node.handlers) == 1 and isinstance(frame.node.handlers[0].type, ast.Name)
+            and frame.node.handlers[0].type.id == "StopIteration"
+            and not frame.in_handler and frame.finalizer is None for frame in self._try_stack)
+
+    def _generator_primitive_call(self, name, args, kwargs):
+        # These primitive operations cannot raise StopIteration. Other active
+        # handlers still need the ordinary complete exception-routing gate.
+        if kwargs or not self._generator_steps_only():
+            return False
+        primitive = lambda v: not (v.top or v.refs or v.st)
+        if name == "bool" and len(args) <= 1:
+            return not args or primitive(args[0])
+        if name == "isinstance" and len(args) == 2:
+            target = args[1]
+            return (primitive(args[0]) and not target.top and not target.refs
+                    and len(target.st) == 1 and next(iter(target.st)) in {
+                        ("type", "int"), ("type", "bool"), ("type", "float"), ("type", "str"),
+                        ("type", "list"), ("type", "dict"), ("type", "set"), ("type", "object"),
+                        ("cbuiltin", "tuple"), ("cbuiltin", "bytes"), ("cbuiltin", "frozenset")})
+        return False
+
     def _in_try_refuse(self, what: str, node) -> None:
         """A raise the model does not route: a non-property class whose path simply ends, a draw the
         harness rejects, a rule whose raises are not routed.  Outside a try it is what it always was;
@@ -2197,7 +2741,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             prop = sorted(self._prop_ancestors(exc.st, exc.cls))
             fact = f"may raise {prop}" if prop else "raises a non-property exception"
         self._record_check(exc.node, exc.op, excs, False, fact, residual=exc.residual, operand=exc.operand,
-                           st=exc.st)
+                           st=exc.st, contract_qualname=exc.contract_qualname)
 
     def _exc_base_of(self, st: State, addr):
         """The builtin exception class a user class derives from (``s_ClassDef`` records it as
@@ -2220,11 +2764,35 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         # CPython 3.14.4 Objects/exceptions.c: these use BaseException_new/init.
         # Python exposes distinct wrappers for the same C slot, so descriptor identity
         # is not its identity. Specialized constructors remain outside this subset.
-        return name in {
-            "BaseException", "Exception", "TypeError", "ValueError", "RuntimeError",
-            "LookupError", "IndexError", "KeyError", "AssertionError", "ArithmeticError",
-            "ZeroDivisionError", "FloatingPointError", "OverflowError",
-        }
+        from ..contracts.rules_exceptions import PLAIN_EXCEPTION_NAMES
+        return name in PLAIN_EXCEPTION_NAMES
+
+    def exception_args(self, st: State, args, node) -> V:
+        items = tuple(self.borrow(st, self.summarize(st, value)) for value in args)
+        addr = self.alloc(st, node, lambda sid: TupleObj(items), 'exception.args')
+        return V(refs=frozenset({addr}))
+
+    def contract_exception_args(self, qualname, exc, case_name, args, node):
+        from ..contracts.registry import get
+        from ..contracts.types import ArgumentRef, ScopedArgsRaiseClaim
+        contract = get(qualname)
+        if contract is None or not contract.tested:
+            raise Unsupported(f'{qualname}: no tested exception contract',node)
+        claim = contract.raise_claim(exc)
+        if not isinstance(claim,ScopedArgsRaiseClaim):
+            raise Unsupported(f'{qualname}: no scoped {exc} payload relation',node)
+        case = next((c for c in claim.args_cases if c.case==case_name),None)
+        if case is None or not case.tested:
+            raise Unsupported(f'{qualname}: no tested {exc} payload case {case_name}',node)
+        values=[]
+        for item in case.args:
+            if isinstance(item,ArgumentRef):
+                if item.position>=len(args):
+                    raise Unsupported(f'{qualname}: payload argument reference out of range',node)
+                values.append(args[item.position])
+            else:
+                values.append(const_str(item))
+        return tuple(values)
 
     def _is_subclass(self, st: State, exc, target) -> bool:
         """``exc`` is ``target`` or derives from it (each a builtin name or a user class address)."""
@@ -2253,8 +2821,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return cls if isinstance(cls, str) else st.heap[cls].name
 
     def s_Raise(self, s, st, fctx, lctx):
-        if s.cause is not None:
-            raise Unsupported("exception chaining effects on state are not modelled", s)
+        if s.cause is not None and not (isinstance(s.cause, ast.Constant) and s.cause.value is None):
+            raise Unsupported("explicit exception causes other than literal None are not modelled", s)
+        # Context/cause inspection remains refused; literal None changes neither class nor args.
         if s.exc is None:
             # a bare raise re-raises the exception being handled.  Inside a finally block that is the
             # exception in flight (if any), which is not tracked: refused.
@@ -2307,13 +2876,20 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         with no arguments, running its ``__init__`` like CPython does)."""
         kind = alt[0]
         if kind == "exc":
+            if alt[1] == "StopIteration":
+                # Raising the canonical class constructs it without arguments; payload reads stay opaque.
+                return alt[1], V(st=frozenset({("excinst", alt[1])}))
             if not self._plain_exception_constructor(alt[1]):
                 self._in_try_refuse(f"{alt[1]} constructor", node)
+            if self._plain_exception_constructor(alt[1]):
+                return alt[1], self.visit_rule(alt[1], st, [], {}, node)
             return alt[1], V(st=frozenset({("excinst", alt[1])}))
         if kind == "excinst":
             return alt[1], V(st=frozenset({alt}))
         if kind == "ref":
             ob = st.heap[alt[1]]
+            if ob.kind == 'exception':
+                return ob.cls, V(refs=frozenset({alt[1]}))
             if ob.kind == "inst" and self._exc_base_of(st, ob.cls) is not None:
                 return ob.cls, V(refs=frozenset({alt[1]}))
             if ob.kind == "class" and self._exc_base_of(st, alt[1]) is not None:
@@ -2513,52 +3089,227 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             del fr.pending_continues[e:]
 
     def s_Assert(self, s, st, fctx, lctx):
+        if self.record:
+            scope, _types = self._scope_facts(st, ast.unparse(s.test))
+            type_sets = {}
+            names = {n.id for n in ast.walk(s.test) if isinstance(n, ast.Name)}
+            for name in names:
+                owner = st.frames[-1] if name in st.frames[-1].env else st.frames[0]
+                value = owner.env.get(name)
+                if value is not None and name not in owner.maybe_unbound:
+                    type_sets[name] = value.kinds()
+            if self.lowered is not None:
+                scope = {original for text in scope if (original := self._orig(s, text))}
+                type_sets = {original: kinds for name, kinds in type_sets.items()
+                             if (original := self._orig(s, name)) and original.isidentifier()}
+            previous = self._assertion_search.get(s)
+            if previous is not None:
+                scope.intersection_update(previous["entry_scope"])
+                type_sets = {name: sorted(set(kinds) | set(previous["type_sets"][name]))
+                             for name, kinds in type_sets.items() if name in previous["type_sets"]}
+            self._assertion_search[s] = {"entry_scope": sorted(scope), "type_sets": type_sets}
         t, f = self.cond(s.test, st, fctx)
         if not f.bottom and s.msg is not None:
             self.eval(s.msg, f, fctx)
         self.check(s, "assert", {"AssertionError"}, f.bottom,
-                   "assertion condition proven" if f.bottom else "assertion may fail", st=f)
+                   "assertion condition proven" if f.bottom else "assertion may fail", st=f,
+                   residual=f"not ({ast.unparse(s.test)})")
         return t
 
+    def _no_closure_cells(self, node, fctx):
+        from types import CodeType
+
+        def check_work():
+            if self._clock() > self.deadline:
+                raise Unsupported("closure analysis time budget exhausted", node)
+
+        check_work()
+        tree = self.tree
+        if fctx.module_key:
+            module = self._ext_by_key.get(fctx.module_key)
+            if module is None:
+                raise Unsupported("nested function source is unavailable", node)
+            tree = module.tree
+        try:
+            # Compile for lexical cell metadata only; never execute this code.
+            pending = [compile(tree, self.filename, "exec", dont_inherit=True)]
+        except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError) as exc:
+            raise Unsupported("nested function lexical analysis: " + type(exc).__name__, node) from None
+        name = node.name if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else "<lambda>"
+        line = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", ())])
+        found = False
+        while pending:
+            check_work()
+            code = pending.pop()
+            if code.co_name == name and code.co_firstlineno == line:
+                found = True
+                if code.co_freevars:
+                    raise Unsupported("captured closure cells are not modelled", node)
+            pending.extend(value for value in code.co_consts if isinstance(value, CodeType))
+        check_work()
+        if not found:
+            raise Unsupported("nested function lexical scope is unavailable", node)
+
+    def _function_captures(self, node, st, fctx):
+        """Snapshot immutable parameters, otherwise reference authenticated live frames."""
+        if fctx.is_module:
+            return {}, {}
+        if fctx.is_class:
+            self._no_closure_cells(node, fctx)
+            return {}, {}
+        from dis import get_instructions
+        from types import CodeType
+
+        def check_work():
+            if self._clock() > self.deadline:
+                raise Unsupported("closure analysis time budget exhausted", node)
+
+        def matches(code, scope):
+            name = scope.name if isinstance(scope, ast.FunctionDef) else "<lambda>"
+            line = min([scope.lineno] + [d.lineno for d in getattr(scope, "decorator_list", ())])
+            return code.co_name == name and code.co_firstlineno == line
+
+        check_work()
+        module = self._ext_by_key.get(fctx.module_key)
+        tree = self.tree if not fctx.module_key else getattr(module, "tree", None)
+        if tree is None:
+            raise Unsupported("nested function source is unavailable", node)
+        try:
+            pending = [(compile(tree, self.filename, "exec", dont_inherit=True), None)]
+            profiles = []
+            while pending:
+                check_work()
+                code, parent = pending.pop()
+                if matches(code, node):
+                    profiles.append((code, parent))
+                pending.extend((value, code) for value in code.co_consts if isinstance(value, CodeType))
+            check_work()
+            if not profiles:
+                raise Unsupported("nested function lexical scope is unavailable", node)
+            if all(not code.co_freevars for code, _ in profiles):
+                return {}, {}
+            if len(profiles) != 1:
+                raise Unsupported("ambiguous captured closure scope", node)
+            code, parent = profiles[0]
+            names = set(code.co_freevars)
+            signature = fctx.node.args
+            parameters = {p.arg for p in signature.posonlyargs + signature.args + signature.kwonlyargs}
+            parameters.update(p.arg for p in (signature.vararg, signature.kwarg) if p is not None)
+            if parent is None or not matches(parent, fctx.node):
+                raise Unsupported("captured closure lexical parent is unavailable", node)
+            # Snapshotting is sound only if no scope can rebind or delete the cell.
+            readonly = names <= parameters
+            pending = [parent]
+            while pending and readonly:
+                check_work()
+                code = pending.pop()
+                for instruction in get_instructions(code):
+                    check_work()
+                    if instruction.opname in ("STORE_DEREF", "DELETE_DEREF") and instruction.argval in names:
+                        readonly = False
+                        break
+                pending.extend(value for value in code.co_consts if isinstance(value, CodeType))
+        except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError) as exc:
+            raise Unsupported("nested function lexical analysis: " + type(exc).__name__, node) from None
+        check_work()
+        frame = st.frames[-1]
+        if readonly:
+            if names & frame.maybe_unbound or not names <= frame.env.keys():
+                raise Unsupported("captured parameter may be unbound", node)
+            return {name: self.borrow(st, self.summarize(st, frame.env[name])) for name in names}, {}
+        captures, frames = {}, {}
+        for name in names:
+            check_work()
+            if name in parent.co_cellvars:
+                frames[name] = (frame.fid, fctx.activation)
+            elif name in fctx.capture_frames:
+                frames[name] = fctx.capture_frames[name]
+            elif name in parent.co_freevars and name in frame.env and name not in frame.maybe_unbound:
+                captures[name] = self.borrow(st, self.summarize(st, frame.env[name]))
+            else:
+                raise Unsupported("captured closure owner is unavailable", node)
+            if name in frames:
+                self._closure_frame_index(st, frames[name], node)
+                owner = next(ctx for ctx in self._fctx_stack if ctx.activation == frames[name][1])
+                owner.mutable_cells.add(name)
+        return captures, frames
+
+    def _closure_frame_index(self, st, binding, node):
+        fid, activation = binding
+        if activation is None or not any(getattr(ctx, "activation", None) == activation for ctx in self._fctx_stack):
+            raise Unsupported("captured closure activation has expired", node)
+        for idx, frame in enumerate(st.frames):
+            if frame.fid == fid:
+                return idx
+        raise Unsupported("captured closure frame is unavailable", node)
+
     def s_FunctionDef(self, s, st, fctx, lctx):
-        if not (fctx.is_module or fctx.is_class):
-            raise Unsupported("nested function (closures are not modelled)", s)
+        captures, capture_frames = self._function_captures(s, st, fctx)
         flavor = "plain"
+        decorators = []
         for d in s.decorator_list:
-            if isinstance(d, ast.Name) and d.id in ("staticmethod", "classmethod") and fctx.is_class:
+            if self._clock() > self.deadline:
+                raise Unsupported("decorator evaluation time budget exhausted", s)
+            descriptor = isinstance(d, ast.Name) and d.id in ("staticmethod", "classmethod") and fctx.is_class
+            if descriptor:
+                module = self._ext_by_key.get(fctx.module_key)
+                tree = self.tree if not fctx.module_key else getattr(module, "tree", None)
+                bound, reflective = self._builtin_source_vetoes(tree)
+                key = self._global_key(d.id, fctx.module_key)
+                descriptor = not (reflective or d.id in bound or key in st.frames[0].env
+                                  or key in st.frames[0].maybe_unbound
+                                  or d.id in st.frames[-1].env or d.id in st.frames[-1].maybe_unbound)
+            if descriptor:
+                if decorators:
+                    raise Unsupported("composition of builtin descriptors and ordinary decorators", s)
                 flavor = d.id
             else:
-                raise Unsupported("decorator", s)
-        if _is_generator(s):
-            # a generator function: defining it is fine, calling it aborts
-            pass
+                decorator = self.eval(d, st, fctx)
+                if flavor != "plain" and decorator != V(st=frozenset({('abc-abstractmethod',)})):
+                    raise Unsupported("composition of builtin descriptors and ordinary decorators", s)
+                if st.bottom:
+                    return st
+                decorators.append((d, self.borrow(st, decorator)))
         defaults = tuple(self.summarize(st, self.eval(d, st, fctx)) for d in s.args.defaults)
         kwd = {p.arg: self.summarize(st, self.eval(d, st, fctx))
                for p, d in zip(s.args.kwonlyargs, s.args.kw_defaults) if d is not None}
+        if st.bottom:
+            return st
         qual = s.name
         mkey = fctx.module_key
-        addr = self.alloc(st, s, lambda sid: FuncObj(s, defaults, kwd, qual, flavor, mkey), "func")
-        self.store_name(s.name, V(refs=frozenset({addr})), st, fctx)
+        addr = self.alloc(st, s, lambda sid: FuncObj(s, defaults, kwd, qual, flavor, mkey, captures, capture_frames), "func")
+        value = self.borrow(st, V(refs=frozenset({addr})))
+        for d, decorator in reversed(decorators):
+            if self._clock() > self.deadline:
+                raise Unsupported("decorator application time budget exhausted", s)
+            value = self.borrow(st, self.call(st, decorator, [value], {}, d))
+            if st.bottom:
+                return st
+        if decorators and self._clock() > self.deadline:
+            raise Unsupported("decorator application time budget exhausted", s)
+        self.store_name(s.name, value, st, fctx)
         return st
 
     def e_Lambda(self, e, st, fctx):
-        if not fctx.is_module:
-            raise Unsupported("nested lambda (closures are not modelled)", e)
+        captures, capture_frames = self._function_captures(e, st, fctx)
         defaults = tuple(self.summarize(st, self.eval(d, st, fctx)) for d in e.args.defaults)
         kwd = {p.arg: self.summarize(st, self.eval(d, st, fctx))
                for p, d in zip(e.args.kwonlyargs, e.args.kw_defaults) if d is not None}
-        addr = self.alloc(st, e, lambda sid: FuncObj(e, defaults, kwd, "<lambda>", "plain", fctx.module_key), "func")
+        addr = self.alloc(st, e, lambda sid: FuncObj(e, defaults, kwd, "<lambda>", "plain", fctx.module_key, captures, capture_frames), "func")
         return V(refs=frozenset({addr}))
 
     def s_ClassDef(self, s, st, fctx, lctx):
-        if not fctx.is_module:
-            raise Unsupported("class defined inside a function or class", s)
+        if not (fctx.is_module or fctx.is_class):
+            raise Unsupported("class defined inside a function", s)
+        if fctx.is_class:
+            self._no_closure_cells(s, fctx)
         if s.decorator_list or s.keywords:
             raise Unsupported("class decorator / metaclass", s)
         if len(s.bases) > 1:
             raise Unsupported("multiple inheritance", s)
         bases = []
         exc_base = None
+        abc_meta = False
         for b in s.bases:
             bv = self.eval(b, st, fctx)
             if bv.top or bv.i or bv.b or bv.f or bv.s is not None or bv.n:
@@ -2567,6 +3318,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 if len(bv.st) != 1 or bv.refs:
                     raise Unsupported("class base", s)
                 tag = next(iter(bv.st))
+                if tag == ('abc-base',):
+                    abc_meta = True
+                    continue
                 if tag == ("type", "object"):
                     continue
                 if tag[0] == "exc":
@@ -2576,9 +3330,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             if len(bv.refs) != 1:
                 raise Unsupported("class base", s)
             a = next(iter(bv.refs))
-            if st.heap[a].kind != "class":
+            if st.heap[a].kind != "class" or isinstance(st.heap[a], NamedTupleClassObj):
                 raise Unsupported("class base", s)
             bases.append(a)
+            abc_meta = getattr(st.heap[a], "abstracts", None) is not None
         # the class body runs in its own namespace
         loc, glo = _assigned_names(s.body)
         cctx = FuncCtx(s, loc, glo, is_class=True, module_key=fctx.module_key)
@@ -2609,6 +3364,20 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         for k in attrs:
             if k in UNSUPPORTED_DUNDERS:
                 raise Unsupported(f"class defines {k}", s)
+        abstracts = None
+        if abc_meta:
+            if set(attrs) & {'__subclasshook__', '__instancecheck__', '__subclasscheck__',
+                             'register', '__abstractmethods__', '_abc_impl'} or _class_has_private_name_mangling(s):
+                raise Unsupported("custom ABC machinery or private abstract names", s)
+            abstracts = {name for name, value in attrs.items() if self._abc_marker(body_st, value, s)}
+            if bases:
+                for name in getattr(body_st.heap[bases[0]], "abstracts", ()) or ():
+                    value = attrs.get(name)
+                    if value is None:
+                        value = self.class_lookup(body_st, bases[0], name)
+                    if self._abc_marker(body_st, value, s):
+                        abstracts.add(name)
+            abstracts = frozenset(abstracts)
         slots = None
         if "__slots__" in fr.env:
             sv = fr.env["__slots__"]
@@ -2625,10 +3394,28 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         class_site = self.site(s, "class")
         if (class_site, "r") in body_st.heap or (class_site, "s") in body_st.heap:
             raise Unsupported("a class statement that runs more than once (a loop body) is not modelled", s)
-        addr = self.alloc(body_st, s, lambda sid: ClassObj(s.name, s, tuple(bases), attrs, slots), "class")
+        addr = self.alloc(body_st, s, lambda sid: ClassObj(s.name, s, tuple(bases), attrs, slots, abstracts), "class")
         self.pop_frame(body_st)
         self.store_name(s.name, V(refs=frozenset({addr})), body_st, fctx)
         return body_st
+
+    def _abc_marker(self, st, value, node):
+        if value is None or value.top or value.st:
+            raise Unsupported("unknown abstract-method marker", node)
+        flags = set()
+        if not value.replace(refs=frozenset()).is_bot():
+            flags.add(False)
+        for addr in value.refs:
+            obj = st.heap[addr]
+            if type(obj) is FuncObj:
+                flags.add(obj.abstract)
+            elif type(obj) in {ListObj, TupleObj, DictObj, SetObj, RangeObj}:
+                flags.add(False)
+            else:
+                raise Unsupported("abstract marker may invoke an object descriptor", node)
+        if len(flags) != 1:
+            raise Unsupported("ambiguous abstract-method marker", node)
+        return flags.pop()
 
     def _const_str_seq(self, st, v: V):
         if v.s is not None and v.s != ANY_STR and len(v.s) == 1 and not v.refs:
@@ -2648,6 +3435,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         """Whether existing model/resolver metadata proves this import binds on the target."""
         # The SV-COMP harness injects this virtual module into sys.modules; it is
         # not resolved from the task's import roots.
+        if module == "builtins":
+            return name is None or hasattr(_builtins, name)
         if module == "_sv_verifier":
             if name is None:
                 return True
@@ -2687,6 +3476,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         if name is None and module in gov.imports.modules.values():
             return True
         if name is not None and alias is not None:
+            if (gov.imports.modules.get(alias, "").startswith("$extern:")
+                    and alias in gov.externs and f"$parent:{alias}" in gov.externs):
+                return True
             resolved = gov.imports.names.get(alias)
             if (resolved is not None and resolved[1] == name
                     and resolved[0].startswith("$extern:")):
@@ -2699,12 +3491,20 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         attrs = module_attrs(module)
         return attrs is not None and name in attrs
 
+    def _unknown_import_init(self, module, node):
+        self._in_try_refuse("ImportError", node)
+        if getattr(self, "_world_mutated", False):
+            raise Unsupported("import after file mutation has unresolved initialization", node)
+        from tharkun.solve.pyresolve import _import_may_initialize
+        if _import_may_initialize(module, self.tree, self.filename):
+            raise Unsupported(f"imported module {module!r} has unresolved initialization", node)
+
     def s_Import(self, s, st, fctx, lctx):
         for a in s.names:
             if a.asname is None and "." in a.name:
                 raise Unsupported("dotted import", s)
             if not self._import_known_to_succeed(a.name, fctx, s):
-                self._in_try_refuse("ImportError", s)
+                self._unknown_import_init(a.name, s)
             gov = self._governing_resolver(fctx)
             alias = a.asname or a.name
             sub = gov.externs.get(alias) if gov is not None else None
@@ -2727,14 +3527,98 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             return st
         for a in s.names:
             if a.name == "*":
-                raise Unsupported("star import", s)
+                self._source_star_import(s, st, fctx)
+                return st
             module = s.module or ""
             alias = a.asname or a.name
             if not self._import_known_to_succeed(module, fctx, s, name=a.name, alias=alias):
-                self._in_try_refuse("ImportError", s)
+                self._unknown_import_init(module, s)
             v = self.module_attr(st, module, a.name, s, fctx)
             self.store_name(alias, v, st, fctx)
         return st
+
+    def _source_star_import(self, node, st, fctx):
+        """Bind certified exports after executing a flat source initializer."""
+        from tharkun.solve.pyresolve import Top
+        gov = self._governing_resolver(fctx)
+        if (gov is None or node.level or len(node.names) != 1
+                or not node.module or not node.module.isidentifier()):
+            raise Unsupported("unresolved source star import", node)
+        try:
+            sub = gov._try_extern_from(node, {id(s) for s in gov.tree.body})
+        except Top as exc:
+            raise Unsupported(f"source star import: {exc}", node) from exc
+        if (sub is None or os.path.basename(sub.filename) == '__init__.py'
+                or not self._ensure_extern_loaded(st, sub)):
+            raise Unsupported("source star module does not complete", node)
+        frame = st.frames[0]
+        prefix = sub.filename + '\x00'
+        if prefix + '__all__' in frame.maybe_unbound:
+            raise Unsupported("explicit source exports are unresolved", node)
+        names = sub.public_names()
+        if prefix + '__all__' in frame.env:
+            if self._source_literal_exports(gov, sub, node) != names:
+                raise Unsupported("explicit exports differ from certified bindings", node)
+        else:
+            live = {name[len(prefix):] for name in frame.env.keys() | frame.maybe_unbound
+                    if name.startswith(prefix) and not name[len(prefix):].startswith('_')}
+            if live != names:
+                raise Unsupported("source exports differ from certified bindings", node)
+        # A missed export could silently leave a caller's builtin or old binding live.
+        for name in names:
+            if self._clock() > self.deadline:
+                raise Unsupported("source star binding time budget exhausted", node)
+            if (prefix + name not in frame.env or prefix + name in frame.maybe_unbound
+                    or gov.imports.names.get(name) != (f'$extern:{sub.filename}', name)):
+                raise Unsupported("ambiguous source export", node)
+            self.store_name(name, self._bind_value(st, gov, name, node), st, fctx)
+
+    def _source_literal_exports(self, gov, sub, node):
+        """Authenticate literal export data, with every metadata escape refused."""
+        from tharkun.solve.extern import _const_str_list
+        from tharkun.solve.pyresolve import Resolver
+
+        bindings = []
+        for statement in sub.tree.body:
+            targets = (statement.targets if isinstance(statement, ast.Assign) else
+                       [statement.target] if isinstance(statement, ast.AnnAssign) else [])
+            if len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == '__all__':
+                bindings.append(statement)
+        if len(bindings) != 1:
+            raise Unsupported("explicit exports require one literal assignment", node)
+        binding = bindings[0]
+        exports = _const_str_list(binding.value)
+        if exports is None:
+            raise Unsupported("explicit exports are not literal strings", node)
+        # Empty stars bind no names, so all_resolvers() may omit their initializer.
+        resolvers = (gov, sub, *(r for r in gov._cache.values() if isinstance(r, Resolver)))
+        if (any(r is False for r in gov._cache.values())
+                or not self._ext_ok <= {r.filename for r in resolvers}):
+            raise Unsupported("explicit export initializer closure is incomplete", node)
+        seen = set()
+        for resolver in resolvers:
+            if id(resolver) in seen:
+                continue
+            seen.add(id(resolver))
+            rest = ast.Module(body=[s for s in resolver.tree.body if s is not binding], type_ignores=[])
+            if resolver is sub and isinstance(binding, ast.AnnAssign):
+                rest.body.append(ast.Expr(value=binding.annotation))
+            if '__all__' in _identifiers(rest):
+                raise Unsupported("explicit exports are observed or rebound", node)
+            for part in ast.walk(rest):
+                if self._clock() > self.deadline:
+                    raise Unsupported("explicit export authentication time budget exhausted", node)
+                # Match captures and exception targets store names outside ast.Name.
+                if getattr(part, 'name', None) == '__all__' or getattr(part, 'rest', None) == '__all__':
+                    raise Unsupported("explicit exports have another binding", node)
+                if ((isinstance(part, ast.Name) and part.id in _GLOBAL_CHANNEL_NAMES)
+                        or (isinstance(part, ast.Attribute) and part.attr in _GLOBAL_CHANNEL_ATTRS)
+                        or (isinstance(part, ast.Import) and any(
+                            a.name.split('.')[0] in _GLOBAL_CHANNEL_MODULES for a in part.names))
+                        or (isinstance(part, ast.ImportFrom)
+                            and (part.module or '').split('.')[0] in _GLOBAL_CHANNEL_MODULES)):
+                    raise Unsupported("explicit export closure has reflection", node)
+        return frozenset(exports)
 
     # ------------------------------------------------------------ loops
     def _reuse_history(self) -> tuple:
@@ -2856,6 +3740,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return self._solve_fixpoint(joined, step, fctx, node)
 
     def s_While(self, s, st, fctx, lctx):
+        geometric = self._geometric_loop_entry(s, st, fctx)
+
         def test_at_entry(state):
             if self.record and s in self._statement_entry_nodes:
                 self._observe_statement_entry(s, state, fctx)
@@ -2899,7 +3785,190 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             out = self.exec_block(s.orelse, out, fctx, lctx)
         for b in breaks:
             out = out.join(b)
+        self._geometric_loop_exit(out, geometric)
         return out
+
+    def _geometric_binding(self, st, name, fctx):
+        """Read an existing scalar cell without evaluating a second source operand."""
+        if fctx.is_class:
+            return None
+        if name in fctx.capture_frames:
+            index = self._closure_frame_index(st, fctx.capture_frames[name], None)
+            key = name
+        elif self._scope(name, fctx) == 'local':
+            index, key = len(st.frames) - 1, name
+        else:
+            index, key = 0, self._global_key(name, fctx.module_key)
+        frame = st.frames[index]
+        if key in frame.maybe_unbound or key not in frame.env:
+            return None
+        return index, key, frame.env[key]
+
+    @staticmethod
+    def _doubles(expression, counter):
+        """True when ``expression`` is the integer doubling of the name ``counter`` (``c*2``, ``2*c``, ``c<<1``, ``c+c``)."""
+        def is_counter(node):
+            return isinstance(node, ast.Name) and node.id == counter
+
+        def literal(node, value):
+            return isinstance(node, ast.Constant) and type(node.value) is int and node.value == value
+        if not isinstance(expression, ast.BinOp):
+            return False
+        left, right, op = expression.left, expression.right, expression.op
+        if isinstance(op, ast.Mult):
+            return (is_counter(left) and literal(right, 2)) or (literal(left, 2) and is_counter(right))
+        if isinstance(op, ast.LShift):
+            return is_counter(left) and literal(right, 1)
+        if isinstance(op, ast.Add):
+            return is_counter(left) and is_counter(right)
+        return False
+
+    def _geometric_loop_entry(self, loop, st, fctx):
+        """Authenticate a pure doubling recurrence before recording its input."""
+        if not self.record or st.bottom or loop.orelse or len(loop.body) != 1:
+            return None
+        if self._clock() > self.deadline:
+            raise Unsupported('geometric loop fact time budget exhausted', loop)
+        body = loop.body[0]
+        # The recurrence is "counter becomes twice itself" -- `c = c * 2`, `c = 2 * c`, `c = c << 1`, `c = c + c` and the augmented forms
+        # `c *= 2`, `c <<= 1`, `c += c`: all equal 2*c on integers (bool operands are excluded below by the integer facts), whatever the spelling.
+        if isinstance(body, ast.Assign) and len(body.targets) == 1 and isinstance(body.targets[0], ast.Name):
+            counter, doubled = body.targets[0].id, self._doubles(body.value, body.targets[0].id)
+        elif isinstance(body, ast.AugAssign) and isinstance(body.target, ast.Name):
+            counter = body.target.id
+            doubled = self._doubles(ast.BinOp(ast.Name(counter, ast.Load()), body.op, body.value), counter)
+        else:
+            return None
+        if not doubled:
+            return None
+        test = loop.test
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
+            return None
+        left, right = test.left, test.comparators[0]
+        if isinstance(test.ops[0], ast.Lt) and isinstance(left, ast.Name) and left.id == counter and isinstance(right, ast.Name):
+            kind, name = 'doubling-ceil', right.id
+        elif isinstance(test.ops[0], ast.Gt) and isinstance(right, ast.Name) and right.id == counter and isinstance(left, ast.Name):
+            kind, name = 'doubling-ceil', left.id            # `bound > counter` is `counter < bound`
+        elif (isinstance(test.ops[0], ast.Eq) and isinstance(right, ast.Constant)
+              and type(right.value) is int and right.value == 0
+              and isinstance(left, ast.BinOp) and isinstance(left.op, ast.Mod)
+              and isinstance(left.right, ast.Constant) and type(left.right.value) is int and left.right.value == 2
+              and isinstance(left.left, ast.BinOp) and isinstance(left.left.op, ast.FloorDiv)
+              and isinstance(left.left.left, ast.Name) and isinstance(left.left.right, ast.Name)
+              and left.left.right.id == counter):
+            kind, name = 'doubling-divisor', left.left.left.id
+        else:
+            return None
+        if name == counter:
+            return None
+        target = self._geometric_binding(st, counter, fctx)
+        bound = self._geometric_binding(st, name, fctx)
+        if target is None or bound is None or target[:2] == bound[:2]:
+            return None
+        index, key, value = target
+        if not value.only_int() or self.ibounds(st, value.i) != (1, 1):
+            return None
+        anchor, upper = None, None
+        if exact_int_value(bound[2]):
+            info = self._as_int(st, bound[2])
+            upper = self.ibounds(st, info)[1]
+            anchor = '~geometric-input:' + self.fresh(st)
+            self.zone_assign(st, anchor, info)
+        elif kind == 'doubling-ceil' and bound[2].kinds() == ['float']:
+            kind = 'doubling-power'  # Only the integer counter's power fact is used.
+        else:
+            return None
+        return kind, anchor, upper, index, key, st.frames[index].fid
+
+    def _geometric_loop_exit(self, st, descriptor):
+        if descriptor is None or st.bottom:
+            return
+        if self._clock() > self.deadline:
+            raise Unsupported('geometric loop fact time budget exhausted')
+        kind, anchor, upper, index, key, fid = descriptor
+        if index >= len(st.frames) or st.frames[index].fid != fid:
+            return
+        frame = st.frames[index]
+        value = frame.env.get(key)
+        if (key in frame.maybe_unbound or value is None or not value.only_int()
+                or anchor is not None and anchor not in st.zone.vars):
+            return
+        result = '~geometric-output:' + self.fresh(st)
+        self.zone_assign(st, result, value.i)
+        st.zone.add(ZERO, result, -1)
+        if kind == 'doubling-ceil':
+            st.zone.add(anchor, result, 0)
+            if upper is not None:
+                st.zone.add(result, ZERO, max(1, 2 * upper - 1))
+        from .equality import Recipe
+        frame.env[key] = value.replace(value_term=Recipe('int', kind, data=(anchor, result)))
+        self._geometric_facts = True
+
+    def _geometric_comparison(self, st, op, lv, rv, left, right):
+        """Use only certificates still equal to their immutable zone snapshots."""
+        if not self._fctx_stack or not lv.only_int() or not exact_int_value(rv):
+            return None
+        fctx = self._fctx_stack[-1]
+
+        def integer(node, value):
+            return isinstance(node, ast.Constant) and type(node.value) is int and node.value == value
+
+        def certified(node):
+            if not isinstance(node, ast.Name):
+                return None
+            binding = self._geometric_binding(st, node.id, fctx)
+            if binding is None:
+                return None
+            value = binding[2]
+            term = value.value_term
+            if (not value.only_int() or value.i.lin is None or term is None or term.kind != 'int'
+                    or term.op not in {'doubling-ceil', 'doubling-divisor', 'doubling-power'}):
+                return None
+            anchor, result = term.data
+            if result not in st.zone.vars:
+                return None
+            difference = value.i.lin.sub(Lin.var(result)).norm(st.zone)
+            return (term.op, anchor) if difference.is_const() and difference.c == 0 else None
+
+        def matches(node, anchor):
+            if not isinstance(node, ast.Name) or anchor is None or anchor not in st.zone.vars:
+                return False
+            binding = self._geometric_binding(st, node.id, fctx)
+            if binding is None or not exact_int_value(binding[2]):
+                return False
+            info = self._as_int(st, binding[2])
+            if info.lin is None:
+                return False
+            difference = info.lin.sub(Lin.var(anchor)).norm(st.zone)
+            return difference.is_const() and difference.c == 0
+
+        if isinstance(op, (ast.Eq, ast.NotEq)):
+            proven = False
+            if (integer(right, 0) and isinstance(left, ast.BinOp) and isinstance(left.op, ast.BitAnd)
+                    and isinstance(left.left, ast.Name) and isinstance(left.right, ast.BinOp)
+                    and isinstance(left.right.op, ast.Sub) and isinstance(left.right.left, ast.Name)
+                    and left.left.id == left.right.left.id and integer(left.right.right, 1)):
+                proven = certified(left.left) is not None
+            elif integer(right, 0) and isinstance(left, ast.BinOp) and isinstance(left.op, ast.Mod):
+                fact = certified(left.right)
+                proven = fact is not None and fact[0] == 'doubling-divisor' and matches(left.left, fact[1])
+            elif (integer(right, 1) and isinstance(left, ast.BinOp) and isinstance(left.op, ast.Mod)
+                    and integer(left.right, 2) and isinstance(left.left, ast.BinOp)
+                    and isinstance(left.left.op, ast.FloorDiv)):
+                fact = certified(left.left.right)
+                proven = fact is not None and fact[0] == 'doubling-divisor' and matches(left.left.left, fact[1])
+            return isinstance(op, ast.Eq) if proven else None
+        if (isinstance(op, ast.Lt) and isinstance(left, ast.BinOp) and isinstance(left.op, ast.FloorDiv)
+                and integer(left.right, 2)):
+            fact = certified(left.left)
+            info = self._as_int(st, rv)
+            if fact is not None and fact[0] == 'doubling-ceil' and info.lin is not None:
+                anchor = fact[1]
+                difference = info.lin.sub(Lin.var(anchor)).norm(st.zone)
+                lo, _hi = st.zone.bounds(anchor)
+                if difference.is_const() and difference.c == 0 and lo is not None and lo >= 1:
+                    return True
+        return None
 
     def s_For(self, s, st, fctx, lctx):
         if s.type_comment:
@@ -2907,8 +3976,17 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         itv = self.eval(s.iter, st, fctx)
         if st.bottom:
             return st
-        itv = self.iterable(st, itv, s.iter)
-        self.check_iterable(st, itv, s.iter)
+        itv = self.iterable(st, itv, s.iter, consumer="for")
+        if st.bottom:
+            return st
+        if any(st.heap[a].kind == "generator" for a in itv.refs):
+            return self._generator_for(s, st, fctx, lctx, itv)
+        if self.instance_value(st, itv):
+            return self._user_iterator_for(s, st, fctx, lctx, itv)
+        if self._dict_items_for_source(st, itv) is not None:
+            self.check(s.iter, 'iter', {'TypeError'}, True, 'one builtin dict.items() view', st=st)
+        else:
+            self.check_iterable(st, itv, s.iter)
         st.pins = st.pins + (itv,)
         # A ghost iteration counter G for `for i in range(c, hi)` with a constant c:
         # at the head G = iterations done, the body sees i = c + G exactly, and the
@@ -2994,8 +4072,351 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 out.kill_var(ghost[0])
         return out
 
+    def _generator_for(self, node, st, fctx, lctx, iterator):
+        """Consume all continuations or refuse the whole proof on spent work."""
+        if len(iterator.refs) != 1 or not iterator.replace(refs=frozenset()).is_bot():
+            raise Unsupported("generator iteration requires one known identity", node)
+        self.check(node.iter, "iter", {"TypeError"}, True, "one source generator", st=st)
+        current = st.copy()
+        pin = len(current.pins)
+        current.pins += (iterator,)
+        stopped, breaks = None, []
+
+        def advance(head):
+            self.fresh_pass()
+            returns = len(fctx.returns)
+            mark = self._exit_mark(fctx)
+            try:
+                yielded, exhausted = self._resume_generator(head, head.pins[pin], node.iter)
+                control = LoopCtx()
+                if not yielded:
+                    head.set_bottom()
+                    return head, exhausted, control.breaks, False
+                value = self._merge_branches(head, yielded)
+                self.assign(node.target, value, head, fctx)
+                head = self.exec_block(node.body, head, fctx, control)
+                for continuation in control.continues:
+                    head = head.join(continuation)
+                return head, exhausted, control.breaks, True
+            finally:
+                # Returns and routed exceptions leave this consumer's iterator scope.
+                exits = list(fctx.returns[returns:]) + list(fctx.raises[mark[0]:])
+                frames = {id(frame): frame for frame in self._try_stack}
+                for fid, a, b, c, d, e in mark[1]:
+                    frame = frames.get(fid)
+                    if frame is not None:
+                        exits.extend(frame.raised[a:] + frame.unhandled[b:] + frame.pending_returns[c:]
+                                     + frame.pending_breaks[d:] + frame.pending_continues[e:])
+                seen = set()
+                for exit in exits:
+                    state = exit.st if isinstance(exit, _Exc) else exit[0] if isinstance(exit, tuple) else exit
+                    if id(state) not in seen and len(state.pins) > pin:
+                        seen.add(id(state))
+                        state.pins = state.pins[:pin] + state.pins[pin + 1:]
+
+        while not current.bottom:
+            if self._clock() > self.deadline:
+                raise Unsupported("generator iteration time budget exhausted", node)
+            entry = current.copy()
+            current, exhausted, escaped, yielded = advance(current)
+            for end in exhausted:
+                stopped = end if stopped is None else stopped.join(end)
+            breaks.extend(escaped)
+            if not yielded:
+                break
+            if exhausted and not current.bottom:
+                # An uncertain stopping point needs an inductive continuation head.
+                # Known concrete trips retain the exact default path.
+                def step(head):
+                    return advance(head)[0]
+                head = entry if current.leq(entry) else self._fixpoint(current, step, fctx, node)
+                _, final_exhausted, final_breaks, _ = advance(head.copy())
+                for end in final_exhausted:
+                    stopped = end if stopped is None else stopped.join(end)
+                breaks.extend(final_breaks)
+                break
+        if stopped is not None and node.orelse:
+            stopped = self.exec_block(node.orelse, stopped, fctx, lctx)
+        out = stopped
+        for end in breaks:
+            out = end if out is None else out.join(end)
+        if out is None:
+            out = st.copy()
+            out.set_bottom()
+            return out
+        out.pins = out.pins[:pin] + out.pins[pin + 1:]
+        return out
+
+    def _resume_generator(self, st, iterator, node):
+        from .generators import Refused, compile_program
+
+        if len(iterator.refs) != 1:
+            raise Unsupported("generator identity alternatives require continuation partitioning", node)
+        address = next(iter(iterator.refs))
+        if address[1] != "r":
+            raise Unsupported("resumption of a summary generator identity", node)
+        obj = st.heap[address]
+        if -2 in obj.states:
+            raise Unsupported("reentrant generator resumption", node)
+        if not obj.function.replace(refs=frozenset()).is_bot():
+            raise Unsupported("generator function identity is unavailable", node)
+        cache = getattr(self, "_generator_programs", None)
+        if cache is None:
+            cache = self._generator_programs = {}
+        yielded, exhausted = [], []
+        caller = self._fctx_stack[-1]
+        for pc, saved in obj.states.items():
+            if pc == -1:
+                exhausted.append(st.copy())
+                continue
+            for function in obj.function.refs:
+                branch = st.copy()
+                fo = branch.heap[function]
+                if isinstance(fo.node, ast.AsyncFunctionDef):
+                    raise Unsupported("asynchronous generator/coroutine continuation", node)
+                for binding in fo.capture_frames.values():
+                    self._closure_frame_index(branch, binding, node)
+                if fo.node not in cache:
+                    try:
+                        cache[fo.node] = compile_program(fo.node, lambda n: _is_generator(
+                            ast.Module(body=[n], type_ignores=[])))
+                    except Refused as error:
+                        raise Unsupported(str(error), node) from None
+                program = cache[fo.node]
+                start = program.entry if pc is None else pc
+                if not 0 <= start < len(program.code):
+                    raise Unsupported("generator position does not match its function", node)
+                loc, glo = _assigned_names(fo.node.body, allow_nonlocal=bool(fo.captures or fo.capture_frames)) if not isinstance(fo.node, ast.Lambda) else (set(), set())
+                env = dict(fo.captures)
+                env.update(saved.bindings)
+                hidden = {f"!generator.{instruction.loop}.{part}" for instruction in program.code
+                          if instruction.kind == "for-enter" for part in ("cursor", "end", "step")}
+                context = FuncCtx(fo.node, loc | set(env) | hidden, glo, module_key=fo.module_key,
+                                  capture_frames=fo.capture_frames)
+                context.activation = self._bump()
+                resume_pin = len(branch.pins)
+                branch.pins += (V(refs=frozenset({address})),)
+                branch.frames.append(Frame(f"c{len(branch.frames)}"))
+                for name, value in env.items():
+                    self.write_var(branch, len(branch.frames)-1, name, value)
+                branch.frame.maybe_unbound.update(saved.maybe_unbound)
+                branch.heap[address] = obj.replace(function=V(refs=frozenset({function})),
+                    states={-2: GeneratorFrame(env, saved.maybe_unbound)})
+                previous_epoch, previous_module = self.epoch, self._cur_module_key
+                previous_forced, self._forced_draws = self._forced_draws, {}
+                self._cur_module_key = fo.module_key
+                self.callstring.append((node.lineno, node.col_offset, "generator-resume"))
+                self.active.append(fo.node)
+                self.borrowed.append(set())
+                self._fctx_stack.append(context)
+
+                def release_active_identity(state):
+                    if (len(state.pins) <= resume_pin
+                            or state.pins[resume_pin].refs != frozenset({address})):
+                        raise Unsupported("active generator identity moved to summary storage", node)
+                    state.pins = state.pins[:resume_pin] + state.pins[resume_pin + 1:]
+
+                def finish(state, next_pc, value=None):
+                    if state.bottom:
+                        return
+                    release_active_identity(state)
+                    bindings = {} if next_pc == -1 else {
+                        name: self._const_bounds(state, value, "generator-local")
+                        for name, value in state.frame.env.items()}
+                    state.heap[address] = state.heap[address].replace(states={next_pc: GeneratorFrame(
+                        bindings, () if next_pc == -1 else state.frame.maybe_unbound)})
+                    pin = len(state.pins)
+                    if value is not None:
+                        state.pins += (self.summarize(state, value),)
+                    self.pop_frame(state)
+                    if value is None:
+                        exhausted.append(state)
+                    else:
+                        value = state.pins[pin]
+                        state.pins = state.pins[:pin] + state.pins[pin + 1:]
+                        yielded.append((state, value))
+
+                try:
+                    pending = [(branch, start)]
+                    while pending:
+                        current, position = pending.pop()
+                        if current.bottom:
+                            continue
+                        if self._clock() > self.deadline:
+                            raise Unsupported("generator continuation time budget exhausted", node)
+                        self.fresh_pass()
+                        instruction = program.code[position]
+                        source = instruction.node
+                        before = self._exit_count
+                        kind = instruction.kind
+                        def check_exit():
+                            if current.bottom and self._try_stack and self._exit_count == before:
+                                raise Unsupported("generator operation ends without a modelled exit", source)
+                        if kind == "exec":
+                            current = self.exec_block([source], current, context, None)
+                        elif kind == "test":
+                            condition = self.eval(source, current, context)
+                            check_exit()
+                            if current.bottom:
+                                continue
+                            yes, no = self.truth_split(current, condition, source)
+                            pending.extend([(yes, instruction.next), (no, instruction.alternate)])
+                            continue
+                        elif kind == "yield":
+                            value = NONE if source.value is None else self.eval(source.value, current, context)
+                            check_exit()
+                            if not current.bottom:
+                                finish(current, instruction.next, value)
+                            continue
+                        elif kind == "return":
+                            if source.value is not None:
+                                self.eval(source.value, current, context)
+                            check_exit()
+                            finish(current, -1)
+                            continue
+                        elif kind == "send-none":
+                            targets = source.targets if isinstance(source, ast.Assign) else [source.target]
+                            for target in targets:
+                                self.assign(target, NONE, current, context)
+                        elif kind == "for-enter":
+                            value = self.eval(source.iter, current, context)
+                            check_exit()
+                            if current.bottom:
+                                continue
+                            if len(value.refs) != 1 or not value.replace(refs=frozenset()).is_bot():
+                                raise Unsupported("generator loop requires one range", source)
+                            iterable = current.heap[next(iter(value.refs))]
+                            if iterable.kind != "range":
+                                raise Unsupported("generator loop iterator cursor is not modelled", source)
+                            prefix = f"!generator.{instruction.loop}."
+                            for part, bound in (("cursor", iterable.lo), ("end", iterable.hi)):
+                                if isinstance(bound, str):
+                                    info = IntInfo(Lin.var(bound))
+                                elif isinstance(bound, int):
+                                    info = IntInfo.interval(bound, bound)
+                                else:
+                                    info = IntInfo.interval(*bound)
+                                self.write_var(current, len(current.frames)-1, prefix+part, V(i=info))
+                            self.write_var(current, len(current.frames)-1, prefix+"step", const_int(iterable.step))
+                        elif kind == "for-next":
+                            prefix = f"!generator.{instruction.loop}."
+                            if any(prefix+part not in current.frame.env or prefix+part in current.frame.maybe_unbound
+                                   for part in ("cursor", "end", "step")):
+                                raise Unsupported("generator range continuation bindings are unavailable", source)
+                            step = self.ibounds(current, current.frame.env[prefix+"step"].i)
+                            if step[0] is None or step[0] != step[1] or step[0] == 0:
+                                raise Unsupported("generator range step lost its exact value", source)
+                            comparison = ast.copy_location(ast.Compare(
+                                left=ast.Name(id=prefix+"cursor", ctx=ast.Load()),
+                                ops=[ast.Lt() if step[0]>0 else ast.Gt()],
+                                comparators=[ast.Name(id=prefix+"end", ctx=ast.Load())]), source)
+                            ast.fix_missing_locations(comparison)
+                            for generated in ast.walk(comparison):
+                                setattr(generated, ROLE_ATTR, "generator-control")
+                            condition = self.eval(comparison, current, context)
+                            check_exit()
+                            if current.bottom:
+                                continue
+                            yes, no = self.truth_split(current, condition, comparison)
+                            if not yes.bottom:
+                                self.assign(source.target, self.read_env_value(yes, yes.frame, prefix+"cursor", yes.frame.env[prefix+"cursor"]), yes, context)
+                            pending.extend([(yes, instruction.next), (no, instruction.alternate)])
+                            continue
+                        elif kind == "for-bump":
+                            prefix = f"!generator.{instruction.loop}."
+                            if any(prefix+part not in current.frame.env or prefix+part in current.frame.maybe_unbound
+                                   for part in ("cursor", "step")):
+                                raise Unsupported("generator range continuation bindings are unavailable", source)
+                            lo, hi = self.ibounds(current, current.frame.env[prefix+"cursor"].i)
+                            step = self.ibounds(current, current.frame.env[prefix+"step"].i)[0]
+                            if step is None:
+                                raise Unsupported("generator range step lost its exact value", source)
+                            self.write_var(current, len(current.frames)-1, prefix+"cursor",
+                                           int_iv(None if lo is None else lo+step, None if hi is None else hi+step))
+                        else:
+                            raise Unsupported("unknown generator continuation instruction", source)
+                        if current.bottom and self._try_stack and self._exit_count == before:
+                            raise Unsupported("generator operation ends without a modelled exit", source)
+                        if not current.bottom:
+                            self.gc(current)
+                            pending.append((current, instruction.next))
+                    for returned, _ in context.returns:
+                        finish(returned, -1)
+                finally:
+                    self._fctx_stack.pop()
+                    self.borrowed.pop()
+                    self.active.pop()
+                    self.callstring.pop()
+                    self.epoch, self._cur_module_key = previous_epoch, previous_module
+                    self._forced_draws = previous_forced
+                for error in context.raises:
+                    if error.st.bottom:
+                        continue
+                    release_active_identity(error.st)
+                    error.st.heap[address] = error.st.heap[address].replace(states={-1: GeneratorFrame({})})
+                    self.pop_frame(error.st)
+                    if self._is_subclass(error.st, error.cls, "StopIteration"):
+                        # The wrapped cause is opaque; its private in-flight pin must not leak.
+                        error.st.pins = error.st.pins[:resume_pin] + tuple(
+                            value for value in error.st.pins[resume_pin:] if value != error.val)
+                        error = _Exc(error.st, "RuntimeError", V(top=True), error.node, "raise",
+                                     "generator raised StopIteration")
+                    self._route_exc(error, caller)
+        return yielded, exhausted
+
+    def _user_iterator_for(self, s, st, fctx, lctx, iterator):
+        """Execute every finite user-iterator continuation; never prove a consumed prefix."""
+        if self.instance_class(st, iterator) is None or not iterator.replace(refs=frozenset()).is_bot():
+            raise Unsupported("for requires one known user iterator", s)
+        current = st.copy()
+        pin = len(current.pins)
+        current.pins += (iterator,)
+        stopped = None
+        breaks = []
+
+        def release(state):
+            state.pins = state.pins[:pin] + state.pins[pin + 1:]
+            return state
+
+        while not current.bottom:
+            if self._clock() > self.deadline:
+                raise Unsupported("user iterator for time budget exhausted", s)
+            self.fresh_pass()
+            frame = _TryFrame(s, fctx, lctx, None, True)
+            self._try_stack.append(frame)
+            try:
+                element = self.special(current, iterator, "__next__", [], s.iter)
+            finally:
+                self._try_stack.pop()
+            for exc in frame.raised:
+                if self._is_subclass(exc.st, exc.cls, "StopIteration"):
+                    end = self._leave_handler(None, exc.val, exc.st, fctx)
+                    stopped = end if stopped is None else stopped.join(end)
+                else:
+                    self._route_exc(exc.with_state(release(exc.st)), fctx)
+            if current.bottom:
+                break
+            self.assign(s.target, element, current, fctx)
+            control = LoopCtx()
+            current = self.exec_block(s.body, current, fctx, control)
+            for continuation in control.continues:
+                current = current.join(continuation)
+            breaks.extend(control.breaks)
+        if stopped is not None and s.orelse:
+            stopped = self.exec_block(s.orelse, stopped, fctx, lctx)
+        out = stopped
+        for end in breaks:
+            out = end if out is None else out.join(end)
+        if out is None:
+            out = st.copy()
+            out.set_bottom()
+            return out
+        return release(out)
+
     def check_iterable(self, st: State, v: V, node) -> bool:
         """Record the "iter" TypeError check; True iff ``v`` is certainly iterable."""
+        if any(st.heap[a].kind == "generator" for a in v.refs):
+            raise Unsupported("generator continuation/protocol is not modelled", node)
         bad = v.i is not None or bool(v.b) or v.f or v.n
         for a in v.refs:
             k = st.heap[a].kind
@@ -3022,13 +4443,50 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         derives e.g. ``lo <= hi - 1``).  Call this only on paths where an
         element provably exists: a loop body, a successful unpack.  Elsewhere
         use :meth:`elem_summary`."""
+        if any(st.heap[a].kind == "generator" for a in v.refs):
+            raise Unsupported("generator continuation/protocol is not modelled", node)
+        if any(type(st.heap.get(a)) in {ZipObj, EnumerateObj} for a in v.refs):
+            if len(v.refs) != 1 or not v.replace(refs=frozenset()).is_bot():
+                raise Unsupported("iteration over mixed lazy iterator receivers", node)
+            obj = st.heap[next(iter(v.refs))]
+            return (self._zip_row(st, next(iter(v.refs)), node) if type(obj) is ZipObj
+                    else self._enumerate_row(st, obj, node, exists=True))
+        if isinstance(node, ast.For):
+            source = self._dict_items_for_source(st, v)
+            if source is not None:
+                return self._dict_items_for_pair(st, source, node)
         out = self.elem_summary(st, v)
         if out is None:
             return None
         return self.mat(st, out)
 
+    def _dict_items_for_source(self, st, value):
+        if len(value.refs) != 1 or not value.replace(refs=frozenset()).is_bot():
+            return None
+        view = st.heap[next(iter(value.refs))]
+        if type(view) is not DictView or view.which != 'items' or len(view.dicts) != 1:
+            return None
+        source = next(iter(view.dicts))
+        return source if type(st.heap[source]) is DictObj else None
+
+    def _dict_items_for_pair(self, st, source, node):
+        # A view is live: reread after every back edge, rather than snapshotting entry values.
+        mapping = st.heap[source]
+        if self.dict_len(st, {source})[1] == 0:
+            return None
+        keys, values = self.dict_keys_v(st, mapping), self.dict_vals_v(st, mapping)
+        if any(v.is_bot() or v.top or v.refs or v.st or v.f for v in (keys, values)):
+            raise Unsupported('direct dict.items() loop requires non-float primitive fields', node)
+        pair = self.new_list(st, node, None, BOT, tag='dict-items-for-pair', kind='tuple',
+                             items=[keys, values])
+        return V(refs=frozenset({pair}))
+
     def elem_summary(self, st: State, v: V) -> V | None:
         """Every element of iterable ``v`` (symbolic bounds, not materialized)."""
+        if any(st.heap[a].kind == "generator" for a in v.refs):
+            raise Unsupported("generator continuation/protocol is not modelled", None)
+        if any(type(st.heap.get(a)) in {ZipObj, EnumerateObj} for a in v.refs):
+            raise Unsupported("lazy iterator consumption requires a reviewed consumer")
         out = BOT
         if v.s is not None:
             out = vjoin(out, st.zone, ANYSTR, st.zone)
@@ -3095,31 +4553,218 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return lo, hi
 
     def dict_method(self, st: State, a, name, args, kwargs, node) -> V:
+        if name=='__missing__' and isinstance(st.heap[a],DefaultDictObj):
+            return self.visit_method_rule('collections.defaultdict.__missing__',
+                MethodCtx(st,frozenset({a}),name,args,kwargs,node))
         qualname = f"dict.{name}"
         if qualname in _METHOD_HOOKS:
             return self.visit_method_rule(qualname, MethodCtx(st, frozenset({a}), name, args, kwargs, node))
         return self._dict_method_model(st, a, name, args, kwargs, node)
 
+    def defaultdict_missing(self, ctx) -> V:
+        from ..contracts.registry import get
+        q='collections.defaultdict.__missing__'
+        st,node=ctx.state,ctx.node
+        contract=get(q)
+        if contract is None or not contract.tested:
+            raise Unsupported(q+': no tested contract',node)
+        if len(ctx.receivers)!=1 or ctx.kwargs or len(ctx.args)!=1:
+            raise Unsupported(q+': one native receiver and one positional key required',node)
+        address=next(iter(ctx.receivers))
+        ob=st.heap[address]
+        if type(ob) is not DefaultDictObj:
+            raise Unsupported(q+': receiver is not a native defaultdict',node)
+        key=ctx.args[0]
+        proven={exc:'native factory None/list and guarded insertion execute no target callback' for exc in PROPERTY_EXC_ORDER}
+        if ob.factory is None:
+            payload=self.contract_exception_args(q,'KeyError','no-factory',
+                                                  (V(refs=frozenset({address})),key),node)
+            self.check(node,q+':KeyError',{'KeyError'},False,'default_factory is None',st=st,
+                       exact_args={'KeyError':payload},contract_qualname=q)
+            self._contract_checks(node,q,contract,proven,recorded={'KeyError'})
+            st.set_bottom()
+            return BOT
+        if ob.factory!='list':
+            raise Unsupported(q+': factory is not the native list constructor',node)
+        value,present,_=self.dict_load(st,ob,key,node)
+        if not present:
+            keys=self.key_consts(st,key)
+            key_summary=self.borrow(st,self.summarize(st,self.mat(st,key)))
+            self.borrow(st,value)
+            fresh=V(refs=frozenset({self.new_list(st,node,IntInfo.interval(0,0),BOT,tag='defaultdict direct missing list')}))
+            self._defaultdict_store_factory_list(st,address,key_summary,keys,fresh,strong=address[1]=='r')
+            value=vjoin(value,st.zone,fresh,st.zone)
+        self._contract_checks(node,q,contract,proven)
+        return self.mat(st,value)
+
+    def _dict_setdefault_model(self, st, a, args, kwargs, node):
+        from tharkun.solve.contracts.adapters.absint import contract_for_builtin
+
+        contract = contract_for_builtin('dict.setdefault')
+        if (contract is None or contract.returns is None or not contract.returns.tested
+                or contract.returns.type != 'the value type'):
+            raise Unsupported('dict.setdefault requires its tested return contract', node)
+        if not self._arity(node, args, kwargs, 1, 2, 'dict.setdefault'):
+            st.set_bottom()
+            return BOT
+        receiver = st.heap[a]
+        if type(receiver) is not DictObj or a[1] != 'r':
+            raise Unsupported('dict.setdefault requires one recent builtin receiver', node)
+        key_value = args[0]
+        keys = self.key_consts(st, key_value)
+        if ((keys is None or len(keys) != 1)
+                and (key_value.is_bot() or key_value.top or key_value.refs or key_value.st or key_value.f)):
+            raise Unsupported('dict.setdefault requires non-float primitive keys', node)
+        default = args[1] if len(args) == 2 else NONE
+        # An ignored temporary default can run cleanup when its last reference is released.
+        fields = [self.dict_keys_v(st, receiver), *receiver.items.values(), receiver.ovals, default]
+        if any(v.top or v.refs or v.st or v.f for v in fields):
+            raise Unsupported('dict.setdefault requires non-float primitive fields', node)
+        if keys is None or len(keys) != 1:
+            value = BOT
+            for key, old in receiver.items.items():
+                if self._clock() > self.deadline:
+                    raise Unsupported('dict.setdefault time budget exhausted', node)
+                if self._dict_key_may_equal(key_value, keys, key):
+                    value = vjoin(value, st.zone, old, st.zone)
+            if keys is None or any(key not in receiver.items for key in keys):
+                if not receiver.exact:
+                    value = vjoin(value, st.zone, receiver.ovals, st.zone)
+                value = vjoin(value, st.zone, default, st.zone)
+                # setdefault inserts only: uncertain keys never overwrite definite entries.
+                st.heap[a] = receiver.replace(exact=False,
+                    okeys=self.join_into(st, receiver.okeys, key_value),
+                    ovals=self.join_into(st, receiver.ovals, default))
+            return self.mat(st, value)
+        key = next(iter(keys))
+        if key in receiver.items:
+            return self.mat(st, receiver.items[key])
+        value = default
+        if not receiver.exact and self._dict_key_may_equal(receiver.okeys, self.key_consts(st, receiver.okeys), key):
+            value = vjoin(value, st.zone, receiver.ovals, st.zone)
+        self._subscript_store_model(st, V(refs=frozenset({a})), ('index', args[0]), value, node)
+        return self.mat(st, value)
+
+    def _dict_pop_model(self, st, a, args, kwargs, node):
+        from tharkun.solve.contracts.adapters.absint import contract_for_builtin
+
+        contract = contract_for_builtin('dict.pop')
+        if (contract is None or contract.returns is None or not contract.returns.tested
+                or contract.returns.type != 'the value type, or the default'):
+            raise Unsupported('dict.pop requires its tested return contract', node)
+        if not self._arity(node, args, kwargs, 1, 2, 'dict.pop'):
+            st.set_bottom()
+            return BOT
+        receiver = st.heap[a]
+        # shortcut: uncertain presence and summary receivers need a weak deletion model.
+        if type(receiver) is not DictObj or a[1] != 'r' or not receiver.exact:
+            raise Unsupported('dict.pop requires one closed recent builtin receiver', node)
+        keys = self.key_consts(st, args[0])
+        if (keys is None or len(keys) != 1
+                or any(type(k) not in (int, bool, str, type(None)) for k in receiver.items)):
+            raise Unsupported('dict.pop requires constant non-float scalar keys', node)
+        default = args[1] if len(args) == 2 else NONE
+        # An ignored temporary default can run cleanup when its last reference is released.
+        if default.top or default.refs or default.st or default.f:
+            raise Unsupported('dict.pop requires a non-float primitive default', node)
+        key = next(iter(keys))
+        present = key in receiver.items
+        self.check(node, 'dict.pop:KeyError', {'KeyError'}, present or len(args) == 2,
+                   'key present or default supplied', st=st)
+        if not present:
+            if len(args) == 2:
+                return default
+            st.set_bottom()
+            return BOT
+        value = receiver.items[key]
+        if value.top or value.st or value.f:
+            raise Unsupported('dict.pop requires a non-float modeled result', node)
+        self.borrow(st, value)
+        items = dict(receiver.items)
+        del items[key]
+        st.heap[a] = receiver.replace(items=items)
+        return self.mat(st, value)
+
     def _dict_method_model(self, st: State, a, name, args, kwargs, node) -> V:
         ob = st.heap[a]
+        if name == "update":
+            return self._dict_update_model(st, a, args, kwargs, node)
         if name in ("keys", "values", "items"):
             self._arity(node, args, kwargs, 0, 0, name)
             va = self.alloc(st, node, lambda sid: DictView(frozenset({a}), name), "dictview")
             return V(refs=frozenset({va}))
         if name == "get":
+            from tharkun.solve.contracts.adapters.absint import contract_for_builtin
+
             if not self._arity(node, args, kwargs, 1, 2, "get"):
                 st.set_bottom()
                 return BOT
-            val, _ok, _f = self.dict_load(st, ob, args[0], node)
+            val, present, _f = self.dict_load(st, ob, args[0], node)
             dflt = args[1] if len(args) > 1 else NONE
+            contract = contract_for_builtin('dict.get')
+            if (present and not val.is_bot() and not val.f and contract is not None
+                    and contract.returns is not None and contract.returns.tested):
+                return self.mat(st, val)
             return vjoin(self.mat(st, val) if not val.is_bot() else BOT, st.zone, dflt, st.zone)
+        if name == "setdefault":
+            return self._dict_setdefault_model(st, a, args, kwargs, node)
+        if name == "pop":
+            return self._dict_pop_model(st, a, args, kwargs, node)
         raise Unsupported(f"dict.{name}", node)
+
+    def _dict_update_model(self, st, a, args, kwargs, node):
+        from tharkun.solve.contracts.adapters.absint import contract_for_builtin
+
+        contract = contract_for_builtin('dict.update')
+        if (contract is None or contract.returns is None or not contract.returns.tested
+                or contract.returns.type != 'None'):
+            raise Unsupported('dict.update requires its tested None return contract', node)
+        valid = len(args) <= 1
+        self.check(node, 'call-args', {'TypeError'}, valid, 'dict.update accepts at most one positional argument', st=st)
+        if not valid:
+            st.set_bottom()
+            return BOT
+        receiver = st.heap[a]
+        if type(receiver) is not DictObj or a[1] != 'r':
+            raise Unsupported('dict.update requires one recent builtin receiver', node)
+        mappings = [receiver]
+        if args:
+            source = args[0]
+            if len(source.refs) != 1 or not source.replace(refs=frozenset()).is_bot():
+                raise Unsupported('dict.update requires one exact builtin mapping', node)
+            mappings.append(st.heap[next(iter(source.refs))])
+        for mapping in mappings:
+            if type(mapping) is not DictObj:
+                raise Unsupported('dict.update with an open mapping protocol', node)
+            # Replacing a last reference can run __del__; primitive fields have no cleanup hooks.
+            fields = [self.dict_keys_v(st, mapping), *mapping.items.values(), mapping.ovals]
+            if any(v.top or v.refs or v.st or v.f for v in fields):
+                raise Unsupported('dict.update requires non-float primitive keys and values', node)
+        if any(v.top or v.refs or v.st or v.f for v in kwargs.values()):
+            raise Unsupported('dict.update requires primitive keyword values', node)
+        if args:
+            items = dict(receiver.items)
+            exact, keys, values = self._dict_unpack(st, args[0], node, items, receiver.exact,
+                                                   receiver.okeys, receiver.ovals)
+            st.heap[a] = DictObj(items, exact, keys, values)
+        for key, value in kwargs.items():
+            self._subscript_store_model(st, V(refs=frozenset({a})), ('index', const_str(key)), value, node)
+        return NONE
 
     def key_consts(self, st: State, v: V):
         """The finite set of hashable constants ``v`` may be, or None.  An int is a set of constants when the
         zone bounds it: a name bound to a constant (``EMPTY, WHITE, BLACK = 0, 1, 2``) is one constant, a loop
         variable over ``range(3)`` is three; the bounds are sound, so every value the key may have is in the set."""
-        if v.top or v.refs or v.st or v.f:
+        if v.refs:
+            from .native import concrete
+            values = concrete(self, st, v)
+            if values is None:
+                return None
+            try:
+                return set(values)
+            except TypeError:
+                return None
+        if v.top or v.st or v.f:
             return None
         out = set()
         if v.s is not None:
@@ -3149,52 +4794,296 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             # Python numeric keys coalesce across bool, int, and float.  When a
             # numeric key is not finite, retain every definite numeric entry.
             return key.i is not None or bool(key.b) or bool(key.f)
+        if isinstance(definite, tuple):
+            return bool(key.refs)
         return False
 
+    def _dict_union(self, st, left, right, node, inplace):
+        """Builtin dict union copies left then overwrites from right, without user protocols."""
+        if inplace:
+            raise Unsupported("in-place dict union", node)
+        for value in (left, right):
+            if len(value.refs) != 1 or not value.replace(refs=frozenset()).is_bot():
+                raise Unsupported("dict union requires two exact builtin mappings", node)
+            mapping = st.heap[next(iter(value.refs))]
+            if type(mapping) is not DictObj:
+                raise Unsupported("dict union with an open mapping protocol", node)
+            if any(v.top or v.refs or v.st or v.f for v in mapping.values()):
+                raise Unsupported("dict union requires non-float primitive keys and values", node)
+        items, exact, keys, values = {}, True, BOT, BOT
+        for source in (left, right):
+            exact, keys, values = self._dict_unpack(st, source, node, items, exact, keys, values)
+        address = self.alloc(st, node, lambda _sid: DictObj(items, exact, keys, values), "dict_union")
+        return V(refs=frozenset({address}))
+
+    def _dict_unpack(self, st, source, node, items, exact, okeys, ovals):
+        """Merge one closed builtin mapping; its possible keys never become definite."""
+        if len(source.refs) != 1 or not source.replace(refs=frozenset()).is_bot():
+            raise Unsupported('dict unpacking requires one exact builtin mapping', node)
+        mapping = st.heap[next(iter(source.refs))]
+        if type(mapping) is not DictObj:
+            raise Unsupported('dict unpacking with an open mapping protocol', node)
+        keys = self.dict_keys_v(st, mapping)
+        if keys.top or keys.refs or keys.st or keys.f:
+            raise Unsupported('dict unpacking requires callback-free non-float scalar keys', node)
+        self.check(node, 'dict-unpack', {'TypeError'}, True, 'exact builtin dict with callback-free scalar keys')
+        constants = self.key_consts(st, mapping.okeys)
+        for key, old in items.items():
+            if key not in mapping.items and self._dict_key_may_equal(mapping.okeys, constants, key):
+                items[key] = vjoin(old, st.zone, mapping.ovals, st.zone)
+        items.update({key: self._const_bounds(st, value, '') for key, value in mapping.items.items()})
+        okeys = vjoin(okeys, st.zone, mapping.okeys, st.zone)
+        ovals = vjoin(ovals, st.zone, self._const_bounds(st, mapping.ovals, ''), st.zone)
+        # Captured fields are not rewritten if a later allocation demotes a value.
+        for value in [*items.values(), okeys, ovals]:
+            self.borrow(st, value)
+        return exact and mapping.exact, okeys, ovals
+
     def e_Dict(self, e, st, fctx):
+        unpacking = any(key is None for key in e.keys)
+        if unpacking and self._try_stack and any(
+                not isinstance(n, (ast.Dict, ast.Name, ast.Constant, ast.Load)) for n in ast.walk(e)):
+            self._in_try_refuse('dict unpacking operand exceptions', e)
+        pin_index = len(st.pins)
+        result = None
+        if unpacking:
+            address = self.alloc(st, e, lambda sid: DictObj({}), 'dict')
+            result = V(refs=frozenset({address}))
+            st.pins += (result,)
         items = {}
         okeys = BOT
         ovals = BOT
         exact = True
-        for k, x in zip(e.keys, e.values):
-            if k is None:
-                raise Unsupported("dict unpacking", e)
-            kv = self.eval(k, st, fctx)
-            xv = self.eval(x, st, fctx)
-            if st.bottom:
-                return BOT
-            ks = self.key_consts(st, kv)
-            value = self.summarize(st, xv)
-            if ks is not None and len(ks) == 1:
-                key = next(iter(ks))
-                items[key] = value
+        try:
+            for k, x in zip(e.keys, e.values):
+                if k is None:
+                    source = self.eval(x, st, fctx)
+                else:
+                    kv = self.eval(k, st, fctx)
+                    xv = self.eval(x, st, fctx)
+                if st.bottom:
+                    return BOT
+                if unpacking:
+                    if len(st.pins) != pin_index + 1 or st.pins[pin_index] != result:
+                        raise Unsupported('dict display pin changed during operand evaluation', e)
+                    # Calls may rewrite captured values or collect temporaries.
+                    # Read the live partial mapping, rather than stale Python locals.
+                    partial = st.heap[address]
+                    items, exact, okeys, ovals = dict(partial.items), partial.exact, partial.okeys, partial.ovals
+                if k is None:
+                    exact, okeys, ovals = self._dict_unpack(st, source, e, items, exact, okeys, ovals)
+                else:
+                    if kv.refs:
+                        self.check_hash_key(st, kv, e)
+                    ks = self.key_consts(st, kv)
+                    value = self.summarize(st, xv)
+                    if ks is not None and len(ks) == 1:
+                        items[next(iter(ks))] = value
+                    else:
+                        # shortcut: open keys lose identity/cardinality; refine when lookup proofs need them.
+                        if kv.top or kv.st or not (kv.i is not None or kv.b or kv.f or kv.s is not None or kv.n or kv.refs):
+                            raise Unsupported('dict literal with a non-constant key', e)
+                        for key, old in items.items():
+                            if self._dict_key_may_equal(kv, ks, key):
+                                items[key] = vjoin(old, st.zone, value, st.zone)
+                        okeys = vjoin(okeys, st.zone, self.summarize(st, kv), st.zone)
+                        ovals = vjoin(ovals, st.zone, value, st.zone)
+                        exact = False
+                if unpacking:
+                    st.heap[address] = DictObj(items, exact, okeys, ovals)
+            if unpacking:
+                return result
+            a = self.alloc(st, e, lambda sid: DictObj(items, exact, okeys, ovals), 'dict')
+            return V(refs=frozenset({a}))
+        finally:
+            if unpacking:
+                st.pins = st.pins[:pin_index] + st.pins[pin_index + 1:]
+
+    def check_hash_key(self, st: State, key: V, node):
+        if not key.refs:
+            if key.top or key.st:
+                raise Unsupported("hash/equality protocol of an unknown key", node)
+            return
+        pending, seen = [key], set()
+        while pending:
+            if self._clock() >= self.deadline:
+                raise Unsupported("dictionary key validation time budget exhausted", node)
+            value = pending.pop()
+            if value.top or value.st:
+                raise Unsupported("hash/equality protocol of an unknown key", node)
+            for address in value.refs - seen:
+                seen.add(address)
+                obj = st.heap[address]
+                if type(obj) is not TupleObj:
+                    raise Unsupported("hash/equality protocol of a non-builtin-tuple key", node)
+                pending.extend(obj.values())
+
+    def _dict_straightline_write(self, st: State, ob, key: V, node):
+        """Stored value after an uninterrupted same-name module write, else no relation.
+
+        This is a source-dominance proof, not identity between two ANY_STR values.
+        No fact survives a call, mutation, assignment, different key or control block.
+        """
+        if (self.lowered is not None or self.source != self.site_source or st.bottom
+                or len(st.frames) != 1 or st.frame.fid != "g" or type(ob) is not DictObj):
+            return None
+        if key.s is None or not key.replace(s=None).is_bot():
+            return None
+        if (any(type(k) not in (str, int, bool, type(None)) for k in ob.items)
+                or not (ob.okeys.is_bot() or (ob.okeys.s is not None and ob.okeys.replace(s=None).is_bot()))):
+            return None  # an existing custom key could execute equality hooks during lookup/store
+
+        def membership(expr):
+            if (isinstance(expr, ast.Compare) and len(expr.ops) == 1
+                    and isinstance(expr.ops[0], (ast.In, ast.NotIn))
+                    and isinstance(expr.left, ast.Name) and isinstance(expr.comparators[0], ast.Name)):
+                return expr.left.id, expr.comparators[0].id
+            return None
+
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and isinstance(node.slice, ast.Name):
+            key_name, dict_name = node.slice.id, node.value.id
+        else:
+            names = membership(node)
+            if names is None:
+                return None
+            key_name, dict_name = names
+        stmt = node
+        while not isinstance(stmt, ast.stmt):
+            stmt = self._site_parents.get(stmt)
+            if stmt is None:
+                return None
+        if self._site_parents.get(stmt) is not self.tree:
+            return None
+        if isinstance(stmt, ast.Assert):
+            if stmt.test is not node or stmt.msg is not None:
+                return None
+        elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            if not (stmt.value is node or (isinstance(stmt.value, ast.Call) and stmt.value.func is node
+                    and not stmt.value.args and not stmt.value.keywords)):
+                return None  # another operand/callee/argument may run before this lookup
+        else:
+            return None
+        frame = st.frame
+        obj = frame.env.get(dict_name)
+        if (dict_name in frame.maybe_unbound or key_name in frame.maybe_unbound or key_name not in frame.env or obj is None
+                or len(obj.refs) != 1 or not obj.replace(refs=frozenset()).is_bot()):
+            return None
+        address = next(iter(obj.refs))
+        if address[1] != "r" or st.heap.get(address) is not ob:
+            return None
+        for before in reversed(self.tree.body[:self.tree.body.index(stmt)]):
+            if isinstance(before, ast.Pass):
                 continue
+            if (isinstance(before, ast.Assert) and before.msg is None
+                    and membership(before.test) == (key_name, dict_name) and isinstance(before.test.ops[0], ast.In)):
+                continue
+            if (isinstance(before, ast.Assign) and len(before.targets) == 1
+                    and isinstance(before.targets[0], ast.Subscript) and isinstance(before.value, ast.Name)):
+                target = before.targets[0]
+                if (isinstance(target.value, ast.Name) and target.value.id == dict_name
+                        and isinstance(target.slice, ast.Name) and target.slice.id == key_name
+                        and before.value.id not in frame.maybe_unbound):
+                    value = frame.env.get(before.value.id)
+                    if value is not None and not (value.top or value.st or value.f) and all(
+                            st.heap[r].kind == "func" for r in value.refs):
+                        return value
+            return None
+        return None
 
-            # shortcut: open keys lose identity/cardinality; refine them when lookup proofs need those facts.
-            # References and static values can carry custom hash/equality hooks.
-            if kv.top or kv.refs or kv.st or not (kv.i is not None or kv.b or kv.f or kv.s is not None or kv.n):
-                raise Unsupported("dict literal with a non-constant key", e)
+    def _dict_iteration_member(self, st, ob, node):
+        """A stable builtin loop key is present in the same live mapping."""
+        if (self.lowered is not None or self.source != self.site_source or st.bottom
+                or len(st.frames) != 1 or st.frame.fid != 'g' or type(ob) is not DictObj
+                or not isinstance(node, ast.Subscript) or not isinstance(node.value, ast.Name)
+                or not isinstance(node.slice, ast.Name)):
+            return False
+        stmt = node
+        while not isinstance(stmt, ast.stmt):
+            stmt = self._site_parents.get(stmt)
+            if stmt is None:
+                return False
+        loop = self._site_parents.get(stmt)
+        if (not isinstance(loop, ast.For) or self._site_parents.get(loop) is not self.tree
+                or not isinstance(loop.target, ast.Name) or loop.target.id != node.slice.id):
+            return False
+        iterator = loop.iter
+        view = (isinstance(iterator, ast.Call) and not iterator.args and not iterator.keywords
+                and isinstance(iterator.func, ast.Attribute) and iterator.func.attr == 'keys')
+        source = iterator.func.value if view else iterator
+        if not isinstance(source, ast.Name):
+            return False
+        frame = st.frame
+        receivers = [frame.env.get(n) for n in (source.id, node.value.id)]
+        if any(n in frame.maybe_unbound for n in (source.id, node.value.id, node.slice.id)):
+            return False
+        if any(v is None or len(v.refs) != 1 or not v.replace(refs=frozenset()).is_bot() for v in receivers):
+            return False
+        addresses = [next(iter(v.refs)) for v in receivers]
+        if addresses[0] != addresses[1] or addresses[0][1] != 'r' or st.heap.get(addresses[0]) is not ob:
+            return False
+        builtins = {'dict', 'list', 'tuple', 'set', 'frozenset', 'zip', 'enumerate', 'range',
+                    'len', 'min', 'max', 'abs', 'int', 'bool', 'float', 'str', 'ord', 'chr', 'all', 'any', 'sum'}
+        sv_names = {'nondet_int', 'nondet_bool', 'nondet_str', 'nondet_float',
+                    'nondet_list', 'nondet_dict', 'assume', 'check_type'}
 
-            for key, old in items.items():
-                if self._dict_key_may_equal(kv, ks, key):
-                    # An uncertain insertion cannot remove the key, but can
-                    # replace its value if it collides.
-                    items[key] = vjoin(old, st.zone, value, st.zone)
-            okeys = vjoin(okeys, st.zone, self.summarize(st, kv), st.zone)
-            ovals = vjoin(ovals, st.zone, value, st.zone)
-            exact = False
-        a = self.alloc(st, e, lambda sid: DictObj(items, exact, okeys, ovals), "dict")
-        return V(refs=frozenset({a}))
+        def sv_attr(expr):
+            if not isinstance(expr, ast.Attribute) or not isinstance(expr.value, ast.Name) or expr.attr not in sv_names:
+                return False
+            value = frame.env.get(expr.value.id)
+            return (value is not None and value.st == frozenset({('module', '_sv_verifier')})
+                    and value.replace(st=frozenset()).is_bot())
 
-    def check_hash_key(self, key: V, node):
-        if key.top or key.refs or key.st:
-            raise Unsupported("hash/equality protocol of a non-scalar key", node)
+        # Close the reachable value producers: no user hooks, imports or dynamic code.
+        forbidden = {'type', 'eval', 'exec', 'compile', 'globals', 'locals', 'vars',
+                     'getattr', 'setattr', 'delattr', '__import__', '__builtins__',
+                     '__loader__', '__spec__', '__package__', '__cached__'}
+        for part in ast.walk(self.tree):
+            if self._clock() > self.deadline:
+                return False
+            if isinstance(part, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
+                                 ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp, ast.NamedExpr)):
+                return False
+            if isinstance(part, ast.Name) and isinstance(part.ctx, (ast.Store, ast.Del)) and part.id in builtins:
+                return False
+            if isinstance(part, ast.Import) and any(a.name != '_sv_verifier' for a in part.names):
+                return False
+            if isinstance(part, ast.ImportFrom) or (isinstance(part, ast.Name) and part.id in forbidden):
+                return False
+            if isinstance(part, ast.Attribute) and isinstance(part.ctx, (ast.Store, ast.Del)):
+                return False
+            if isinstance(part, ast.Attribute) and not (view and part is iterator.func) and not sv_attr(part):
+                return False
+            if isinstance(part, ast.Call) and not ((isinstance(part.func, ast.Name) and part.func.id in builtins)
+                    or sv_attr(part.func) or (view and part is iterator)):
+                return False
+        for body in loop.body:
+            if not isinstance(body, (ast.Pass, ast.Expr, ast.Assert)) or (isinstance(body, ast.Assert) and body.msg is not None):
+                return False
+            for part in ast.walk(body):
+                if self._clock() > self.deadline:
+                    return False
+                if isinstance(getattr(part, 'ctx', None), (ast.Store, ast.Del)):
+                    return False
+                if isinstance(part, ast.Call):
+                    if (sv_attr(part.func) and part.func.attr == 'check_type' and len(part.args) == 2
+                            and not part.keywords and isinstance(part.args[1], ast.Name)
+                            and part.args[1].id in {'int', 'bool', 'float', 'str', 'list', 'tuple', 'dict', 'set'}
+                            and part.args[1].id not in frame.env):
+                        continue
+                    if (isinstance(part.func, ast.Name) and part.func.id == 'len'
+                            and part.func.id not in frame.env and len(part.args) == 1 and not part.keywords):
+                        continue
+                    return False
+        return True
 
     def dict_load(self, st: State, ob, kv: V, node) -> tuple:
         """(value, ok) of ``d[k]``: KeyError is impossible when every key ``kv`` may be is present."""
-        self.check_hash_key(kv, node)
+        self.check_hash_key(st, kv, node)
         ks = self.key_consts(st, kv)
         if ks is None:
+            written = self._dict_straightline_write(st, ob, kv, node)
+            if written is not None:
+                return written, True, "uninterrupted same-binding builtin-string dictionary write"
             ok = False
             out = self.dict_vals_v(st, ob)
             fact = "key not a known constant"
@@ -3209,6 +5098,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 out = vjoin(out, st.zone, ob.ovals, st.zone)
             fact = (f"keys {sorted(map(repr, ks))} all present" if ok else
                     f"key(s) {sorted(map(repr, missing))} may be absent")
+        if not ok and self._dict_iteration_member(st, ob, node):
+            return out, True, "same live builtin dictionary iteration key"
         return out, ok, fact
 
     def _defaultdict_store_factory_list(self, st: State, address, key_summary: V, keys, value: V,
@@ -3249,11 +5140,14 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             raise Unsupported(f"assignment target {type(t).__name__}", t)
 
     def unpack(self, t, v: V, st: State, fctx) -> None:
-        self._in_try_refuse("unpacking (its ValueError is not routed)", t)
-        v = self.iterable(st, v, t)
         n = len(t.elts)
+        if self._try_stack and not (v.refs and v.replace(refs=frozenset()).is_bot() and all(
+                type(st.heap[a]) is TupleObj and st.heap[a].items is not None
+                and len(st.heap[a].items) == n for a in v.refs)):
+            self._in_try_refuse("unpacking (its ValueError is not routed)", t)
+        v = self.iterable(st, v, t)
         if any(isinstance(e, ast.Starred) for e in t.elts):
-            raise Unsupported("starred assignment", t)
+            return self._unpack_starred(t, v, st, fctx)
         if v.top:
             raise Unsupported("unpacking an unknown value", t)
         bad = v.i is not None or bool(v.b) or v.f or v.n or bool(v.st)
@@ -3273,6 +5167,28 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 feasible = True
                 parts = [vjoin(p, st.zone, self.all_elems(st, ob), st.zone) for p in parts]
             elif ob.kind in ("range", "iterator", "set"):
+                if type(ob) is IteratorObj and a[0][-1] == "scalar-map":
+                    from .map_identity import consume
+                    values = consume(self, st, ob, n, t)
+                    if st.bottom:
+                        return
+                    feasible = True
+                    parts = [vjoin(p, st.zone, value, st.zone) for p, value in zip(parts, values)]
+                    continue
+                if type(ob) is IteratorObj and a[0][-1] == "identity-map":
+                    # Construction proves this is the sole consumer, outside loops/functions.
+                    source = st.heap[next(iter(ob.source.refs))]
+                    if type(source) is not TupleObj or source.items is None:
+                        raise Unsupported("identity map positional snapshot is not closed", t)
+                    if len(source.items) != n:
+                        continue  # ValueError, before any assignment target is stored.
+                    feasible = True
+                    parts = [vjoin(p, st.zone, x, st.zone) for p, x in zip(parts, source.items)]
+                    continue
+                if n == 0:
+                    # Success with no targets establishes no element or element constraints.
+                    feasible = True
+                    continue
                 ev = self.iter_elem(st, V(refs=frozenset({a})), t)
                 if ev is not None:
                     feasible = True
@@ -3290,6 +5206,67 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         parts = [self.borrow(st, self.mat(st, p)) for p in parts]
         for e, p in zip(t.elts, parts):
             self.assign(e, p, st, fctx)
+
+    def _unpack_starred(self, t, v: V, st: State, fctx) -> None:
+        """Snapshot builtin sequence elements before assigning targets, with a fresh rest list."""
+        self._in_try_refuse("starred unpacking (its ValueError is not routed)", t)
+        stars = [i for i, target in enumerate(t.elts) if isinstance(target, ast.Starred)]
+        if len(stars) != 1 or v.top or v.st or v.s is not None:
+            raise Unsupported("starred unpacking needs one star and builtin list/tuple sources", t)
+        star = stars[0]
+        fixed = len(t.elts) - 1
+        suffix = fixed - star
+        parts, rest_elem, rest_lengths = [BOT] * fixed, BOT, BOT
+        rest_items, positional = None, self._frozen_display(t.elts[star], fctx)
+        for address in v.refs:
+            if self._clock() > self.deadline:
+                raise Unsupported("starred unpacking time budget exhausted", t)
+            obj = st.heap[address]
+            if type(obj) not in {ListObj, TupleObj}:
+                raise Unsupported("starred unpacking of an unrepresented iterable", t)
+            _, (lo, hi) = self.len_lin(st, obj)
+            if hi is not None and hi < fixed:
+                continue  # ValueError ends this alternative before any target is assigned.
+            if type(obj) is TupleObj and obj.items is not None:
+                end = len(obj.items) - suffix
+                values = [*obj.items[:star], *obj.items[end:]]
+                items = obj.items[star:end]
+                if positional:
+                    if rest_items is None:
+                        rest_items = list(items)
+                    elif len(rest_items) == len(items):
+                        rest_items = [vjoin(old, st.zone, item, st.zone) for old, item in zip(rest_items, items)]
+                    else:
+                        positional = False
+                middle = BOT
+                for item in items:
+                    if self._clock() > self.deadline:
+                        raise Unsupported("starred unpacking time budget exhausted", t)
+                    middle = vjoin(middle, st.zone, item, st.zone)
+            else:
+                positional = False
+                elem = self.all_elems(st, obj)
+                values = [elem] * fixed
+                middle = elem if hi is None or hi > fixed else BOT
+            parts = [vjoin(old, st.zone, item, st.zone) for old, item in zip(parts, values)]
+            rest_elem = vjoin(rest_elem, st.zone, middle, st.zone)
+            length = int_iv(max(0, (lo or 0) - fixed), None if hi is None else hi - fixed)
+            rest_lengths = vjoin(rest_lengths, st.zone, length, st.zone)
+        bad = v.i is not None or bool(v.b) or bool(v.f) or v.n
+        self.check(t, "unpack", {"TypeError"}, not bad, "starred unpacking of builtin lists/tuples", st=st)
+        if rest_lengths.is_bot() or any(part.is_bot() for part in parts):
+            st.set_bottom()
+            return
+        parts = [self.borrow(st, self.mat(st, part)) for part in parts]
+        rest_elem = self.borrow(st, self.summarize(st, rest_elem))
+        if positional and rest_items is not None:
+            items = [self.borrow(st, self.mat(st, item)) for item in rest_items]
+            address = self.new_list(st, t, None, BOT, tag="frozen list", kind="tuple", items=items)
+        else:
+            address = self.new_list(st, t, rest_lengths.i, rest_elem, tag="starred unpack")
+        parts.insert(star, self.borrow(st, V(refs=frozenset({address}))))
+        for target, part in zip(t.elts, parts):
+            self.assign(target.value if isinstance(target, ast.Starred) else target, part, st, fctx)
 
     # ------------------------------------------------------------- names
     def _scope(self, name, fctx: FuncCtx):
@@ -3314,6 +5291,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
     def store_name(self, name, v: V, st: State, fctx) -> None:
         if st.bottom:
             return
+        if name in fctx.capture_frames:
+            self.write_var(st, self._closure_frame_index(st, fctx.capture_frames[name], None), name, v)
+            return
         sc = self._scope(name, fctx)
         if sc == "enclosing":
             raise Unsupported("assignment to a non-local name", None)
@@ -3328,14 +5308,25 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         if name == "__builtins__":
             raise Unsupported("deleting the builtin namespace", None)
         sc = self._scope(name, fctx)
-        idx = 0 if sc == "module" else (len(st.frames) - 1)
+        idx = (self._closure_frame_index(st, fctx.capture_frames[name], None) if name in fctx.capture_frames
+               else 0 if sc == "module" else len(st.frames) - 1)
         var_name = self._global_key(name, fctx.module_key) if sc == "module" else name
         fr = st.frames[idx]
         zn = f"{fr.fid}:{var_name}"
+        if getattr(self, '_track_module_identity', False) and idx == 0:
+            st.zone.forget(self._identity_slot(var_name))
         st.kill_var(zn)
         st.rewrite_bounds_away(zn)
         fr.env.pop(var_name, None)
         fr.maybe_unbound.discard(var_name)
+
+    def _string_term(self, value):
+        from .equality import Recipe, literal
+        if value.value_term is not None:
+            return value.value_term
+        if value.s != ANY_STR and len(value.s) == 1:
+            return literal(next(iter(value.s)))
+        return Recipe("str", "atom", data=object())
 
     def write_var(self, st: State, idx: int, name: str, v: V) -> None:
         # Also covers imported module globals and formal parameters; run()'s
@@ -3345,7 +5336,15 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         fr = st.frames[idx]
         zn = f"{fr.fid}:{name}"
         z = st.zone
-        if v.i is not None:
+        track_slot_identity = getattr(self, '_track_module_identity', False) and idx == 0 and "\x00" not in name
+        if track_slot_identity:
+            z.forget(self._identity_slot(name))
+        if v.i is not None and getattr(self, '_shape_numbers', False):
+            v = self.summarize(st, v)
+            if zn in st.zone.vars:
+                st.rewrite_bounds_away(zn)
+                st.kill_var(zn)
+        elif v.i is not None:
             ii = v.i
             s = ii.lin.single() if ii.lin is not None else None
             if s is not None and s[0] == zn:
@@ -3361,15 +5360,27 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             v = v.replace(i=IntInfo(Lin.var(zn)))
         else:
             st.kill_var(zn)
+        if self._value_equalities and v.s is not None and v.value_term is None and v.kinds() == ["str"]:
+            v = v.replace(value_term=self._string_term(v))
         fr.env[name] = v
         fr.maybe_unbound.discard(name)
+        if track_slot_identity:
+            z.add_var(self._identity_slot(name))
 
     def read_env_value(self, st: State, fr: Frame, name: str, v: V) -> V:
+        if v.i is not None and getattr(self, '_shape_numbers', False):
+            return self.summarize(st, v)
         if v.i is not None:
             return v.replace(i=IntInfo(Lin.var(f"{fr.fid}:{name}")))
         return v
 
     def load_name(self, name, node, st: State, fctx) -> V:
+        if name in fctx.capture_frames:
+            frame = st.frames[self._closure_frame_index(st, fctx.capture_frames[name], node)]
+            if name in frame.maybe_unbound or name not in frame.env:
+                raise Unsupported("captured closure cell is unbound or deleted", node)
+            value = frame.env[name]
+            return self.mat(st, value) if value.i is not None else value
         sc = self._scope(name, fctx)
         # shortcut: refuse possibly unbound reads; split binding/absence paths when those proofs are needed.
         if fctx.is_class:
@@ -3388,7 +5399,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 self._in_try_refuse("UnboundLocalError", node)
                 st.set_bottom()  # UnboundLocalError: not a property exception
                 return BOT
-            return v
+            if v.i is not None and getattr(self, '_shape_numbers', False):
+                return self.summarize(st, v)
+            return self.mat(st, v) if v.i is not None and name in fctx.mutable_cells else v
         # A free name of a module-level function or method is a module global.
         # [internal ref] (soundness, ROOT fix): materialize -- copy at read time, into a
         # fresh zone temp via mat()/to_temp() -- EVERY read of a global that
@@ -3410,6 +5423,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             raise Unsupported(f"global name {name!r} may be unbound", node)
         if key in g.env:
             v = g.env[key]
+            if v.i is not None and getattr(self, '_shape_numbers', False):
+                return self.summarize(st, v)
             if v.i is not None and key in self.global_written:
                 return self.mat(st, v)
             return v
@@ -3434,6 +5449,14 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             value = m(e, st, fctx)
         finally:
             self.borrowed.pop()
+        if self._forced_draws:
+            pending = self._forced_draws.get(e)
+            # a case split's outcome: used by the FIRST evaluation of that node, in the activation it was forced in, and
+            # only for a value that is a bool (so both outcomes together cover it)
+            if (pending is not None and pending[1] == self._activation(st) and value.b
+                    and value.replace(b=frozenset()).is_bot()):
+                del self._forced_draws[e]
+                value = const_bool(pending[0])
         return self.borrow(st, value)
 
     def e_Constant(self, e, st, fctx):
@@ -3445,9 +5468,17 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         if isinstance(c, int):
             return const_int(c)
         if isinstance(c, float):
-            return V(f=FloatInfo(fv.FloatFact.const(c)))
+            term = ("zero-sign", math.copysign(1.0, c) < 0.0) if c == 0.0 else exactfloat.of_float_const(c)
+            return V(f=FloatInfo(fv.FloatFact.const(c), term))
+        if isinstance(c, bytes):
+            if self._try_stack:
+                raise Unsupported("constant of type bytes", e)
+            return V(top=True, st=frozenset({("bytes_const", c)}))
         if isinstance(c, str):
-            return const_str(c) if len(c) <= 64 else ANYSTR
+            value = const_str(c)
+            if self._clock() > self.deadline:
+                raise Unsupported("string literal time budget exhausted", e)
+            return value
         raise Unsupported(f"constant of type {type(c).__name__}", e)
 
     def e_Name(self, e, st, fctx):
@@ -3464,7 +5495,33 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         a = self.new_list(st, e, None, BOT, tag="tuple", kind="tuple", items=items)
         return V(refs=frozenset({a}))
 
+    def _frozen_display(self, e, fctx) -> bool:
+        """Whether list display or starred-rest binding ``e`` passes the source escape audit."""
+        if not self.frozen_lists or fctx.module_key != "" or getattr(e, ROLE_ATTR, None) is not None:
+            return False
+        from tharkun.solve.contracts.adapters import absint as _contracts
+        if any(_contracts.contract_for_builtin(q) is None for q in ("list.__getitem__", "tuple.__getitem__")):
+            return False        # the contracts admit the models: with the list's or the tuple's withdrawn the display stays a list
+        if self._frozen_positions is None:
+            self._frozen_positions = frozenset()
+            if self._extern_resolver() is not None:
+                try:
+                    original = ast.parse(self.site_source, self.filename)
+                except SyntaxError:
+                    original = None
+                if original is not None:
+                    others = [r.tree for key, r in self._ext_by_key.items() if key != "" and r is not self._ext_resolver]
+                    stem = os.path.splitext(os.path.basename(self.filename))[0]
+                    self._frozen_positions = frozen_list_displays(original, others, stem)
+        return (e.lineno, e.col_offset) in self._frozen_positions
+
     def e_List(self, e, st, fctx):
+        if self._frozen_display(e, fctx):
+            items = [self.eval(x, st, fctx) for x in e.elts]
+            if st.bottom:
+                return BOT
+            a = self.new_list(st, e, None, BOT, tag="frozen list", kind="tuple", items=items)
+            return V(refs=frozenset({a}))
         elem = BOT
         for x in e.elts:
             if isinstance(x, ast.Starred):
@@ -3548,10 +5605,78 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         # `x * x` over one name: both reads see the same value (a Name read has no effect)
         square = (isinstance(e.op, ast.Mult) and isinstance(e.left, ast.Name)
                   and isinstance(e.right, ast.Name) and e.left.id == e.right.id)
-        return self.binop(st, e.op, l, r, e, square=square)
+        result = self.binop(st, e.op, l, r, e, square=square)
+        if (not st.bottom and isinstance(e.op, ast.FloorDiv) and result.only_int()
+                and result.i.lin is None):
+            lin = self._product_quotient(st, e, fctx)
+            if lin is not None:
+                return V(i=IntInfo(lin))
+        return result
+
+    def _product_quotient(self, st, node, fctx):
+        """Cancel stable integer abs factors only after division's ordinary checks."""
+        from .polynomial import affine_quotient
+
+        if not any(isinstance(n, ast.Call) for n in ast.walk(node)):
+            return None
+        gov = self._governing_resolver(fctx)
+        if gov is None:
+            return None
+        bound, reflective = self._builtin_source_vetoes(gov.tree)
+        if reflective or 'abs' in bound:
+            return None
+        builtin = self.load_name('abs', node, st, fctx)
+        if builtin != self.builtin_name('abs', node) or builtin.st != frozenset({('builtin', 'abs')}):
+            return None
+        names, atoms, values = {}, {}, {}
+        stack = [(node, False)]
+        while stack:
+            if self._clock() >= self.deadline:
+                raise Unsupported('product quotient analysis budget exhausted', node)
+            item, ready = stack.pop()
+            if isinstance(item, ast.Constant) and type(item.value) in {int, bool}:
+                values[item] = item
+            elif isinstance(item, ast.Name):
+                if item.id not in names:
+                    value = self.load_name(item.id, item, st, fctx)
+                    if not value.replace(i=None, b=frozenset()).is_bot():
+                        return None
+                    info = self._as_int(st, value)
+                    if info is None or info.lin is None:
+                        return None
+                    names[item.id] = info.lin
+                values[item] = item
+            elif isinstance(item, ast.UnaryOp) and isinstance(item.op, (ast.UAdd, ast.USub)):
+                if not ready:
+                    stack.extend([(item, True), (item.operand, False)])
+                else:
+                    values[item] = ast.UnaryOp(op=item.op, operand=values[item.operand])
+            elif (isinstance(item, ast.BinOp) and
+                  (isinstance(item.op, (ast.Add, ast.Sub, ast.Mult)) or item is node)):
+                if not ready:
+                    stack.extend([(item, True), (item.right, False), (item.left, False)])
+                else:
+                    values[item] = ast.BinOp(left=values[item.left], op=item.op, right=values[item.right])
+            elif (isinstance(item, ast.Call) and isinstance(item.func, ast.Name)
+                  and item.func.id == 'abs' and len(item.args) == 1 and not item.keywords):
+                if not ready:
+                    stack.extend([(item, True), (item.args[0], False)])
+                else:
+                    key = ast.dump(values[item.args[0]])
+                    atom = atoms.setdefault(key, f'\0abs:{len(atoms)}')
+                    names[atom] = Lin.var(atom)
+                    values[item] = ast.Name(id=atom, ctx=ast.Load())
+            else:
+                return None
+        lin = affine_quotient(values[node], names, self.deadline)
+        # Formal abs atoms must disappear; no fictional variable enters the state.
+        if lin is not None and not lin.vars().intersection(atoms.values()):
+            return lin
+        return None
 
     def _check_type_intstr_hint(self, node, st, fctx):
-        """Tag one inline int|str hint only at a direct check_type argument."""
+        """Tag one inline union of builtin scalar classes and ``None`` (``int | str``, ``int | None``, ``int | str | float``) only at a
+        direct check_type argument."""
         gov = self._governing_resolver(fctx)
         if gov is None or fctx.is_class:
             return None
@@ -3572,17 +5697,29 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             hint_arg = (set(keywords) == {"value", "hint"} and keywords["hint"] is node)
         if not hint_arg:
             return None
-        if not (isinstance(node.left, ast.Name) and isinstance(node.right, ast.Name)
-                and {node.left.id, node.right.id} == {"int", "str"}
-                and gov.is_builtin(node.left) and gov.is_builtin(node.right)):
+        # ``a | b | c ...``: every operand an exact builtin scalar class (or ``None``), however many and in any order
+        leaves = []
+
+        def flatten(n):
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr):
+                flatten(n.left)
+                flatten(n.right)
+            else:
+                leaves.append(n)
+        flatten(node)
+        none_leaf = [isinstance(n, ast.Constant) and n.value is None for n in leaves]
+        if (len(leaves) < 2 or (none_leaf[0] and none_leaf[1])        # ``None | None`` is a TypeError
+                or not all(is_none or (isinstance(n, ast.Name) and n.id in _UNION_HINT_NAMES and gov.is_builtin(n))
+                           for n, is_none in zip(leaves, none_leaf))):
             return None
-        left, right = self.eval(node.left, st, fctx), self.eval(node.right, st, fctx)
-        if st.bottom:
-            return BOT
-        if (left != V(st=frozenset({("type", node.left.id)}))
-                or right != V(st=frozenset({("type", node.right.id)}))):
-            raise Unsupported("check_type union operands are not exact builtin classes", node)
-        return V(st=frozenset({("check-type-union", "int", "str")}))
+        names = {n.id for n, is_none in zip(leaves, none_leaf) if not is_none}
+        for n, is_none in zip(leaves, none_leaf):
+            if not is_none and self.eval(n, st, fctx) != V(st=frozenset({("type", n.id)})):
+                raise Unsupported("check_type union operands are not exact builtin classes", node)
+            if st.bottom:
+                return BOT
+        members = names | ({"NoneType"} if any(none_leaf) else set())
+        return V(st=frozenset({("check-type-union",) + tuple(sorted(members))}))
 
     def e_Compare(self, e, st, fctx):
         t, f = self.cond(e, st, fctx)
@@ -3600,11 +5737,46 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return self.attr_load(st, v, e.attr, e)
 
     def e_Subscript(self, e, st, fctx):
+        hint = self._check_type_generic_hint(e, st, fctx)
+        if hint is not None:
+            return hint
         obj = self.eval(e.value, st, fctx)
         idx = self.eval_index(e.slice, st, fctx)
         if st.bottom:
             return BOT
         return self.subscript_load(st, obj, idx, e)
+
+    def _check_type_generic_hint(self, node, st, fctx):
+        """Admit inert generic descriptions only as direct verifier hint arguments."""
+        from ..check_type_hints import builtin_hint_shape, check_type_arguments, check_type_contract
+        from ..pyresolve import Top
+
+        gov = self._governing_resolver(fctx)
+        if gov is None or fctx.is_class:
+            return None
+        parent = gov.parent.get(node)
+        if isinstance(parent, ast.keyword):
+            parent = gov.parent.get(parent)
+        if not isinstance(parent, ast.Call) or gov.call_name(parent) != "_sv_verifier.check_type":
+            return None
+        bound = check_type_arguments(parent)
+        if bound is None or bound[1] is not node or check_type_contract() is None:
+            return None
+        try:
+            shape = builtin_hint_shape(node, gov)
+        except Top as exc:
+            raise Unsupported(str(exc), node) from exc
+        if shape is None:
+            return None
+        # Resolver's lexical certificate is necessary but not sufficient: a class
+        # scope or an inlined function can supply a different runtime binding.
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name):
+                value = self.eval(child, st, fctx)
+                expected = self.builtin_name(child.id, child)
+                if value != expected:
+                    raise Unsupported("check_type generic name is not one exact builtin class", child)
+        return V(st=frozenset({("check-type-generic", shape)}))
 
     def e_JoinedStr(self, e, st, fctx):
         parts = [self.eval(p, st, fctx) for p in e.values]
@@ -3619,7 +5791,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         spec = self.eval(e.format_spec, st, fctx) if e.format_spec is not None else const_str("")
         return BOT if st.bottom else self.visit_rule("syntax.FormattedValue", st, [value, spec, const_int(-1)], {}, e)
 
-    def check_formattable(self, st, v: V, node, has_spec=False):
+    def check_formattable(self, st, v: V, node, has_spec=False, *, closed_objects=False):
         if v.top:
             raise Unsupported("formatting an unknown value", node)
         todo, seen = [v], set()
@@ -3632,6 +5804,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             for a in item.refs - seen:
                 seen.add(a)
                 ob = st.heap[a]
+                if closed_objects and type(ob) not in {ListObj, TupleObj, DictObj, SetObj, FuncObj, InstObj}:
+                    raise Unsupported("check_type mismatch representation is not closed", node)
+                if ob.kind == 'exception' or (ob.kind == 'inst' and ob.exc_args is not None):
+                    raise Unsupported('exception formatting may execute argument hooks', node)
                 if ob.kind == "inst":
                     for k in ("__str__", "__repr__", "__format__"):
                         if self.class_lookup(st, ob.cls, k) is not None:
@@ -3651,11 +5827,133 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return ("index", self.eval(sl, st, fctx))
 
     # ============================================================ conditions
+    def _input_bool_test(self, test, names, st: State, fctx) -> bool:
+        """Is ``test`` a two-valued boolean built only from inputs, constants and operators, that neither reads nor can rebind
+        ``names``?  (No program function is called: it could rebind the aliased scalars.)  The first implementation
+        (eabff14a, an AI lane, opencode) was wrong: it accepted the one direct attribute call spelled ``.nondet_bool()`` on a
+        module name instead of testing the expression's value domain, so ``nondet_int() % 2 == 0`` or a ``from``-imported
+        alias did not qualify."""
+        gov = self._governing_resolver(fctx)
+        if gov is None:
+            return False
+        for n in ast.walk(test):
+            if isinstance(n, ast.Call):
+                try:
+                    origin = gov.call_name(n) or ""
+                except Top:
+                    return False
+                if not origin.startswith("_sv_verifier.nondet_"):
+                    return False
+            elif isinstance(n, ast.Name):
+                if n.id in names:
+                    return False
+            elif not isinstance(n, (ast.Attribute, ast.Constant, ast.Compare, ast.BoolOp, ast.UnaryOp, ast.BinOp,
+                                    ast.expr_context, ast.operator, ast.cmpop, ast.boolop, ast.unaryop)):
+                return False
+        return self._is_bool_choice(test, st, fctx)
+
+    def _scalar_identity_cover(self, e, st: State, fctx):
+        """An immediate conditional alias is one of its unchanged scalar sources.
+
+        Authenticate object flow in the original module, never identity from equal
+        abstract scalar values. Earlier statement evaluation retains every goal.
+        """
+        if (self.lowered is not None or self.source != self.site_source or st.bottom
+                or len(st.frames) != 1 or st.frame.fid != "g"
+                or not isinstance(e, ast.BoolOp) or not isinstance(e.op, ast.Or) or len(e.values) != 2):
+            return False
+        stmt = self._site_parents.get(e)
+        if (not isinstance(stmt, ast.Assert) or stmt.test is not e or stmt.msg is not None
+                or self._site_parents.get(stmt) is not self.tree):
+            return False
+        names = []
+        for term in e.values:
+            if (not isinstance(term, ast.Compare) or len(term.ops) != 1 or not isinstance(term.ops[0], ast.Is)
+                    or not isinstance(term.left, ast.Name) or not isinstance(term.comparators[0], ast.Name)):
+                return False
+            names.append((term.left.id, term.comparators[0].id))
+        target = names[0][0]
+        if names[1][0] != target:
+            return False
+        sources = {right for _, right in names}
+        frame = st.frame
+        for name in sources | {target}:
+            value = frame.env.get(name)
+            if (name in frame.maybe_unbound or value is None or value.is_bot()
+                    or value.top or value.refs or value.st or value.f):
+                return False
+        index = self.tree.body.index(stmt)
+        if index == 0:
+            return False
+        before = self.tree.body[index - 1]
+        if (not isinstance(before, ast.Assign) or len(before.targets) != 1
+                or not isinstance(before.targets[0], ast.Name) or before.targets[0].id != target
+                or target in sources or not isinstance(before.value, ast.IfExp)):
+            return False
+        choice = before.value
+        test = choice.test
+        if isinstance(test, ast.Name):
+            value = frame.env.get(test.id)
+            if (test.id == target or test.id in frame.maybe_unbound or value is None
+                    or not value.b or not value.replace(b=frozenset()).is_bot()):
+                return False
+        elif self._input_bool_test(test, {target} | sources, st, fctx):
+            pass
+        else:
+            return False
+        for arm in (choice.body, choice.orelse):
+            if isinstance(arm, ast.Call):
+                if (not isinstance(arm.func, ast.Name) or arm.func.id == target
+                        or arm.func.id in frame.maybe_unbound or len(arm.args) != 1 or arm.keywords):
+                    return False
+                fn = frame.env.get(arm.func.id)
+                if fn is None or len(fn.refs) != 1 or not fn.replace(refs=frozenset()).is_bot():
+                    return False
+                obj = st.heap[next(iter(fn.refs))]
+                if (type(obj) is not FuncObj or obj.flavor != "plain" or obj.module_key
+                        or obj.defaults or obj.kwdefaults):
+                    return False
+                fd = obj.node
+                if not isinstance(fd, ast.FunctionDef):
+                    return False
+                args = fd.args
+                params = args.posonlyargs + args.args
+                if (self._site_parents.get(fd) is not self.tree or fd.decorator_list or fd.returns
+                        or fd.type_params or len(params) != 1 or params[0].annotation
+                        or args.vararg or args.kwarg or args.kwonlyargs or args.defaults
+                        or len(fd.body) != 1 or not isinstance(fd.body[0], ast.Return)
+                        or not isinstance(fd.body[0].value, ast.Name) or fd.body[0].value.id != params[0].arg):
+                    return False
+                arm = arm.args[0]
+            if not isinstance(arm, ast.Name) or arm.id not in sources:
+                return False
+        return True
+
     def cond(self, e, st: State, fctx) -> tuple[State, State]:
         """(state where ``e`` is truthy, state where it is falsy)."""
+        if self._forced_draws and not st.bottom:
+            pending = self._forced_draws.get(e)
+            if pending is not None and pending[1] == self._activation(st):
+                # a case split's outcome for this test: the other branch is empty
+                del self._forced_draws[e]
+                t, f = self._cond(e, st, fctx)
+                if pending[0]:
+                    f = f.copy()
+                    f.set_bottom()
+                else:
+                    t = t.copy()
+                    t.set_bottom()
+                return t, f
+        return self._cond(e, st, fctx)
+
+    def _cond(self, e, st: State, fctx) -> tuple[State, State]:
         if st.bottom:
             return st, st.copy()
         if isinstance(e, ast.BoolOp):
+            if self._scalar_identity_cover(e, st, fctx):
+                no = st.copy()
+                no.set_bottom()
+                return st, no
             if isinstance(e.op, ast.And):
                 fs = []
                 cur = st
@@ -3730,6 +6028,12 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 f = f.join(other)
             return t, f
         self.check_truthy(st, v, node)
+        string_length = None
+        if (self.record and self._value_equalities and v.s == ANY_STR
+                and v.value_term is not None and v.kinds() == ['str']):
+            form = self._string_length_form(st, v)
+            if form is not None:
+                string_length = self.to_temp(st, IntInfo(form)).lin
         t, f = st.copy(), st.copy()
         can_t = can_f = False
         if v.i is not None:
@@ -3753,7 +6057,11 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             can_t = True
         for a in v.refs:
             ob = st.heap[a]
-            if ob.kind in ("list", "tuple", "range", "dict", "dictview", "array"):
+            if type(ob) is DictObj:
+                lo, hi = self.dict_len(st, {a})
+                can_t = can_t or hi != 0
+                can_f = can_f or lo == 0
+            elif ob.kind in ("list", "tuple", "range", "dict", "dictview", "array"):
                 can_t = can_f = True
             elif ob.kind == "set":
                 # a set is truthy exactly when it has an element
@@ -3761,8 +6069,16 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 can_f = can_f or ob.length[0] == 0
             else:
                 can_t = True
-        # refine a variable that is only an int
+        # Refine the observed live length cell or a value that is only an int.
         name = node.id if isinstance(node, ast.Name) else None
+        if len(v.refs) == 1 and v.kinds() == ['obj']:
+            addr = next(iter(v.refs))
+            ob = st.heap[addr]
+            # A summary length covers other objects too; only a recent list has one live length cell.
+            if addr[1] == 'r' and type(ob) is ListObj and isinstance(ob.length, str):
+                t.zone.add(ZERO, ob.length, -1)
+                f.zone.add(ob.length, ZERO, 0)
+                f.zone.add(ZERO, ob.length, 0)
         if v.only_int() and v.i.lin is not None:
             d = v.i.lin
             s = d.single()
@@ -3772,6 +6088,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 _refine_ne(t.zone, x, ZERO, -c)
                 f.zone.add(x, ZERO, -c)
                 f.zone.add(ZERO, x, c)
+        if string_length is not None:
+            _refine_le(t.zone, string_length.neg(), -1)
+            _refine_le(f.zone, string_length, 0)
         if not can_t:
             t.set_bottom()
         if not can_f:
@@ -3820,8 +6139,30 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
     def compare_split(self, st: State, op, lv: V, rv: V, lnode, rnode, node):
         t, f = st.copy(), st.copy()
         if lv.top or rv.top:
+            if isinstance(op, (ast.Eq, ast.NotEq)):
+                lok, left = self.exact_constant(st, lv)
+                rok, right = self.exact_constant(st, rv)
+                if lok and rok:
+                    same = left == right
+                    (f if same == isinstance(op, ast.Eq) else t).set_bottom()
+                    return t, f
             raise Unsupported("comparison with an unknown value", node)
         if isinstance(op, (ast.Is, ast.IsNot)):
+            if (isinstance(lnode, ast.Name) and isinstance(rnode, ast.Name)
+                    and not getattr(self, '_copy_identity_ready', False)):
+                from ..lowering.copy_identity import annotate_module_copies
+                annotate_module_copies(self.tree, deadline=self.deadline)
+                self._copy_identity_ready = True
+            same = True if getattr(node, '_lw_must_copy_identity', False) else self._class_identity(st, lv, rv)
+            if same is None:
+                same = self._bool_singleton_identity(lv, rv)
+            if same is None and (lv.n or rv.n):
+                same = self._none_singleton_identity(lv, rv)
+            if same is None and getattr(self, '_track_module_identity', False):
+                same = self._identity_equal(st, lnode, rnode)
+            if same is not None:
+                (f if same == isinstance(op, ast.Is) else t).set_bottom()
+                return t, f
             self._refine_is(t, f, op, lv, rv, lnode, rnode)
             return t, f
         if isinstance(op, (ast.In, ast.NotIn)):
@@ -3831,6 +6172,11 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 return (no, yes) if isinstance(op, ast.NotIn) else (yes, no)
             self.check_in(st, lv, rv, node)
             member = self.set_membership(st, lv, rv, node)
+            if (member is None and rv.refs and rv.replace(refs=frozenset()).is_bot()
+                    and all(self._dict_straightline_write(st, st.heap[r], lv, node) is not None for r in rv.refs)):
+                member = True
+            if member is None:
+                member = self._tuple_membership(st, lv, rv)
             if member is True or member is False:
                 (f if member == isinstance(op, ast.In) else t).set_bottom()
             return t, f
@@ -3863,6 +6209,17 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                     eq_true = not eq_true
                 (f if eq_true else t).set_bottom()
                 return t, f
+            if getattr(self, '_geometric_facts', False):
+                geometric = self._geometric_comparison(st, op, lv, rv, lnode, rnode)
+                if geometric is not None:
+                    (f if geometric else t).set_bottom()
+                    return t, f
+            if (self._value_equalities and (lv.value_term is not None or rv.value_term is not None)
+                    and lv.kinds() == ["str"] and rv.kinds() == ["str"]):
+                from .equality import Congruence, Theories
+                if Theories(Congruence(self.deadline)).proves_equal(self._string_term(lv), self._string_term(rv)):
+                    (f if isinstance(op, ast.Eq) else t).set_bottom()
+                    return t, f
             # [internal ref] (MAIN's guarded rewrite, 2026-09-28): X // 2**k and X >> k for the
             # same bare-name X are the same VALUE, not just the same bounds, whenever
             # X is proven non-negative right now -- canonicalize the comparison to
@@ -3886,7 +6243,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                     _refine_le(f.zone, d, 0)
                     _refine_le(f.zone, d.neg(), 0)
                     _refine_ne_lin(t.zone, d)
-            self._prune_float_compare(st, op, lv, rv, t, f)
+            if lv.int_values is not None or rv.int_values is not None:
+                self._refine_int_choices(st, op, lv, rv, lnode, rnode, t, f)
+            self._prune_float_compare(st, op, lv, rv, t, f, lnode, rnode)
             return t, f
         # ordering comparisons
         if self.set_ordering(st, op, lv, rv, node, t, f):
@@ -3894,6 +6253,11 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         ok = self._orderable(st, lv, rv)
         self.check(node, "compare", {"TypeError"}, ok,
                    "ordering between " + ",".join(lv.kinds()) + " and " + ",".join(rv.kinds()), st=st)
+        if getattr(self, '_geometric_facts', False):
+            geometric = self._geometric_comparison(st, op, lv, rv, lnode, rnode)
+            if geometric is not None:
+                (f if geometric else t).set_bottom()
+                return t, f
         if lv.only_int() and rv.only_int() and lv.i.lin is not None and rv.i.lin is not None:
             d = lv.i.lin.sub(rv.i.lin).norm(st.zone)
             if isinstance(op, ast.Lt):
@@ -3908,18 +6272,57 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             elif isinstance(op, ast.GtE):
                 _refine_le(t.zone, d.neg(), 0)
                 _refine_le(f.zone, d, -1)
-        self._prune_float_compare(st, op, lv, rv, t, f)
+        if lv.int_values is not None or rv.int_values is not None:
+            self._refine_int_choices(st, op, lv, rv, lnode, rnode, t, f)
+        self._prune_float_compare(st, op, lv, rv, t, f, lnode, rnode)
         return t, f
+
+    def _refine_int_choices(self, st, op, lv, rv, left, right, yes, no):
+        """Project actual finite memberships after a primitive singleton comparison."""
+        if (not lv.only_int() or not rv.only_int()
+                or not isinstance(left, (ast.Name, ast.Constant))
+                or not isinstance(right, (ast.Name, ast.Constant))
+                or self._fctx_stack and self._fctx_stack[-1].is_class):
+            return
+        import operator
+        from .state import _int_choices
+        predicate = {ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt,
+                     ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge}.get(type(op))
+        if predicate is None:
+            return
+        for value, other, reverse in ((lv, rv, False), (rv, lv, True)):
+            choices = value.int_values
+            singleton = _int_choices(other, st.zone)
+            if choices is None or singleton is None or len(singleton) != 1 or value.i.lin is None:
+                continue
+            point = next(iter(singleton))
+            for truth, branch in ((True, yes), (False, no)):
+                if branch.bottom:
+                    continue
+                low = high = None
+                for candidate in choices:
+                    if self._clock() > self.deadline:
+                        raise Unsupported('integer membership comparison time budget exhausted')
+                    matches = predicate(point, candidate) if reverse else predicate(candidate, point)
+                    if matches == truth:
+                        low = candidate if low is None else min(low, candidate)
+                        high = candidate if high is None else max(high, candidate)
+                if low is None:
+                    branch.set_bottom()
+                else:
+                    _refine_le(branch.zone, value.i.lin, high)
+                    _refine_le(branch.zone, value.i.lin.neg(), -low)
 
     _CMP_SYMBOL = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!="}
 
-    def _prune_float_compare(self, st: State, op, lv: V, rv: V, t: State, f: State) -> None:
+    def _prune_float_compare(self, st: State, op, lv: V, rv: V, t: State, f: State, lnode, rnode) -> None:
         """A comparison with a float operand decides a branch when the operands' facts leave it
         no pair: ``values.refine_compare`` (NaN makes every ordered comparison and ``==`` False
         and ``!=`` True; an int is compared with a float exactly) narrows the operands to the pairs
         for which the comparison is true and to those for which it is false, and an empty side is
         an impossible branch.  Only a purely numeric comparison with at least one float operand
-        (int against int has the zone); the operands themselves are not narrowed in the branches."""
+        (int against int has the zone). A current-frame pure float name compared with a literal
+        retains its refined fact; effectful operands cannot refine a potentially stale read."""
         symbol = self._CMP_SYMBOL.get(type(op))
         if symbol is None or not (lv.f or rv.f):
             return
@@ -3931,36 +6334,163 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             t.set_bottom()
         if af.is_bottom() or bf.is_bottom():
             f.set_bottom()
+        for node, other, value, yes, no in ((lnode, rnode, lv, at, af), (rnode, lnode, rv, bt, bf)):
+            if (not isinstance(node, ast.Name) or not isinstance(other, ast.Constant)
+                    or not value.f or not value.replace(f=None).is_bot()):
+                continue
+            for branch, fact in ((t, yes), (f, no)):
+                if not branch.bottom and branch.frames[-1].env.get(node.id) is value:
+                    branch.frames[-1].env[node.id] = value.replace(
+                        f=FloatInfo(fact, value.f.term, value.f.why))
+
+    def _tuple_membership(self, st, lv: V, rv: V):
+        """``lv in rv`` for ``rv`` one tuple of the program with one value per position (a literal ``(1, -2)``): True when ``lv``
+        equals a position, False when it differs from every position, both decided by constants (``_decide_eq``); else ``None``."""
+        if (rv.top or rv.i is not None or rv.b or rv.f or rv.s is not None or rv.n or rv.st or len(rv.refs) != 1
+                or lv.top or lv.refs or lv.st):
+            return None
+        ob = st.heap.get(next(iter(rv.refs)))
+        if type(ob) is not TupleObj or ob.items is None:
+            return None
+        decisions = [self._decide_eq(st, lv, item) for item in ob.items]
+        if any(d is True for d in decisions):
+            return True
+        return False if all(d is False for d in decisions) else None
+
+    def _bool_singleton_identity(self, lv: V, rv: V):
+        """``lv is rv`` when one side is exactly ``True`` or exactly ``False`` (the bool singletons): True when the other is that
+        same constant, False when the other can never be it (no such bool value among its alternatives; an object, a static value, an
+        int, a str, None, a float are never the bool singletons); else ``None``."""
+        def single(v: V):
+            if v.top or v.refs or v.st or v.is_bot():
+                return None
+            return next(iter(v.b)) if v.kinds() == ["bool"] and len(v.b) == 1 else None
+
+        for const, other in ((single(lv), rv), (single(rv), lv)):
+            if const is None or other.top or other.is_bot():
+                continue
+            if single(other) is not None:
+                return single(other) == const
+            if not (other.b and const in other.b):
+                return False
+            return None
+        return None
+
+    def _none_singleton_identity(self, lv: V, rv: V):
+        """Decide identity with known None using the already evaluated operands."""
+        if lv.is_bot() or rv.is_bot():
+            return None
+        for single, other in ((lv, rv), (rv, lv)):
+            if single.kinds() == ["None"]:
+                if other.kinds() == ["None"]:
+                    return True
+                if not other.n and not other.top:
+                    return False
+        return None
+
+    def _class_ids(self, st, v: V):
+        """The classes ``v`` names and nothing else: ``(builtin class tags, class addresses)``, or ``None`` when ``v`` may be
+        anything that is not a builtin class (``("type", name)`` or the ``tuple`` tag) or a class object of the program."""
+        if v.top or v.is_bot() or v.i is not None or v.b or v.f or v.s is not None or v.n:
+            return None
+        tags = set()
+        for t in v.st:
+            if (len(t) == 2 and t[0] in ('type', 'exc')) or t == ("cbuiltin", "tuple"):
+                tags.add(t)
+            else:
+                return None
+        for a in v.refs:
+            if type(st.heap.get(a)) is not ClassObj:
+                return None
+        return frozenset(tags), frozenset(v.refs)
+
+    def _class_identity(self, st, lv: V, rv: V):
+        """Whether the class objects ``lv`` and ``rv`` are the same object: True, False, or ``None`` (not decided).
+
+        A builtin class tag names one object for the whole run.  A class address ``(site, "r")`` is the most recent class
+        made at its site and ``(site, "s")`` summarizes the older ones, so two different addresses are two different classes
+        (and no builtin class is a class of the program), while one address is ONE class only when it is a ``"r"``.  Equal
+        singletons are the same object; disjoint sets are different objects; anything else is not decided.  A class of the
+        program has no metaclass here (``s_ClassDef`` refuses one), so ``==`` on classes is ``is``."""
+        l, r = self._class_ids(st, lv), self._class_ids(st, rv)
+        if l is None or r is None:
+            return None
+        (lt, la), (rt, ra) = l, r
+        if not (lt & rt) and not (la & ra):
+            return False
+        if len(lt) + len(la) == 1 and l == r and all(addr[1] == "r" for addr in la):
+            return True
+        return None
+
+    def exact_constant(self, st: State, v: V):
+        """Whether the value denotes exactly one builtin scalar or opaque bytes value."""
+        if len(v.st) == 1 and v.replace(st=frozenset(), top=False).is_bot():
+            tag = next(iter(v.st))
+            if tag[0] == "bytes_const":
+                return True, tag[1]
+        if v.refs or v.st or v.f or v.top:
+            return False, None
+        vals = []
+        if v.i is not None:
+            lo, hi = self.ibounds(st, v.i)
+            if lo is None or lo != hi:
+                return False, None
+            vals.append(lo)
+        if v.b:
+            if len(v.b) != 1:
+                return False, None
+            vals.append(next(iter(v.b)))
+        if v.s is not None:
+            if v.s == ANY_STR or len(v.s) != 1:
+                return False, None
+            vals.append(next(iter(v.s)))
+        if v.n:
+            vals.append(None)
+        if len(vals) != 1:
+            return False, None
+        return True, vals[0]
 
     def _decide_eq(self, st, lv: V, rv: V):
         """True/False when ``lv == rv`` is decided by constants, else None."""
-        def const_of(v: V):
-            if v.refs or v.st or v.f or v.top:
-                return False, None
-            vals = []
-            if v.i is not None:
-                lo, hi = self.ibounds(st, v.i)
-                if lo is None or lo != hi:
-                    return False, None
-                vals.append(lo)
-            if v.b:
-                if len(v.b) != 1:
-                    return False, None
-                vals.append(next(iter(v.b)))
-            if v.s is not None:
-                if v.s == ANY_STR or len(v.s) != 1:
-                    return False, None
-                vals.append(next(iter(v.s)))
-            if v.n:
-                vals.append(None)
-            if len(vals) != 1:
-                return False, None
-            return True, vals[0]
+        same = self._class_identity(st, lv, rv)
+        if same is not None:
+            return same
 
-        ok1, a = const_of(lv)
-        ok2, b = const_of(rv)
+        ok1, a = self.exact_constant(st, lv)
+        ok2, b = self.exact_constant(st, rv)
         if ok1 and ok2:
             return a == b
+
+        def scalar_class(v: V):
+            # builtin scalars only: a str, a number (int, bool, float: ``1 == 1.0 == True``) or None
+            if v.top or v.refs or v.st or v.is_bot():
+                return None
+            ks = set(v.kinds())
+            if ks == {"str"}:
+                return "str"
+            if ks and ks <= {"int", "bool", "float"}:
+                return "number"
+            return "None" if ks == {"None"} else None
+
+        left, right = scalar_class(lv), scalar_class(rv)
+        if left is not None and right is not None and left != right:
+            return False        # a str, a number and None are never equal to one of another class
+        return self._decide_exact_float_eq(st, lv, rv)
+
+    def _decide_exact_float_eq(self, st, lv: V, rv: V):
+        """``==`` of two floats that are exact dyadic terms: the difference is a linear form over the int variables they came from; zero is equal,
+        a form the zone bounds away from zero is unequal (exact finite doubles: no NaN, and -0.0 == 0.0)."""
+        if not (lv.f and rv.f and exactfloat.is_xd(lv.f.term) and exactfloat.is_xd(rv.f.term)) or lv.i is not None or rv.i is not None or lv.b or rv.b:
+            return None
+        d = exactfloat.add(lv.f.term, rv.f.term, -1)
+        if any(v[0] == "at" for v, _k in d[3]):
+            return None           # an atom left in the difference: the two values are not provably related
+        lin = Lin({v[1]: k for v, k in d[3]}, d[2]).norm(st.zone)      # d * 2**s as an int linear form
+        if lin.is_const():
+            return lin.c == 0
+        lo, hi = lin_bounds(lin, st.zone)
+        if (lo is not None and lo > 0) or (hi is not None and hi < 0):
+            return False
         return None
 
     def _shr_floordiv_identity_holds(self, st: State, lnode, rnode) -> bool:
@@ -4120,7 +6650,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             elif k not in ("list", "tuple", "range", "dict", "dictview", "iterator", "array"):
                 ok = False
             if k in ("dict", "dictview"):
-                self.check_hash_key(lv, node)
+                self.check_hash_key(st, lv, node)
             if k in ("dict", "dictview") and any(st.heap[r].kind in ("list", "dict") for r in lv.refs):
                 ok = False  # unhashable key
         if rv.s is not None and (lv.refs or lv.i is not None or lv.f or lv.n or lv.b or lv.st):
@@ -4270,7 +6800,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         ``sum`` never do, which is ``consumer=None``).  A callable the table does not know is refused when the
         class defines ``__len__``: running the probe where CPython does not, or skipping it where CPython does,
         would each make a raise in ``__len__`` wrongly end, or wrongly miss, the path."""
-        if self._try_stack and any(st.heap[a].kind not in ("list", "tuple", "range", "array")
+        user_for = (consumer == "for" and value.refs
+                    and value.replace(refs=frozenset()).is_bot()
+                    and all(st.heap[a].kind == "inst" for a in value.refs))
+        if self._try_stack and not user_for and any(st.heap[a].kind not in ("list", "tuple", "range", "array", "generator")
                                    for a in value.refs):
             self._in_try_refuse("iteration with unmodelled non-property raises", node)
         if not self.instance_value(st, value):
@@ -4282,11 +6815,22 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 return part
             def iterate():
                 out = self.borrow(branch, self.special(branch, part, "__iter__", [], node))
-                if out.kinds() != ["obj"] or any(branch.heap[a].kind != "iterator" for a in out.refs):
+                if branch.bottom:
+                    return BOT
+                if out.kinds() != ["obj"]:
+                    raise Unsupported("__iter__ must return a modelled iterator", node)
+                for addr in out.refs:
+                    obj = branch.heap[addr]
+                    if obj.kind == "iterator" or (consumer == "for" and obj.kind == "generator"):
+                        continue
+                    if consumer == "for" and obj.kind == "inst":
+                        method = self.class_lookup(branch, obj.cls, "__next__")
+                        if method is not None and self._plain_method(branch, method) is not None:
+                            continue
                     raise Unsupported("__iter__ must return a modelled iterator", node)
                 return out
             result = self.visit_protocol("protocol.iteration", node, iterate, _PROTOCOL_NATIVE["protocol.iteration"])
-            if consumer is not None and self.class_lookup(branch, cls, "__len__") is not None:
+            if consumer not in (None, "for") and self.class_lookup(branch, cls, "__len__") is not None:
                 from tharkun.solve.contracts.rules import Refused, get_rule
 
                 outcome = get_rule("protocol.length_hint").accept(self.visitor, LengthHintCtx(branch, part, node, consumer))
@@ -4327,7 +6871,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 ast.UAdd: "pos", ast.USub: "neg"}
         self._in_try_refuse("re.RegexFlag operator (its non-property raises are not routed)", node)
         name = names.get(type(op))
-        alternatives = product([concrete(self,st,value) for value in values])
+        alternatives = product([concrete(self,st,value) for value in values], analyzer=self)
         if name is None or alternatives is None:
             raise Unsupported("re.RegexFlag: non-finite or unsupported operator",node)
         outputs,errors=[],set()
@@ -4376,13 +6920,17 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             # defeating any chance of the abs(-e) == abs(e) fact ever being visible
             # for floats.  +x (UAdd) is a no-op and keeps the operand's fact/term
             # unchanged; -x negates the interval exactly via the shared value-level
-            # transfer (solve/values.py::neg) and drops the term (no lemma names a
-            # negated value).
+            # transfer (solve/values.py::neg); only a known zero sign survives
+            # as its flipped sign, since other lemmas do not name negation.
             if isinstance(op, ast.USub):
                 res, _raises = fv.neg(v.f.fact)
                 if _raises:
                     self._in_try_refuse("a float negation that may raise", node)
-                out = vjoin(out, st.zone, V(f=FloatInfo(res)), st.zone)
+                term = v.f.term
+                term = (("zero-sign", not term[1]) if isinstance(term, tuple) and len(term) == 2
+                        and term[0] == "zero-sign" and type(term[1]) is bool else
+                        exactfloat.neg(term) if exactfloat.is_xd(term) else None)
+                out = vjoin(out, st.zone, V(f=FloatInfo(res, term)), st.zone)
             else:
                 out = vjoin(out, st.zone, V(f=v.f), st.zone)
         self.check(node, "unary", {"TypeError"}, not bad, "unary operand: " + ",".join(v.kinds()), st=st)
@@ -4404,7 +6952,45 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             return IntInfo.interval(lo, hi)
         return ii
 
+    @staticmethod
+    def primitive_numeric_kind(value):
+        if exact_int_value(value):
+            return 'int'
+        if value.f and value.replace(f=None).is_bot():
+            return 'float'
+        return None
+
+    @staticmethod
+    def _division_rule(qualname):
+        from ..contracts.rules_numeric_division import DIVISION_METHODS
+        return qualname in DIVISION_METHODS
+
+    def _float_conversion_is_total(self, st, value):
+        if self.primitive_numeric_kind(value) == 'float':
+            return True
+        if not exact_int_value(value):
+            return False
+        lo, hi = self.ibounds(st, self._as_int(st, value))
+        return lo is not None and hi is not None and -_FLOAT_CONVERSION_MAX_INT <= lo <= hi <= _FLOAT_CONVERSION_MAX_INT
+
+    @staticmethod
+    def _primitive_numeric_call(qualname, args, kwargs):
+        return (((qualname in {"min", "max"} and len(args) >= 2) or (qualname in {"abs", "int", "math.sqrt"} and len(args) == 1))
+                and not kwargs
+                and all(not (value.top or value.refs or value.st or value.n or value.s is not None)
+                        and (value.i is not None or value.b or value.f) for value in args))
+
+    def _nonraising_sqrt_call(self, st, qualname, args, kwargs):
+        if (qualname != 'math.sqrt' or kwargs or len(args) != 1
+                or not self._float_conversion_is_total(st, args[0])):
+            return False
+        fact = self.float_view(st, args[0]).fact
+        return not fact.has_interval() or fact.lo >= 0.0
+
     def binop(self, st: State, op, l: V, r: V, node, inplace=False, square=False) -> V:
+        if (isinstance(op, ast.BitOr)
+                and any(type(st.heap[a]) is DictObj for value in (l, r) for a in value.refs)):
+            return self._dict_union(st, l, r, node, inplace)
         if isinstance(op, ast.Mod) and l.s is not None and l.replace(s=None).is_bot():
             return self.visit_rule("str.__mod__", st, [l, r], {}, node)
         if any(tag[0] == "native-flag" for value in (l,r) for tag in value.st):
@@ -4427,6 +7013,14 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                               for a in side.refs):
                 # dicts merge with `|`, views are sets: not modelled
                 raise Unsupported("operator on a type, class, function, range, dict or view", node)
+        if isinstance(op, (ast.Div, ast.FloorDiv, ast.Mod)):
+            lk, rk = self.primitive_numeric_kind(l), self.primitive_numeric_kind(r)
+            if lk is not None and rk is not None:
+                name = {ast.Div:'truediv', ast.FloorDiv:'floordiv', ast.Mod:'mod'}[type(op)]
+                reverse = lk == 'int' and rk == 'float'
+                owner = 'float' if 'float' in (lk,rk) else 'int'
+                q = owner+'.__'+('r' if reverse else '')+name+'__'
+                return self.visit_rule(q, st, [r,l] if reverse else [l,r], {}, node)
         out = BOT
         bad = False  # a TypeError is possible
         zde = False  # a ZeroDivisionError is possible
@@ -4436,10 +7030,15 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         rnum = ri is not None or r.f
         if self._try_stack:
             if l.f or r.f:
-                self._in_try_refuse("float arithmetic (its non-property raises are not routed)", node)
+                if not isinstance(op, (ast.Add, ast.Sub, ast.Mult)):
+                    self._in_try_refuse("float arithmetic (its non-property raises are not routed)", node)
+                if not all(self._float_conversion_is_total(st, value.replace(n=False)) for value in (l, r)):
+                    self.check(node, "float-conversion", {"OverflowError"}, False,
+                               "an integer operand may overflow conversion to float", st=st)
             if l.s is not None or r.s is not None or l.refs or r.refs:
                 self._in_try_refuse("builtin sequence/set arithmetic (its non-property raises are not routed)", node)
-            if isinstance(op, (ast.Div, ast.Pow)):
+            if isinstance(op, (ast.Div, ast.Pow)) and not (self._generator_steps_only()
+                    and self.primitive_numeric_kind(l) is not None and self.primitive_numeric_kind(r) is not None):
                 self._in_try_refuse("numeric division/power (its OverflowError is not routed)", node)
             if isinstance(op, (ast.LShift, ast.RShift)) and ri is not None:
                 lo, _ = self.ibounds(st, ri)
@@ -4494,6 +7093,11 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             self.check(node, "divide", {"ZeroDivisionError"}, not zde, "; ".join(facts) or
                        ("divisor excludes 0" if not zde else "divisor may be 0"),
                        residual=residual, operand=right, st=st)
+        if (self._value_equalities and isinstance(op, ast.Add)
+                and l.s is not None and r.s is not None
+                and l.kinds() == ["str"] and r.kinds() == ["str"] and out.kinds() == ["str"]):
+            from .equality import Recipe
+            out = out.replace(value_term=Recipe("str", "Add", (self._string_term(l), self._string_term(r))))
         if out.is_bot():
             st.set_bottom()
         return out
@@ -4513,6 +7117,12 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             fact = ff if fact is None else fact.join(ff)
             if v.f:
                 term = None
+            elif (not v.b and ii.lin is not None and lo is not None and hi is not None
+                    and -exactfloat.TWO53 < lo and hi < exactfloat.TWO53):
+                term = exactfloat.of_lin(ii.lin.norm(st.zone))      # float(int) of |value| < 2**53 is exact (a variable the zone pins is its constant)
+            elif (not v.b and lo is not None and hi is not None and -exactfloat.TWO53 < lo and hi < exactfloat.TWO53):
+                self._xd_atoms = getattr(self, "_xd_atoms", 0) + 1
+                term = exactfloat.of_atom(self._xd_atoms)    # exact, but with no int variable to name: a fresh atom
         if fact is None:
             fact = fv.FloatFact.bottom()
         return FloatInfo(fact, term, v.f.why if v.f else "")
@@ -4579,7 +7189,59 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             fact = (f"divisor in [{d.lo:.6g}, {d.hi:.6g}]{' or nan' if d.nan else ''}"
                     + (" excludes 0" if "ZeroDivisionError" not in raises else " may be 0")
                     + (f" by {b.why}" if b.why else ""))
+        if (isinstance(op, (ast.FloorDiv, ast.Mod)) and exactfloat.is_xd(ta) and ta == tb and a.fact.has_interval()
+                and not a.fact.nan):
+            # one exact finite float over itself: x // x == 1.0 and x % x == 0.0 whenever it does not raise (x == 0.0 raises)
+            k = 1.0 if isinstance(op, ast.FloorDiv) else 0.0
+            res = fv.FloatFact(k, k, False)
+            term = exactfloat.of_float_const(k) if k else ("zero-sign", False)
+        exact = self._exact_float_op(op, a, b, res, square)
+        if exact is not None:
+            res, xterm = exact
+            term = xterm if xterm is not None else (term if not exactfloat.is_xd(term) else None)
         return FloatInfo(res, term, why or (a.why if isinstance(op, ast.Add) else "")), raises, fact
+
+    def _exact_float_op(self, op, a: FloatInfo, b: FloatInfo, res, square=False):
+        """``(exact fact, term or None)`` for ``a op b`` on EXACT dyadic operands (``exactfloat.py``) whose exact result is representable, else None.
+
+        IEEE ``+ - *`` are correctly rounded, so when the real result is representable the double IS the real result: its interval needs no outward
+        rounding, and a sum/difference/scale-by-literal keeps an exact term (``float(i) + float(j)`` is ``float(i + j)``).  ``x ** 2`` of an exact
+        ``x`` is the product ``x * x`` (libm ``pow`` is within 0.52 ulp, and the exact square is representable, so it returns it).  A float with
+        no term, a NaN/inf operand, or a result beyond ``2**53`` scaled: None (the ordinary outward-rounded transfer stands)."""
+        ta, tb = a.term, b.term
+        if not (exactfloat.is_xd(ta) and exactfloat.is_xd(tb)) or a.fact.nan or b.fact.nan:
+            return None
+        if not (a.fact.has_interval() and b.fact.has_interval()):
+            return None
+        if isinstance(op, ast.Pow):
+            if not (exactfloat.is_const(tb) and exactfloat.const_value(tb) == 2):
+                return None
+            kind, square, tb, b = "mul", True, ta, a
+        elif isinstance(op, ast.Add):
+            kind = "add"
+        elif isinstance(op, ast.Sub):
+            kind = "sub"
+        elif isinstance(op, ast.Mult):
+            kind = "mul"
+        else:
+            return None
+        if kind == "mul":
+            if square:
+                term = None
+            elif exactfloat.is_const(tb):
+                term = exactfloat.scale_by_const(ta, tb)
+            elif exactfloat.is_const(ta):
+                term = exactfloat.scale_by_const(tb, ta)
+            else:
+                term = None
+            scale = ta[1] + tb[1]
+        else:
+            term = exactfloat.add(ta, tb, 1 if kind == "add" else -1)
+            scale = term[1]
+        iv = exactfloat.exact_interval(kind, a.fact.lo, a.fact.hi, b.fact.lo, b.fact.hi, square)
+        if iv is None or max(abs(iv[0]), abs(iv[1])) * (2 ** scale) >= exactfloat.TWO53:
+            return None          # the real result may not be representable: the ordinary outward-rounded transfer stands
+        return fv.FloatFact(iv[0], iv[1], False), term
 
     # ------------------------------------------------------ math (every function of the module)
     #: the math functions with a sound interval transfer in solve/values.py (lane D); the others get the
@@ -4723,9 +7385,16 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
 
     def _math_trig_sqrt(self, st, v: V, name, node):
         """``sin``/``cos``/``sqrt``: the interval transfer plus the value terms the lemmas use."""
+        if name == 'sqrt' and self._try_stack and not self._float_conversion_is_total(st, v):
+            self.check(node, 'math.sqrt:conversion', {'OverflowError'}, False,
+                       'an integer operand may overflow conversion to float', st=st)
         a = self.float_view(st, v)
-        res, _raises = getattr(fv, name)(a.fact)  # ValueError / OverflowError: not property classes
-        if _raises:
+        res, _raises = getattr(fv, name)(a.fact)
+        if name == 'sqrt' and self._try_stack:
+            for exc in _raises:
+                self.check(node, 'math.sqrt:domain', {exc}, False,
+                           'a negative argument may be outside the real domain', st=st)
+        elif _raises:
             self._in_try_refuse(f"math.{name} (ValueError / OverflowError)", node)
         term, why = None, ""
         if name in ("sin", "cos"):
@@ -4743,6 +7412,29 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             st.set_bottom()
             return BOT
         return V(f=FloatInfo(res, term, why))
+
+    def _exact_affine_quotient(self, st, node):
+        from .polynomial import affine_quotient
+
+        if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.FloorDiv):
+            return None
+        names = {}
+        nodes = list(ast.walk(node))
+        if any(not isinstance(n, (ast.BinOp, ast.UnaryOp, ast.Name, ast.Constant,
+                                  ast.FloorDiv, ast.Add, ast.Sub, ast.Mult, ast.UAdd, ast.USub, ast.Load))
+               for n in nodes):
+            return None
+        for n in nodes:
+            if not isinstance(n, ast.Name) or n.id in names:
+                continue
+            value = self.load_name(n.id, n, st, self._fctx_stack[-1])
+            if not value.replace(i=None, b=frozenset()).is_bot():
+                return None
+            info = self._as_int(st, value)
+            if info is None or info.lin is None:
+                return None
+            names[n.id] = info.lin
+        return affine_quotient(node, names, self.deadline)
 
     def _int_binop(self, st: State, op, a: IntInfo, b: IntInfo, node, facts):
         z = st.zone
@@ -4777,6 +7469,11 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 facts.append(f"divisor {self.plin(lb)} in [{ib[0]}, {ib[1]}] excludes 0")
             if isinstance(op, ast.Div):
                 return FLOAT, zde
+            if (la is not None and lb is not None and la.sub(lb).norm(z).is_const() and la.sub(lb).norm(z).c == 0
+                    and isinstance(op, (ast.FloorDiv, ast.Mod))):
+                # the same int divided by itself: every execution that does not raise (the divisor was 0) has x // x == 1 and x % x == 0
+                k = 1 if isinstance(op, ast.FloorDiv) else 0
+                return mk(Lin.const(k), (k, k)), zde
             if isinstance(op, ast.Mod):
                 # result has the divisor's sign, |r| < |divisor|
                 if ib[0] is not None and ib[0] > 0:
@@ -4784,6 +7481,17 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 if ib[1] is not None and ib[1] < 0:
                     return mk(None, (None if ib[0] is None else ib[0] + 1, 0)), zde
                 return mk(None, (None, None)), zde
+            # Keep ordinary linear division cheap; expand only a lost nonlinear form.
+            lin = None
+            if la is not None and lb is not None and lb.is_const() and lb.c:
+                if la.c % lb.c == 0 and all(c % lb.c == 0 for _, c in la.terms):
+                    lin = Lin({v: c // lb.c for v, c in la.terms}, la.c // lb.c)
+            if (lin is None and isinstance(node, ast.BinOp)
+                    and any(isinstance(n, ast.BinOp) and isinstance(n.op, ast.Mult)
+                            for n in ast.walk(node.left))):
+                lin = self._exact_affine_quotient(st, node)
+            if lin is not None:
+                return mk(lin, lin_bounds(lin, z)), zde
             # floor division
             if ib[0] is not None and ib[0] > 0 and ia[0] is not None and ia[0] >= 0:
                 hi = None if ia[1] is None else ia[1] // ib[0]
@@ -4793,8 +7501,11 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         if isinstance(op, ast.Pow):
             if ib[0] is not None and ib[0] >= 0:
                 if ia[0] is not None and ia[0] >= 0:
-                    lo = ia[0] ** ib[0] if ib[0] < 64 and ia[0] < 2 ** 16 else None
-                    return mk(None, (lo if lo is not None else 0, None)), False
+                    if ia[0] == 0:
+                        lo = 1 if ib[1] == 0 else 0
+                    else:
+                        lo = ia[0] ** ib[0] if ib[0] < 64 and ia[0] < 2 ** 16 else 1
+                    return mk(None, (lo, None)), False
                 return mk(None, (None, None)), False
             # negative exponent: a float, ZeroDivisionError on base 0
             if _iv_contains0(ia):
@@ -4924,11 +7635,19 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 if r.i is not None or r.b or r.f or r.n or r.s is not None or r.st:
                     bad = True
             elif isinstance(op, ast.Mult):
-                if inplace and ob.kind == "list":
-                    # `xs *= n` repeats the list IN PLACE: every alias sees it (lane F, b01)
-                    raise Unsupported("in-place list repetition", node)
                 ri = self._as_int(st, r)
-                if ri is not None:
+                if inplace and ob.kind == "list":
+                    if len(l.refs) != 1 or not l.replace(refs=frozenset()).is_bot():
+                        raise Unsupported("in-place repetition of a joined receiver", node)
+                    if ri is not None:
+                        self.collapse(st, {a})
+                        ob = st.heap[a]
+                        length, elem = self._seq_repeat_info(st, ob, ri)
+                        lo, hi = self.ibounds(st, length)
+                        self.update_obj(st, {a}, lambda old, strong: self.set_len(
+                            st, old.replace(elem=elem, pre=None), strong, length.lin, lo, hi))
+                        out = vjoin(out, z, V(refs=frozenset({a})), z)
+                elif ri is not None:
                     out = vjoin(out, z, self._seq_repeat(st, ob, ri, node), z)
                 if r.f or r.n or r.s is not None or r.refs or r.st:
                     bad = True
@@ -4951,7 +7670,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 bad = True
         return out, bad
 
-    def _seq_repeat(self, st: State, ob, n: IntInfo, node) -> V:
+    def _seq_repeat_info(self, st: State, ob, n: IntInfo):
         la, liv = self.len_lin(st, ob)
         niv = self.ibounds(st, n)
         ln = None
@@ -4963,11 +7682,32 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         else:
             iv = _iv_mul(liv, (0 if niv[0] is None or niv[0] < 0 else niv[0], niv[1]))
             lii = IntInfo.interval(0 if iv[0] is None or iv[0] < 0 else iv[0], iv[1])
+        return lii, elem
+
+    def _seq_repeat(self, st: State, ob, n: IntInfo, node) -> V:
+        lii, elem = self._seq_repeat_info(st, ob, n)
         a = self.new_list(st, node, lii, elem, tag=ob.kind + "*", kind=ob.kind, seg=ob.kind == "list",
                           typecode=getattr(ob, "typecode", None))
         return V(refs=frozenset({a}))
 
     # ============================================================ subscripts
+    def sequence_index_args(self, qualname, st, index, node):
+        # Native conversion precedes bounds adjustment; an interval can reach both payload cases.
+        import sys
+        lo,hi=self.ibounds(st,index)
+        cases=[]
+        if (hi is None or hi >= -sys.maxsize-1) and (lo is None or lo <= sys.maxsize):
+            cases.append('native-bounds')
+        if lo is None or hi is None or lo < -sys.maxsize-1 or hi > sys.maxsize:
+            cases.append('oversized-int')
+        value=BOT
+        for case in cases:
+            args=self.contract_exception_args(qualname,'IndexError',case,(),node)
+            if len(args)!=1:
+                raise Unsupported(qualname+': one native IndexError argument required',node)
+            value=vjoin(value,st.zone,args[0],st.zone)
+        return (value,)
+
     def index_ok(self, st: State, length_lin: Lin | None, length_iv, idx: IntInfo):
         """Is ``-len <= idx < len``?  Returns (ok, fact)."""
         z = st.zone
@@ -5034,6 +7774,12 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         """``ob[idx] = v`` on a list object (idx checked in range on this path)."""
         pre = getattr(ob, "pre", None)
         if pre is None:
+            if strong and isinstance(ob.length, str):
+                # a recent list of exactly one element: ``ob[0] = v`` (or ``ob[-1] = v``) leaves ``v`` as the only element
+                n_lo, n_hi = st.zone.bounds(ob.length)
+                i_lo, i_hi = self.ibounds(st, idx)
+                if n_lo == n_hi == 1 and i_lo == i_hi and i_lo in (0, -1):
+                    return ob.replace(elem=self.join_into(st, BOT, v))
             return ob.replace(elem=self.join_into(st, ob.elem, v))
         if not strong:
             return ob.replace(elem=self.join_into(st, ob.elem, v), pre=self.join_into(st, pre, v))
@@ -5088,12 +7834,29 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return self._through_subscript_rules(quals, st, node, idx, lambda: self._subscript_load_model(st, obj, idx, node))
 
     def _subscript_load_model(self, st: State, obj: V, idx, node) -> V:
+        if idx[0] == "slice" and len(obj.refs) > 1:
+            # Only one receiver is selected at runtime; its allocations are alternatives.
+            entry_epoch = set(self.epoch)
+            merged_epoch = set(entry_epoch)
+            outs = []
+            try:
+                for part in self.alternatives(obj):
+                    if self._clock() > self.deadline:
+                        raise Unsupported("slice alternatives time budget exhausted", node)
+                    self.epoch = set(entry_epoch)
+                    branch = st.copy()
+                    value = self._subscript_load_model(branch, part, idx, node)
+                    merged_epoch.update(self.epoch)
+                    outs.append((branch, value))
+            finally:
+                self.epoch = merged_epoch
+            return self._merge_branches(st, outs)
         if obj.s is not None and obj.replace(s=None).is_bot():
             if idx[0] == "index":
                 key = idx[1]
             else:
                 from .native import concrete, product
-                options = product([concrete(self, st, x) if x is not None else [None] for x in idx[1:4]])
+                options = product([concrete(self, st, x) if x is not None else [None] for x in idx[1:4]], analyzer=self)
                 key = None
                 if options is not None:
                     try:
@@ -5135,6 +7898,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         for a in obj.refs:
             ob = st.heap[a]
             if ob.kind in ("list", "tuple", "array"):
+                sequence_kind = "list" if a[0][-1] == "frozen list" else ob.kind
                 if idx[0] == "slice":
                     out = vjoin(out, st.zone, self.slice_load(st, a, ob, idx, node), st.zone)
                     continue
@@ -5150,7 +7914,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                     lo, hi = self.ibounds(st, ii)
                     n = len(ob.items)
                     ok = lo is not None and hi is not None and -n <= lo and hi < n
-                    self.check(node, "index", {"IndexError"}, ok, f"tuple index in [{lo}, {hi}], len {n}", st=st)
+                    self.check(node, "index", {"IndexError"}, ok, f"tuple index in [{lo}, {hi}], len {n}", st=st,
+                               exact_args={'IndexError':self.sequence_index_args(sequence_kind+'.__getitem__',st,ii,node)} if not ok else None)
                     if lo is None or hi is None:
                         cands = range(-n, n)
                     else:
@@ -5160,8 +7925,14 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                     continue
                 llin, liv = self.len_lin(st, ob)
                 ok, fact = self.index_ok(st, llin, liv, ii)
-                self.check(node, "index", {"IndexError"}, ok, fact, **self._index_residual(node, st))
+                payload = ({'IndexError':self.sequence_index_args(sequence_kind+'.__getitem__',st,ii,node)}
+                           if not ok and ob.kind in ('list','tuple') else None)
+                self.check(node, "index", {"IndexError"}, ok, fact, exact_args=payload, **self._index_residual(node, st))
                 ibad = ibad or not ok
+                lo,hi=self.ibounds(st,ii)
+                if (liv[1] is not None and ((lo is not None and lo >= liv[1]) or
+                                           (hi is not None and hi < -liv[1]))):
+                    continue  # a definitely out-of-range index has no normal successor
                 e = self.elem_at(st, ob, ii)
                 if not e.is_bot():
                     out = vjoin(out, st.zone, e, st.zone)
@@ -5207,8 +7978,15 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 res = None
                 if isinstance(node, ast.Subscript):
                     res = f"({ast.unparse(node.slice)}) not in {ast.unparse(node.value)}"
+                exact_args = None
+                if not ok:
+                    q = 'collections.defaultdict.__getitem__' if isinstance(ob,DefaultDictObj) else 'dict.__getitem__'
+                    if type(ob) not in (DictObj,DefaultDictObj) or isinstance(ob,DefaultDictObj) and ob.factory is not None:
+                        raise Unsupported('unmodelled dictionary missing-key payload',node)
+                    payload = self.contract_exception_args(q,'KeyError','native-missing-key',(obj,kv),node)
+                    exact_args = {'KeyError':payload}
                 self.check(node, "key", {"KeyError"}, ok, fact, residual=res,
-                           operand=getattr(node, "slice", None), st=st)
+                           operand=getattr(node, "slice", None), st=st, exact_args=exact_args)
                 if not val.is_bot():
                     out = vjoin(out, st.zone, val, st.zone)
             else:
@@ -5254,6 +8032,49 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
 
     def slice_load(self, st: State, a, ob, idx, node) -> V:
         lo, hi, stepc = self._slice_parts(st, idx, node)
+        if type(ob) is TupleObj and ob.items is not None:
+            options = []
+            for part in idx[1:4]:
+                if part is None:
+                    options.append([None])
+                    continue
+                if part.top or part.refs or part.st or part.s is not None or part.f:
+                    break
+                values = ([None] if part.n else []) + list(part.b or ())
+                if part.i is not None:
+                    lower, upper = self.ibounds(st, part.i)
+                    if lower is None or lower != upper:
+                        break
+                    values.append(lower)
+                if not values:
+                    break
+                options.append(list(dict.fromkeys(values)))
+            if len(options) == 3:
+                import itertools
+                items = []
+                for bounds in itertools.product(*options):
+                    if self._clock() > self.deadline:
+                        raise Unsupported('tuple slice alternatives time budget exhausted', node)
+                    try:
+                        items.append(ob.items[slice(*bounds)])
+                    except ValueError:
+                        pass  # a zero step has no normal successor; active try was refused above
+                if not items:
+                    st.set_bottom()
+                    return BOT
+                outs = []
+                entry_epoch = set(self.epoch)
+                merged_epoch = set(entry_epoch)
+                try:
+                    for values in items:
+                        self.epoch = set(entry_epoch)
+                        branch = st.copy()
+                        addr = self.new_list(branch, node, None, BOT, tag='tuple[:]', kind='tuple', items=values)
+                        merged_epoch.update(self.epoch)
+                        outs.append((branch, V(refs=frozenset({addr}))))
+                finally:
+                    self.epoch = merged_epoch
+                return self._merge_branches(st, outs)
         llin, liv = self.len_lin(st, ob)
         z = st.zone
         newlen = None  # an exact Lin
@@ -5261,7 +8082,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             L = llin
 
             def val(v):
-                if v is None or (v.n and v.i is None):
+                if v is None or (v.n and v.replace(n=False).is_bot()):
                     return None
                 if v.only_int() and v.i.lin is not None:
                     return v.i.lin
@@ -5327,17 +8148,19 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 raise Unsupported("instance item assignment", node)
             else:
                 tbad = True
+        unique = (len(obj.refs) == 1 and obj.replace(refs=frozenset()).is_bot()
+                  and next(iter(obj.refs))[1] == "r")
         if dicts:
             if idx[0] == "slice":
                 raise Unsupported("dict slice assignment", node)
             kv = idx[1]
-            self.check_hash_key(kv, node)
+            self.check_hash_key(st, kv, node)
             if kv.top:
                 raise Unsupported("unknown key", node)
             if any(st.heap[r].kind in ("list", "dict") for r in kv.refs):
                 tbad = True
             ks = self.key_consts(st, kv)
-            strong = len(dicts) == 1 and next(iter(dicts))[1] == "r" and ks is not None and len(ks) == 1
+            strong = unique and ks is not None and len(ks) == 1
             sv = self.summarize(st, v)
             for a in dicts:
                 ob = st.heap[a]
@@ -5396,10 +8219,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             st.set_bottom()
             return
         if lists:
-            self.update_obj(st, lists, lambda ob, strong: self.store_elem(st, ob, strong, ii, v))
+            self.update_obj(st, lists, lambda ob, strong: self.store_elem(st, ob, strong and unique, ii, v))
         if arrays:
             checked_v = self._array_store_value(st, node, typecode, v)
-            self.update_obj(st, arrays, lambda ob, strong: self.store_elem(st, ob, strong, ii, checked_v))
+            self.update_obj(st, arrays, lambda ob, strong: self.store_elem(st, ob, strong and unique, ii, checked_v))
 
     def slice_store(self, st: State, a, idx, v: V, node, strong: bool) -> None:
         if any(st.heap[r].kind in ("inst", "iterator") for r in v.refs):
@@ -5473,18 +8296,20 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         if name.startswith("__") and name not in SUPPORTED_DUNDERS | {
                 "__init__", "__str__", "__repr__", "__format__", "__bool__"}:
             raise Unsupported("reflective or unmodelled class attribute " + name)
-        seen = 0
+        seen = set()
         a = cls_addr
-        while a is not None and seen < 50:
+        while a is not None:
+            if self._clock() > self.deadline:
+                raise Unsupported("class hierarchy time budget exhausted")
+            if a in seen:
+                raise Unsupported("cyclic class hierarchy")
+            seen.add(a)
             co = st.heap.get(a)
             if co is None:
                 return None
             if name in co.attrs:
                 return co.attrs[name]
             a = co.bases[0] if co.bases else None
-            seen += 1
-        if a is not None:
-            raise Unsupported("class lookup depth")
         return None
 
     def _mro_has_unmodelled_base(self, st: State, cls_addr) -> bool:
@@ -5502,26 +8327,35 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         a base -- carries attributes outside the user-class model; a name miss anywhere in
         such an MRO is unknown, never a confident absence.
         """
-        seen = 0
+        seen = set()
         a = cls_addr
-        while a is not None and seen < 50:
+        while a is not None:
+            if self._clock() > self.deadline:
+                raise Unsupported("class hierarchy time budget exhausted")
+            if a in seen:
+                raise Unsupported("cyclic class hierarchy")
+            seen.add(a)
             co = st.heap.get(a)
             if co is None:
                 return False
-            if "__exc_base__" in co.attrs:
+            if (isinstance(co, NamedTupleClassObj) or "__exc_base__" in co.attrs
+                    or getattr(co, "abstracts", None) is not None):
                 return True
             a = co.bases[0] if co.bases else None
-            seen += 1
         return False
 
     def attr_load(self, st: State, v: V, name: str, node) -> V:
         """The read of an attribute: of a user instance it is ``protocol.attribute_access``'s (the rule of the lookup, [internal ref] step 2), the
         other receivers (a class, a builtin container, a module) are the model alone."""
+        if any(type(st.heap.get(a)) in {ZipObj, EnumerateObj} for a in v.refs):
+            raise Unsupported("native lazy iterator attributes are not modelled", node)
         if not v.top and any(st.heap[a].kind == "inst" for a in v.refs):
             return self.visit_protocol("protocol.attribute_access", node, lambda: self._attr_load_model(st, v, name, node), None)
         return self._attr_load_model(st, v, name, node)
 
     def _attr_load_model(self, st: State, v: V, name: str, node) -> V:
+        if any(st.heap[a].kind == "generator" for a in v.refs):
+            raise Unsupported("generator continuation/protocol is not modelled", node)
         if v.top:
             raise Unsupported("attribute of an unknown value", node)
         out = BOT
@@ -5529,7 +8363,28 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         methods: dict = {}  # function address -> receivers
         for a in v.refs:
             ob = st.heap[a]
+            if isinstance(ob, NamedTupleObj):
+                if name == "__class__":
+                    out = vjoin(out, st.zone, ob.type_v, st.zone)
+                    continue
+                cls = st.heap[next(iter(ob.type_v.refs))]
+                if name in cls.fields:
+                    out = vjoin(out, st.zone, self.mat(st, ob.items[cls.fields.index(name)]), st.zone)
+                    continue
+            if ob.kind == 'exception':
+                if name == 'args':
+                    out = vjoin(out, st.zone, self.mat(st, ob.args), st.zone)
+                elif name == '__class__':
+                    out = vjoin(out, st.zone, V(st=frozenset({('exc', ob.cls)})), st.zone)
+                else:
+                    raise Unsupported(f'exception attribute {name}', node)
+                continue
             if ob.kind == "inst":
+                if name == 'args' and ob.exc_args is not None:
+                    if self._mro_attr_or_slot(st, ob.cls, name) is not None:
+                        raise Unsupported('custom exception args descriptor shadow', node)
+                    out = vjoin(out, st.zone, self.mat(st, ob.exc_args), st.zone)
+                    continue
                 got = ob.attrs.get(name)
                 # `name`'s FIRST hit walking ob.cls's MRO: ("slot", class_addr) for
                 # an intact slot descriptor declared THERE (in that class's own
@@ -5593,6 +8448,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                     continue
                 out = vjoin(out, st.zone, self.bind_class_attr(st, cv, V(refs=frozenset({a})), node), st.zone)
             elif ob.kind == "class":
+                if name == '__name__':
+                    out = vjoin(out, st.zone, const_str(ob.name), st.zone)
+                    continue
                 cv = self.class_lookup(st, a, name)
                 if cv is None:
                     if _reflective_unresolved_name(name) or self._mro_has_unmodelled_base(st, a):
@@ -5600,6 +8458,22 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                     bad = True
                     continue
                 out = vjoin(out, st.zone, self.bind_class_attr(st, cv, None, node, cls_addr=a), st.zone)
+            elif isinstance(ob,DefaultDictObj) and name=='__missing__':
+                self.borrow(st,V(refs=frozenset({a})))
+                ma=self.alloc(st,node,lambda sid:BuiltinMethod(name,V(refs=frozenset({a}))), 'bimeth')
+                out=vjoin(out,st.zone,V(refs=frozenset({ma})),st.zone)
+            elif ob.kind == 'textwrapper':
+                if name in ob.attrs:
+                    out = vjoin(out, st.zone, self.mat(st, ob.attrs[name]), st.zone)
+                elif name in ('wrap', 'fill'):
+                    self.borrow(st, V(refs=frozenset({a})))
+                    ma = self.alloc(st, node, lambda sid: BuiltinMethod(name, V(refs=frozenset({a}))), 'bimeth')
+                    out = vjoin(out, st.zone, V(refs=frozenset({ma})), st.zone)
+                else:
+                    raise Unsupported(f'TextWrapper attribute {name}', node)
+            elif ob.kind == "range" and name in {"count", "index"}:
+                ma = self.alloc(st, node, lambda sid: BuiltinMethod(name, V(refs=frozenset({a}))), "range-method")
+                out = vjoin(out, st.zone, V(refs=frozenset({ma})), st.zone)
             elif ob.kind in ("list",):
                 if name in LIST_METHODS:
                     ma = self.alloc(st, node, lambda sid: BuiltinMethod(name, V(refs=frozenset({a}))), "bimeth")
@@ -5630,8 +8504,29 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             out = vjoin(out, st.zone, V(refs=frozenset({ma})), st.zone)
         if v.n:
             bad = True
-        if v.i is not None or v.b or v.f or v.s is not None:
-            raise Unsupported(f"attribute {name} of a builtin scalar", node)
+        if (v.i is not None or v.b) and not v.f and v.s is None and name in {"bit_length", "bit_count", "conjugate", "is_integer", "as_integer_ratio"}:
+            # A bound method retains the integer value even after its source variable changes.
+            recv = self._const_bounds(st, V(i=v.i, b=v.b), "")
+            ma = self.alloc(st, node, lambda sid: BuiltinMethod(name, recv), "int-method")
+            out = vjoin(out, st.zone, V(refs=frozenset({ma})), st.zone)
+        elif v.f and v.i is None and not v.b and v.s is None and name in {"conjugate", "is_integer", "as_integer_ratio"}:
+            recv = V(f=FloatInfo(v.f.fact))
+            ma = self.alloc(st, node, lambda sid: BuiltinMethod(name, recv), "float-method")
+            out = vjoin(out, st.zone, V(refs=frozenset({ma})), st.zone)
+        elif v.i is not None or v.b or v.f or v.s is not None:
+            from tharkun.solve.contracts.safety.rules_protocols import _INSTANCE_ATTRS
+            scalar_tags = []
+            if v.i is not None:
+                scalar_tags.append("int")
+            if v.b:
+                scalar_tags.append("bool")
+            if v.f:
+                scalar_tags.append("float")
+            if v.s is not None:
+                scalar_tags.append("str")
+            if any(name in _INSTANCE_ATTRS[t] for t in scalar_tags):
+                raise Unsupported(f"attribute {name} of a builtin scalar", node)
+            bad = True
         obj_node = getattr(node, "value", None)
         self.check(node, "attr", {"AttributeError"}, not bad, f".{name} on " + ",".join(v.kinds()),
                    residual=self._attr_residual(obj_node, name, v), operand=obj_node, st=st)
@@ -5669,6 +8564,12 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return out
 
     def attr_store(self, st: State, obj: V, name: str, v: V, node) -> None:
+        if any(st.heap[a].kind == "generator" for a in obj.refs):
+            raise Unsupported("generator continuation/protocol is not modelled", node)
+        if any(isinstance(st.heap[a], (NamedTupleClassObj, NamedTupleObj)) for a in obj.refs):
+            raise Unsupported("namedtuple mutation is not modelled", node)
+        if any(t[0] in {'abc-base', 'abc-abstractmethod'} or t[:2] in {('mod', 'abc'), ('module', 'abc')} for t in obj.st):
+            raise Unsupported("mutation of ABC machinery", node)
         # ``default_factory`` is a writable C-level slot on defaultdict.  This
         # transfer does not update the factory metadata, so even a valid
         # assignment must stay unknown (including a receiver union).
@@ -5679,8 +8580,23 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             raise Unsupported("reflective attribute assignment " + name, node)
         if obj.top:
             raise Unsupported("attribute store on an unknown value", node)
+        if any(st.heap[a].kind == 'exception' or
+               (name == 'args' and st.heap[a].kind == 'inst' and st.heap[a].exc_args is not None)
+               for a in obj.refs):
+            raise Unsupported('exception descriptor/attribute assignment is not modelled', node)
         if obj.st or any(st.heap[a].kind in ("func",) for a in obj.refs):
             raise Unsupported("attribute store on a module, type or function", node)
+        if any(st.heap[a].kind == 'textwrapper' for a in obj.refs):
+            if (not obj.replace(refs=frozenset()).is_bot()
+                    or any(st.heap[a].kind != 'textwrapper' or name not in st.heap[a].attrs for a in obj.refs)):
+                raise Unsupported('TextWrapper setting on mixed receivers or unmodelled attribute', node)
+            value = self.summarize(st, v)
+            def update(ob, strong):
+                attrs = dict(ob.attrs)
+                attrs[name] = value if strong else vjoin(attrs[name], st.zone, value, st.zone)
+                return ob.replace(attrs=attrs)
+            self.update_obj(st, obj.refs, update)
+            return
         if any(st.heap[a].kind == "class" for a in obj.refs):
             if len(self.alternatives(obj)) > 1:
                 self.map_alternatives(st, obj, lambda branch, part:
@@ -5749,14 +8665,14 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 old = attrs.get(name)
                 ver = 0 if old is None else (None if old[2] is None else old[2] + 1)
                 attrs[name] = (sv, True, ver)
-                nob = InstObj(ob.cls, attrs, qf)
+                nob = InstObj(ob.cls, attrs, qf, ob.exc_args)
                 return self.recompute_qf(st, a, nob)
             if name not in attrs:
                 attrs[name] = (sv, False, None)
             else:
                 old, d, _ = attrs[name]
                 attrs[name] = (vjoin(old, st.zone, sv, st.zone), d, None)
-            return InstObj(ob.cls, attrs, qf)
+            return InstObj(ob.cls, attrs, qf, ob.exc_args)
 
         strong = len(insts) == 1 and next(iter(insts))[1] == "r"
         for a in insts:
@@ -5796,7 +8712,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         lemmas.add_landmarks(lo, hi)
         qf = dict(ob.qf)
         qf[frozenset(group)] = (lo, hi, why)
-        return InstObj(ob.cls, ob.attrs, qf)
+        return InstObj(ob.cls, ob.attrs, qf, ob.exc_args)
 
     def sumsq_lower(self, st: State, bases) -> tuple[float, float, str]:
         """Bounds ``(lo, hi, why)`` of the real sum of b*b over value terms ``bases``."""
@@ -5830,7 +8746,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         site = s_addr[0] + ("focus",) + self.site(node)
         f_addr = (site, "r")
         ob = st.heap[s_addr]
-        st.heap[f_addr] = InstObj(ob.cls, {k: (v, d, 0) for k, (v, d, _r) in ob.attrs.items()}, dict(ob.qf))
+        st.heap[f_addr] = InstObj(ob.cls, {k: (v, d, 0) for k, (v, d, _r) in ob.attrs.items()}, dict(ob.qf), ob.exc_args)
         # the object may be reached through any reference to the summary: may-alias
         def split(v: V) -> V:
             return v.replace(refs=v.refs | {f_addr}) if s_addr in v.refs else v
@@ -5843,7 +8759,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
     def blur(self, st: State, f_addr, s_addr, v: V) -> V:
         st.strip_terms(lambda t: t == f_addr)
         fob = st.heap.pop(f_addr)
-        fob = InstObj(fob.cls, {k: (x, d, None) for k, (x, d, _r) in fob.attrs.items()}, fob.qf)
+        fob = InstObj(fob.cls, {k: (x, d, None) for k, (x, d, _r) in fob.attrs.items()}, fob.qf, fob.exc_args)
         try:
             st.heap[s_addr] = _ojoin(st.heap[s_addr], st.zone, fob, st.zone)
         except Incompatible as e:
@@ -5859,7 +8775,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         """A method starts on the recent object ``addr``: fresh attribute versions."""
         st.strip_terms(lambda t: t == addr)
         ob = st.heap[addr]
-        st.heap[addr] = InstObj(ob.cls, {k: (v, d, 0) for k, (v, d, _r) in ob.attrs.items()}, ob.qf)
+        st.heap[addr] = InstObj(ob.cls, {k: (v, d, 0) for k, (v, d, _r) in ob.attrs.items()}, ob.qf, ob.exc_args)
 
     def _all_slots(self, st, cls_addr):
         """The union of every name declared in __slots__ anywhere along the MRO,
@@ -5880,15 +8796,19 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         names = set()
         has_dict = False
         a = cls_addr
-        seen = 0
-        while a is not None and seen < 50:
+        seen = set()
+        while a is not None:
+            if self._clock() > self.deadline:
+                raise Unsupported("class hierarchy time budget exhausted")
+            if a in seen:
+                raise Unsupported("cyclic class hierarchy")
+            seen.add(a)
             co = st.heap[a]
-            if co.slots is None or "__dict__" in co.slots:
+            if "__exc_base__" in co.attrs or co.slots is None or "__dict__" in co.slots:
                 has_dict = True
             else:
                 names.update(co.slots)
             a = co.bases[0] if co.bases else None
-            seen += 1
         return None if has_dict else names
 
     def _mro_attr_or_slot(self, st, cls_addr, name):
@@ -5918,15 +8838,19 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 "__init__", "__str__", "__repr__", "__format__", "__bool__"}:
             raise Unsupported("reflective or unmodelled class attribute " + name)
         a = cls_addr
-        seen = 0
-        while a is not None and seen < 50:
+        seen = set()
+        while a is not None:
+            if self._clock() > self.deadline:
+                raise Unsupported("class hierarchy time budget exhausted")
+            if a in seen:
+                raise Unsupported("cyclic class hierarchy")
+            seen.add(a)
             co = st.heap[a]
             if name in co.attrs:
                 return ("attr", co.attrs[name])
             if co.slots is not None and name in co.slots:
                 return ("slot", a)
             a = co.bases[0] if co.bases else None
-            seen += 1
         return None
 
     # ============================================================ calls
@@ -5953,8 +8877,13 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             kwargs.update(entries)
         return kwargs
 
-    def call_positional_args(self, e, st, fctx):
+    def call_positional_args(self, e, st, fctx, tail_out=None):
         """Evaluate positional arguments in order, expanding only fixed builtin sequences.
+
+        With ``tail_out`` (a list), a LAST ``*sequence`` of builtin list or tuple of unknown length is not expanded:
+        the arguments before it are returned and ``(elem, lo, hi)`` is appended to ``tail_out``, where ``elem`` covers
+        every element it may hold and ``lo <= len <= hi`` (``hi`` None: unbounded); only ``call_with_star_tail``
+        consumes that.
 
         A list's ``elem`` is an over-approximation of every slot, not a positional layout. Repeating it
         for a statically fixed length is sound but may lose slot correlations. Tuples with recorded
@@ -5962,13 +8891,22 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         deliberately refused rather than invoking target ``__iter__`` methods or guessing an arity.
         """
         args = []
-        expanded = 0
+        def check_work():
+            if self._clock() > self.deadline:
+                raise Unsupported("*args expansion time budget exhausted", e)
+
+        check_work()
         for arg in e.args:
+            check_work()
             if not isinstance(arg, ast.Starred):
                 value = self.eval(arg, st, fctx)
                 if st.bottom:
                     return args
-                args.append(value)
+                check_work()
+                try:
+                    args.append(value)
+                except MemoryError:
+                    raise Unsupported("*args expansion memory exhausted", arg) from None
                 continue
 
             value = self.eval(arg.value, st, fctx)
@@ -5981,54 +8919,150 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             if type(ob) not in (ListObj, TupleObj):
                 raise Unsupported("*args requires a builtin list or tuple", arg)
             if ob.kind == "tuple" and ob.items is not None:
-                if len(ob.items) > MAX_STAR_ARGS:
-                    raise Unsupported("*args expansion exceeds the fixed argument limit", arg)
                 items = ob.items
+                count = len(items)
             else:
                 _lin, (lo, hi) = self.len_lin(st, ob)
-                if lo is None or hi is None or lo != hi or lo < 0:
-                    raise Unsupported("*args requires a fixed sequence length", arg)
-                if lo > MAX_STAR_ARGS:
-                    raise Unsupported("*args expansion exceeds the fixed argument limit", arg)
-                if lo == 0:
-                    items = []
-                else:
+                if tail_out is not None and arg is e.args[-1] and (lo is None or hi is None or lo != hi):
                     elem = self.all_elems(st, ob)
                     if elem.is_bot():
                         raise Unsupported("*args sequence has no element summary", arg)
-                    items = [elem] * lo
-            if expanded + len(items) > MAX_STAR_ARGS:
-                raise Unsupported("*args expansion exceeds the fixed argument limit", arg)
-            expanded += len(items)
-            args.extend(self.borrow(st, self.mat(st, item)) for item in items)
+                    tail_out.append((self.borrow(st, self.mat(st, elem)), max(lo or 0, 0), hi))
+                    return args
+                if lo is None or hi is None or lo != hi or lo < 0:
+                    raise Unsupported("*args requires a fixed sequence length", arg)
+                items, count = None, lo
+                if count:
+                    elem = self.all_elems(st, ob)
+                    if elem.is_bot():
+                        raise Unsupported("*args sequence has no element summary", arg)
+            try:
+                for index in range(count):
+                    check_work()
+                    item = items[index] if items is not None else elem
+                    value = self.borrow(st, self.mat(st, item))
+                    check_work()
+                    args.append(value)
+            except MemoryError:
+                raise Unsupported("*args expansion memory exhausted", arg) from None
+        check_work()
         return args
 
+    def _starred_call_partition(self, e, st, fctx):
+        selected = {n.id for n in ast.walk(e.func) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        expanded = {n.id for arg in e.args if isinstance(arg, ast.Starred)
+                    for n in ast.walk(arg.value) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        for name in sorted(selected & expanded):
+            if name in fctx.capture_frames:
+                index = self._closure_frame_index(st, fctx.capture_frames[name], e)
+                key = name
+            elif fctx.is_class and name in st.frames[-1].env:
+                index, key = len(st.frames) - 1, name
+            elif self._scope(name, fctx) == 'local' and not fctx.is_class:
+                index, key = len(st.frames) - 1, name
+            else:
+                index, key = 0, self._global_key(name, fctx.module_key)
+            frame = st.frames[index]
+            value = frame.env.get(key)
+            if value is None or key in frame.maybe_unbound or len(value.refs) <= 1:
+                continue
+            properties = getattr(self, '_property_classes', ())
+            if properties and properties <= {'TypeError', 'AttributeError'}:
+                self._shape_numbers = True
+            epoch = set(self.epoch)
+            merged_epoch = set(epoch)
+            held = self.borrowed[-1]
+            borrowed = set(held)
+            merged_borrowed = set(borrowed)
+            outs = []
+            try:
+                for part in self.alternatives(value):
+                    if self._clock() > self.deadline:
+                        raise Unsupported('starred call partition time budget exhausted', e)
+                    self.epoch = set(epoch)
+                    held.clear()
+                    held.update(borrowed)
+                    branch = st.copy()
+                    self.write_var(branch, index, key, part)
+                    result = self.eval(e, branch, fctx)
+                    merged_epoch.update(self.epoch)
+                    merged_borrowed.update(held)
+                    outs.append((branch, result))
+            finally:
+                self.epoch = merged_epoch
+                held.clear()
+                held.update(merged_borrowed)
+            return self._merge_branches(st, outs)
+        return None
+
     def e_Call(self, e, st, fctx):
+        self._identity_havoc(st)
         has_starred = any(isinstance(a, ast.Starred) for a in e.args)
-        if has_starred and isinstance(e.func, ast.Attribute):
-            # This fast path resolves the method after evaluating arguments. A starred expression can
-            # mutate the receiver, so keep the native pre-argument attribute lookup boundary explicit.
-            raise Unsupported("method call with *args (attribute lookup order)", e)
+        if has_starred:
+            partition = self._starred_call_partition(e, st, fctx)
+            if partition is not None:
+                return partition
         # method call fast path: obj.name(...)
         if isinstance(e.func, ast.Attribute):
             recv = self.eval(e.func.value, st, fctx)
             if st.bottom:
                 return BOT
+            if not (recv.top or recv.refs or recv.st):
+                from tharkun.solve.contracts.safety.rules_protocols import _INSTANCE_ATTRS
+                kinds = [kind for kind, present in (
+                    ("int", recv.i is not None), ("bool", bool(recv.b)), ("float", bool(recv.f)),
+                    ("str", recv.s is not None), ("NoneType", recv.n)) if present]
+                if kinds and all(e.func.attr not in _INSTANCE_ATTRS[kind] for kind in kinds):
+                    # Python resolves the attribute before evaluating any call arguments.
+                    return self.attr_load(st, recv, e.func.attr, e.func)
+            if has_starred and not _effect_free_arguments(e):
+                # Present method binding may be changed by argument effects; it is not represented here.
+                raise Unsupported("method call with *args (attribute lookup order)", e)
             args = (self.call_positional_args(e, st, fctx) if has_starred else
                     [self.eval(a, st, fctx) for a in e.args])
             kwargs = self.call_keywords(e, st, fctx)
             if st.bottom:
                 return BOT
+            self._identity_havoc(st)
             return self.call_method(st, recv, e.func.attr, args, kwargs, e, operands=True)
         fv = self.eval(e.func, st, fctx)
-        args = (self.call_positional_args(e, st, fctx) if has_starred else
+        tail = []
+        args = (self.call_positional_args(e, st, fctx, tail) if has_starred else
                 [self.eval(a, st, fctx) for a in e.args])
         kwargs = self.call_keywords(e, st, fctx)
         if st.bottom:
             return BOT
+        self._identity_havoc(st)
+        if tail:
+            return self.call_with_star_tail(st, fv, args, tail[0], kwargs, e)
         return self.call(st, fv, args, kwargs, e, operands=True)
 
+    def call_with_star_tail(self, st: State, fv: V, args, tail, kwargs, node) -> V:
+        """``f(a, b, *seq)`` where ``seq`` is a builtin list or tuple of unknown length, and every callee is a user
+        function whose ``*parameter`` takes whatever the named parameters do not.
+
+        Exact where it is admitted: the named positional parameters are all filled by the arguments before ``*seq``
+        (so no element of ``seq`` binds to one, the arity cannot depend on its length, and a keyword naming one of
+        them is the same ``TypeError`` for every length), and the ``*parameter`` becomes a tuple of length
+        ``len(args) - len(params) + [lo, hi]`` over the elements ``seq`` may hold.  Any other callee (a builtin, a
+        class, a bound method, a function without ``*parameter`` or with named parameters left for the tail, a
+        scalar callee) keeps the refusal it had: its arity or its protocol depends on the length."""
+        if (fv.top or fv.st or fv.i is not None or fv.b or fv.f or fv.s is not None or fv.n or not fv.refs
+                or any(st.heap[a].kind != "func" for a in fv.refs)):
+            raise Unsupported("*args requires a fixed sequence length", node)
+        outs = []
+        for address in sorted(fv.refs):
+            fo = st.heap[address]
+            signature = fo.node.args
+            if signature.vararg is None or len(signature.posonlyargs) + len(signature.args) > len(args):
+                raise Unsupported("*args requires a fixed sequence length", node)
+            branch = st.copy() if len(fv.refs) > 1 else st
+            outs.append((branch, self.call_func(branch, address, args, kwargs, node, operands=True, star_tail=tail)))
+        return outs[0][1] if len(outs) == 1 else self._merge_branches(st, outs)
+
     def call_method(self, st: State, recv: V, name, args, kwargs, node, *, special=False, operands=False) -> V:
+        if any(st.heap[a].kind == "generator" for a in recv.refs):
+            raise Unsupported("generator continuation/protocol is not modelled", node)
         if recv.top:
             raise Unsupported(f"method call on an unknown value: .{name}", node)
         outs = []
@@ -6089,18 +9123,31 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         for a in others:
             ob = st.heap[a]
             if ob.kind not in ("inst", "class") and not (
-                    self._try_stack and self._try_routes_builtin_raise(st, ob, name, args, kwargs)):
+                    self._try_stack and (
+                        self._try_routes_builtin_raise(st, ob, name, args, kwargs) or
+                        (ob.kind, name, len(args), bool(kwargs)) in _TRY_METHOD_ALLOWLIST and
+                        isinstance(node, ast.Call) and not node.keywords)):
                 self._in_try_refuse(f"{ob.kind}.{name} (builtin method raises are not routed)", node)
             s2 = st.copy() if nalts > 1 else st
-            if ob.kind == "list":
+            if (isinstance(ob, NamedTupleObj) and not special
+                    and name in st.heap[next(iter(ob.type_v.refs))].fields):
+                field = self.attr_load(s2, V(refs=frozenset({a})), name, node)
+                outs.append((s2, self.call(s2, field, args, kwargs, node)))
+            elif ob.kind == "list":
                 outs.append((s2, self.list_method(s2, frozenset({a}), name, args, kwargs, node)))
             elif ob.kind == "array":
                 outs.append((s2, self.array_method(s2, frozenset({a}), name, args, kwargs, node)))
             elif ob.kind == "dict":
                 outs.append((s2, self.dict_method(s2, a, name, args, kwargs, node)))
+            elif ob.kind == 'textwrapper':
+                outs.append((s2, self.textwrapper_method(s2, frozenset({a}), name, args, kwargs, node)))
             elif ob.kind == "stringio":
                 # [internal ref]: io.StringIO methods (write/getvalue/read/seek/tell).
                 outs.append((s2, self.stringio_method(s2, a, name, args, kwargs, node)))
+            elif ob.kind == "readfile":
+                outs.append((s2, self.readfile_method(s2, a, name, args, kwargs, node)))
+            elif ob.kind == "range" and name in {"count", "index"}:
+                outs.append((s2, self.visit_rule("range." + name, s2, [V(refs=frozenset({a}))] + list(args), kwargs, node)))
             elif ob.kind == "tuple":
                 outs.append((s2, self.tuple_method(s2, a, name, args, kwargs, node)))
             elif ob.kind == "outfile":
@@ -6125,6 +9172,14 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             bad = True
         if recv.s is not None and recv.i is None and not recv.b and not recv.f:
             outs.append((st, self.visit_rule("str." + name, st, [recv] + list(args), kwargs, node)))
+        elif (recv.i is not None or recv.b) and not recv.f and recv.s is None and name in {"bit_length", "bit_count", "conjugate", "is_integer", "as_integer_ratio"}:
+            if recv.refs or recv.st:
+                raise Unsupported("integer query with mixed object receivers", node)
+            outs.append((st, self.visit_rule("int." + name, st, [V(i=recv.i, b=recv.b)] + list(args), kwargs, node)))
+        elif recv.f and recv.i is None and not recv.b and recv.s is None and name in {"conjugate", "is_integer", "as_integer_ratio"}:
+            if recv.refs or recv.st:
+                raise Unsupported("float query with mixed object receivers", node)
+            outs.append((st, self.visit_rule("float." + name, st, [V(f=recv.f)] + list(args), kwargs, node)))
         elif recv.i is not None or recv.b or recv.f or recv.s is not None:
             raise Unsupported(f"method {name} of a builtin scalar", node)
         obj_node = node.func.value if isinstance(getattr(node, "func", None), ast.Attribute) else None
@@ -6171,7 +9226,13 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             if not (self._try_stack and recv.refs and all(
                     self._try_routes_builtin_raise(st, st.heap[a], ob.name, args, kwargs) for a in recv.refs)):
                 self._in_try_refuse(f"bound builtin .{ob.name} (its raises are not routed)", node)
+            if not recv.refs and (recv.i is not None or recv.b) and ob.name in {"bit_length", "bit_count", "conjugate", "is_integer", "as_integer_ratio"}:
+                return self.visit_rule("int." + ob.name, st, [recv] + list(args), kwargs, node)
+            if recv.f and not recv.refs and ob.name in {"conjugate", "is_integer", "as_integer_ratio"}:
+                return self.visit_rule("float." + ob.name, st, [recv] + list(args), kwargs, node)
             kinds = {st.heap[r].kind for r in recv.refs}
+            if kinds == {"range"} and ob.name in {"count", "index"}:
+                return self.visit_rule("range." + ob.name, st, [recv] + list(args), kwargs, node)
             if kinds == {"set"}:
                 return self.set_method(st, recv.refs, ob.name, args, kwargs, node)
             if kinds == {"array"}:
@@ -6179,6 +9240,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 # ``a.append`` through list_method skipped it (``m = a.append; m(0.1)`` on an 'f' array kept the exact
                 # 0.1, which CPython does not store)
                 return self.array_method(st, recv.refs, ob.name, args, kwargs, node)
+            if kinds == {'textwrapper'}:
+                return self.textwrapper_method(st, recv.refs, ob.name, args, kwargs, node)
+            if kinds == {'dict'} and ob.name=='__missing__' and len(recv.refs)==1:
+                return self.dict_method(st,next(iter(recv.refs)),ob.name,args,kwargs,node)
             if kinds == {"list"}:
                 return self.list_method(st, recv.refs, ob.name, args, kwargs, node)
             raise Unsupported(f"a bound method of {sorted(kinds)}", node)
@@ -6190,8 +9255,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         st.set_bottom()
         return BOT
 
-    def bind_args(self, st: State, fnode, fo: FuncObj, args, kwargs, node):
-        for value in [*args, *kwargs.values(), *fo.defaults, *fo.kwdefaults.values()]:
+    def bind_args(self, st: State, fnode, fo: FuncObj, args, kwargs, node, star_tail=None):
+        for value in [*args, *kwargs.values(), *fo.defaults, *fo.kwdefaults.values(), *fo.captures.values()]:
             self.borrow(st, value)
         a = fnode.args
         params = [p.arg for p in a.posonlyargs + a.args]
@@ -6232,12 +9297,55 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         if a.kwarg is not None:
             ka = self.alloc(st, node, lambda sid: DictObj(extra_keywords), "**kwargs")
             bound[a.kwarg.arg] = V(refs=frozenset({ka}))
-        if a.vararg is not None:
+        if a.vararg is not None and star_tail is not None:
+            # admitted by call_with_star_tail: every named positional parameter is filled by ``args``
+            tail_elem, lo, hi = star_tail
+            elem = tail_elem
+            for value in extra:
+                elem = vjoin(elem, st.zone, self.summarize(st, value), st.zone)
+            length = IntInfo.interval(len(extra) + lo, None if hi is None else len(extra) + hi)
+            ta = self.new_list(st, node, length, self.summarize(st, elem), tag="*args", kind="tuple")
+            bound[a.vararg.arg] = V(refs=frozenset({ta}))
+        elif a.vararg is not None:
             ta = self.new_list(st, node, None, BOT, tag="*args", kind="tuple", items=extra)
             bound[a.vararg.arg] = V(refs=frozenset({ta}))
         return bound, "arguments match the signature"
 
-    def call_func(self, st: State, faddr, args, kwargs, node, *, operands=False, keep=None) -> V:
+    def _primitive_tail_body(self, st, faddr, fo, bound):
+        if self._try_stack or fo.captures or fo.capture_frames:
+            return None
+        from .tail_loops import prepare, primitive
+        if not all(primitive(value) for value in bound.values()):
+            return None
+        cache = self.__dict__.setdefault('_primitive_tail_cache', {})
+        if self._clock() > self.deadline:
+            raise Unsupported('tail-call preparation time budget exhausted', fo.node)
+        if fo.node not in cache:
+            cache[fo.node] = prepare(fo.node)
+        prepared = cache[fo.node]
+        if prepared is None:
+            return None
+        body, names, modules = prepared
+        global_frame = st.frames[0]
+        key = self._global_key(fo.node.name, fo.module_key)
+        value = global_frame.env.get(key)
+        if key in global_frame.maybe_unbound or value is None or value.refs != frozenset({faddr}) or not value.replace(refs=frozenset()).is_bot():
+            return None
+        for name in names:
+            if self._clock() > self.deadline:
+                raise Unsupported('tail-call globals time budget exhausted', fo.node)
+            key = self._global_key(name, fo.module_key)
+            value = global_frame.env.get(key)
+            if key in global_frame.maybe_unbound or value is None:
+                return None
+            if name in modules:
+                if value.st != frozenset({('module', '_sv_verifier')}) or not value.replace(st=frozenset()).is_bot():
+                    return None
+            elif not primitive(value):
+                return None
+        return body
+
+    def call_func(self, st: State, faddr, args, kwargs, node, *, operands=False, keep=None, star_tail=None) -> V:
         """Run the user function ``faddr``.  ``operands`` is true for a call ``e_Call`` evaluated: the holders in
         the current scope are then that call's operands (and the ones ``bind_args`` adds for them), which are in
         the callee's frame once it is bound.  The frame is rewritten when an allocation demotes an object
@@ -6247,28 +9355,37 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         ``instantiate`` returns); the holders come back when the callee returns."""
         fo = st.heap[faddr]
         fnode = fo.node
+        for binding in fo.capture_frames.values():
+            if self._clock() > self.deadline:
+                raise Unsupported("closure call time budget exhausted", node)
+            self._closure_frame_index(st, binding, node)
         if fnode in self.active:
-            raise Unsupported("recursion", node)
-        if len(self.active) >= MAX_DEPTH:
-            raise Unsupported("call depth", node)
-        if _is_generator(fnode):
-            raise Unsupported("generator function", node)
-        bound, why = self.bind_args(st, fnode, fo, args, kwargs, node)
+            if self._try_stack:
+                # Runtime stack exhaustion is an additional exit, never a cut of the normal call.
+                self.check(node, "recursion-limit", {"RecursionError"}, False,
+                           "a recursive call may reach the runtime recursion limit", st=st)
+            if self._clock() > self.deadline:
+                raise Unsupported("recursive call time budget exhausted", node)
+        bound, why = self.bind_args(st, fnode, fo, args, kwargs, node, star_tail)
         self.check(node, "call-args", {"TypeError"}, bound is not None, why, st=st)
         if bound is None:
             st.set_bottom()
             return BOT
+        if _is_generator(fnode):
+            return self._new_generator(st, faddr, bound, node, operands=operands, keep=keep)
         if isinstance(fnode, ast.Lambda):
             if any(isinstance(n, ast.NamedExpr) for n in ast.walk(fnode.body)):
                 raise Unsupported("assignment expression in lambda", node)
             loc, glo = set(), set()
         else:
-            loc, glo = _assigned_names(fnode.body)
+            loc, glo = _assigned_names(fnode.body, allow_nonlocal=bool(fo.captures or fo.capture_frames))
+        tail_body = self._primitive_tail_body(st, faddr, fo, bound)
+        bound.update(fo.captures)
         loc |= set(bound)
-        # free variables of a nested function would be closures: not modelled
         # [internal ref]: a function's globals are fixed at DEFINITION time (its OWN file's module
         # namespace), never the caller's -- FuncObj.module_key carries that forward.
-        fctx = FuncCtx(fnode, loc, glo, module_key=fo.module_key)
+        fctx = FuncCtx(fnode, loc, glo, module_key=fo.module_key, capture_frames=fo.capture_frames)
+        fctx.activation = self._bump()
         st.frames.append(Frame(f"c{len(st.frames)}"))
         for k, v in bound.items():
             self.write_var(st, len(st.frames) - 1, k, v)
@@ -6278,8 +9395,11 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             held.clear()
             if keep is not None:
                 held.update(addr[0] for addr in keep.refs if addr[1] == "r")
-        self.callstring.append((node.lineno, node.col_offset,
-                                getattr(node, "end_lineno", None), getattr(node, "end_col_offset", None)))
+        callsite = (node.lineno, node.col_offset,
+                    getattr(node, "end_lineno", None), getattr(node, "end_col_offset", None))
+        if (unit := getattr(node, EVAL_SITE_ATTR, None)) is not None:
+            callsite += (unit,)
+        self.callstring.append(callsite)
         self.active.append(fnode)
         saved_forced, self._forced_draws = self._forced_draws, {}   # a pending case-split force is not the callee's
         saved_epoch = self.epoch
@@ -6296,7 +9416,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 st.set_bottom()
                 end = st
             else:
-                end = self.exec_block(fnode.body, st, fctx, None)
+                end = self.exec_block(tail_body if tail_body is not None else fnode.body, st, fctx, None)
         finally:
             self._fctx_stack.pop()
             self.callstring.pop()
@@ -6346,6 +9466,27 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         _assign_state(st, res_s)
         return res_v
 
+    def _new_generator(self, st, faddr, bound, node, *, operands, keep):
+        keys = tuple(bound)
+        saved = tuple(self.summarize(st, bound[k]) for k in keys)
+        pin = len(st.pins)
+        st.pins += (V(refs=frozenset({faddr})), *saved)
+        held = self.borrowed[-1]
+        holders = set(held) if operands else None
+        if operands:
+            held.clear()
+            if keep is not None:
+                held.update(addr[0] for addr in keep.refs if addr[1] == "r")
+        try:
+            # Pins are rewritten if this allocation demotes an older generator.
+            address = self.alloc(st, node, lambda sid: GeneratorObj(
+                st.pins[pin], dict(zip(keys, st.pins[pin + 1:]))), "generator")
+            return V(refs=frozenset({address}))
+        finally:
+            st.pins = st.pins[:pin]
+            if holders is not None:
+                held.update(holders)
+
     def _bump(self):
         self.tmp += 1
         return self.tmp
@@ -6364,6 +9505,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
 
     def instantiate(self, st: State, caddr, args, kwargs, node, operands=False) -> V:
         co = st.heap[caddr]
+        if isinstance(co, NamedTupleClassObj):
+            return self._namedtuple_construct(st, caddr, co, args, kwargs, node)
         # reject unmodelled class machinery along the MRO
         a = caddr
         exc_base = None
@@ -6375,9 +9518,22 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             if "__exc_base__" in c.attrs:
                 exc_base = next(iter(c.attrs["__exc_base__"].st))[1]
             a = c.bases[0] if c.bases else None
+        if getattr(co, "abstracts", None):
+            self.check(node, "abstract-instantiation", {"TypeError"}, False,
+                       "ABC has unimplemented abstract methods", st=st)
+            st.set_bottom()
+            return BOT
         if exc_base is not None and not self._plain_exception_constructor(exc_base):
             self._in_try_refuse(f"{exc_base} constructor inherited by {co.name}", node)
-        inst = self.alloc(st, node, lambda sid: InstObj(caddr, {}), "inst:" + co.name)
+        exc_args = None
+        if exc_base is not None and self._plain_exception_constructor(exc_base):
+            # Consume the same constructor contract before executing a source __init__.
+            native = self.visit_rule(exc_base, st, args, {}, node)
+            if st.bottom:
+                return BOT
+            exc_args = st.heap[next(iter(native.refs))].args
+            self.borrow(st, exc_args)
+        inst = self.alloc(st, node, lambda sid: InstObj(caddr, {}, exc_args=exc_args), "inst:" + co.name)
         iv = V(refs=frozenset({inst}))
         init = self.class_lookup(st, caddr, "__init__")
         if init is None:
@@ -6459,6 +9615,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return BOT
 
     def static_attr(self, st: State, tag, name, node) -> V:
+        if tag in (('cfunc','collections','defaultdict'),('mfunc','collections','defaultdict')) and name=='__missing__':
+            return V(st=frozenset({('cbuiltin','collections.defaultdict.__missing__')}))
+        if tag[0] == 'exc' and name == '__name__':
+            return const_str(tag[1])
         if tag[0] == "native-flag":
             raise Unsupported("re.RegexFlag attribute is not modelled",node)
         if tag[0] in {"abstract-pattern", "abstract-match", "native-regex"}:
@@ -6476,6 +9636,15 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                     return result
                 raise Unsupported(f"{owner}.{name}: native attribute not represented", node)
             raise Unsupported(f"{qualname}: attribute has no rule or model", node)
+        if tag in {("type", "int"), ("type", "bool")} and name in {"bit_length", "bit_count", "conjugate", "is_integer", "as_integer_ratio"}:
+            return V(st=frozenset({("cbuiltin", "int." + name)}))
+
+        if tag == ("type", "float") and name in {"conjugate", "is_integer", "as_integer_ratio"}:
+            return V(st=frozenset({("cbuiltin", "float." + name)}))
+        if tag[0] == 'type' and self._division_rule(tag[1]+'.'+name):
+            return V(st=frozenset({('cbuiltin',tag[1]+'.'+name)}))
+        if tag in {("builtin", "range"), ("type", "range")} and name in {"count", "index"}:
+            return V(st=frozenset({("cbuiltin", "range." + name)}))
         if tag == ("type", "str"):
             from tharkun.solve.contracts.rules import get_rule
             if get_rule("str." + name) is not None:
@@ -6489,6 +9658,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         raise Unsupported(f"attribute {name} of {tag}", node)
 
     def module_attr(self, st: State, mod: str, name: str, node, fctx=None) -> V:
+        if mod == 'abc' and name in {'ABC', 'abstractmethod'}:
+            return V(st=frozenset({('abc-base',) if name == 'ABC' else ('abc-abstractmethod',)}))
         if mod == "builtins" and name in {"format", "repr", "ascii", "str"}:
             return self.builtin_name(name, node)
         if mod == "re":
@@ -6527,7 +9698,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         # [internal ref]: read-and-recurse -- `mod` names nothing MODULES or a contract
         # covers, so it may instead be an alias bound to a file this program's own
         # sys.path.insert(0, D) makes reachable (extern.py's conditions (a)-(e)).
-        return self._extern_attr(st, name, node, fctx)
+        return self._extern_attr(st, mod, name, node, fctx)
 
     # ---------------------------------------------------------- [internal ref]: read-and-recurse
     def _extern_resolver(self):
@@ -6547,8 +9718,14 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 # Absint may consume calls covered by these real native modules.
                 # Keep the general determinism allowlist unchanged: this Resolver
                 # only establishes import/name metadata for the absint transfer.
+                from tharkun.solve.extern import _task_import_closure
+                task_root = None
+                if any(os.path.basename(path) == "__init__.py" for path in self.declared_files):
+                    closure = _task_import_closure(self.filename, _packages=True)
+                    if closure and set(closure) <= set(map(os.path.abspath, self.declared_files)):
+                        task_root = os.path.dirname(os.path.abspath(self.filename))
                 r = Resolver(self.tree, DET_MODULES | native_module_names(), filename=self.filename,
-                             _declared_files=self.declared_files)
+                             _declared_files=self.declared_files, _task_root=task_root)
                 self._ext_resolver = r
                 self._ext_by_key = {x.filename: x for x in r.all_resolvers()}
                 self._ext_by_key[""] = r
@@ -6565,11 +9742,47 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         key = fctx.module_key if fctx is not None else ""
         return self._ext_by_key.get(key)
 
-    def _extern_attr(self, st: State, name: str, node, fctx) -> V:
+    def _extern_attr(self, st: State, mod: str, name: str, node, fctx) -> V:
         gov = self._governing_resolver(fctx)
         if gov is None:
             return V(top=True)
-        return self._bind_value(st, gov, name, node)
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == name:
+                    local = alias.asname or alias.name
+                    origin = gov.imports.modules.get(local)
+                    if origin is not None and local in gov.externs:
+                        parent = gov.externs.get(f"$parent:{local}")
+                        if parent is not None and not self._ensure_extern_loaded(st, parent):
+                            raise Unsupported("parent package does not complete", node)
+                        sub = gov.externs[local]
+                        if not self._ensure_extern_loaded(st, sub):
+                            raise Unsupported("imported submodule does not complete", node)
+                        return V(st=frozenset({("module", f"$extern:{sub.filename}")}))
+                    return self._bind_value(st, gov, local, node)
+            return V(top=True)
+        # Module values retain their logical name through aliases and argument binding.
+        # Refuse ambiguous origins instead of resolving an AST spelling in the caller.
+        sources = {sub.filename: sub for resolver in self._ext_by_key.values()
+                   for alias, sub in resolver.externs.items()
+                   if resolver.imports.modules.get(alias) == mod}
+        if mod.startswith("$extern:") and mod[8:] in self._ext_by_key:
+            sub = self._ext_by_key[mod[8:]]
+            sources = {sub.filename: sub}
+        if len(sources) != 1:
+            return V(top=True)
+        sub = next(iter(sources.values()))
+        if not self._ensure_extern_loaded(st, sub):
+            raise Unsupported(f"imported source module {mod!r} does not complete", node)
+        if name in sub.submodules:
+            child = sub.submodules[name]
+            if not self._ensure_extern_loaded(st, child):
+                raise Unsupported("imported submodule does not complete", node)
+            return V(st=frozenset({("module", f"$extern:{child.filename}")}))
+        key = self._global_key(name, sub.filename)
+        if key in st.frames[0].maybe_unbound or key not in st.frames[0].env:
+            raise Unsupported(f"source module attribute {mod}.{name} is not bound", node)
+        return st.frames[0].env[key]
 
     def _bind_value(self, st: State, gov, name: str, node=None) -> V:
         """The value ``name`` (as ``gov``'s own file binds it, via import) resolves to, or
@@ -6681,9 +9894,21 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                     and len(node.args) == 1 and not node.keywords and not isinstance(node.args[0], ast.Starred)
                     and (args[0].only_int() or args[0].kinds() in (["bool"], ["float"])))
         if name == "divmod":
-            return (not kwargs and isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id == "divmod" and len(node.args) == 2 and not node.keywords
-                    and len(args) == 2 and all(v.only_int() for v in args))
+            return True  # the visitor validates closed operand kinds and conversion before routing
+        if name.startswith('heapq.'):
+            from ..contracts.rules_heapq import NATIVE_HEAP_NAMES
+            return name.split('.')[1] in NATIVE_HEAP_NAMES
+        if name == 'string.capwords':
+            bound=dict(zip(('s','sep'),args))
+            if len(args)>2 or any(k not in ('s','sep') or k in bound for k in kwargs):
+                return False
+            bound.update(kwargs)
+            text=bound.get('s',BOT);sep=bound.get('sep',NONE)
+            return (text.s is not None and text.replace(s=None).is_bot() and
+                    (sep.n and sep.replace(n=False).is_bot() or sep.s is not None and sep.replace(s=None).is_bot()))
+        if name == 'str.__getitem__':
+            return (len(args)==2 and not kwargs and args[0].s is not None
+                    and args[0].replace(s=None).is_bot() and exact_int_value(args[1]))
         if name in ("str.index", "str.rindex"):
             if kwargs or len(args) != 2:
                 return False
@@ -6692,7 +9917,14 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                    for v in (receiver, needle)):
                 return False
             return all(sub not in text for text in receiver.s for sub in needle.s)
-        if name in ("int", "float"):
+        if name == 'array.array':
+            return self._array_bad_typecode(args,kwargs) is not None
+        if name == 'random.seed':
+            params=('a','version')
+            return len(args)<=2 and all(k in params and k not in params[:len(args)] for k in kwargs)
+        if name == 'int':
+            return self._int_literal_options(st,args,kwargs) is not None
+        if name == "float":
             if (kwargs or len(args) != 1 or not isinstance(node, ast.Call) or node.keywords
                     or len(node.args) != 1 or not isinstance(node.args[0], ast.Constant)
                     or type(node.args[0].value) is not str):
@@ -6747,11 +9979,35 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
 
     def call_static(self, st: State, tag, args, kwargs, node) -> V:
         kind = tag[0]
+        if kind == 'abc-abstractmethod':
+            bound = self._bind_call(st, node, args, kwargs, 'abc.abstractmethod', ('funcobj',), ('funcobj',))
+            if bound is None:
+                return BOT
+            value = bound['funcobj']
+            if (value.top or not value.replace(refs=frozenset()).is_bot() or len(value.refs) != 1):
+                raise Unsupported("abstractmethod requires one exact source function", node)
+            addr = next(iter(value.refs))
+            if addr[1] != 'r' or type(st.heap[addr]) is not FuncObj:
+                raise Unsupported("abstractmethod of a summary or non-function", node)
+            st.heap[addr] = st.heap[addr].replace(abstract=True)
+            return value
         if kind not in ("exc", "excinst") and not (
+                (tag[:3] == ('mfunc', 'math', 'sqrt') and (self._nonraising_sqrt_call(st, 'math.sqrt', args, kwargs) or self._primitive_numeric_call('math.sqrt', args, kwargs))) or
+                (tag[:3] == ('mfunc','array','array') and self._primitive_valueerror_call(st,'array.array',args,kwargs,node)) or
+                (tag[:3] == ('mfunc','random','seed') and self._primitive_valueerror_call(st,'random.seed',args,kwargs,node)) or
+                (kind == 'cbuiltin' and (self._division_rule(tag[1]) or tag[1]=='collections.defaultdict.__missing__')) or
                 (tag[:2] in (("cbuiltin", "chr"), ("builtin", "range"), ("type", "int"), ("type", "float"),
                              ("cbuiltin", "divmod"), ("cbuiltin", "round"))
                  and self._primitive_valueerror_call(st, tag[1], args, kwargs, node))
-                or (tag[:2] == ("builtin", "print") and self._nonraising_print_call(st, tag[1], args, kwargs, node))):
+                or (kind=='cfunc' and tag[1]=='heapq'
+                    and self._primitive_valueerror_call(st,'heapq.'+tag[2],args,kwargs,node))
+                or (kind=='cfunc' and tag[1:3]==('string','capwords')
+                    and self._primitive_valueerror_call(st,'string.capwords',args,kwargs,node))
+                or (kind in {"builtin", "type", "cbuiltin"} and self._primitive_numeric_call(tag[1], args, kwargs))
+                or (tag[:2] == ('builtin', 'type') and len(args) == 1 and not kwargs)
+                or (tag[:2] == ("builtin", "print") and self._nonraising_print_call(st, tag[1], args, kwargs, node))
+                or (self._try_stack and kind in {"builtin", "type", "cbuiltin"}
+                    and self._generator_primitive_call(tag[1], args, kwargs))):
             self._in_try_refuse(f"{'.'.join(map(str, tag[:3]))} (static callable raises are not routed)", node)
         if kind == "native-method":
             return self.visit_rule(tag[1], st, [V(st=frozenset({tag[2]}))] + list(args), kwargs, node)
@@ -6771,6 +10027,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 raise Unsupported("except* / ExceptionGroup is not modelled", node)
             if not self._plain_exception_constructor(tag[1]):
                 self._in_try_refuse(f"{tag[1]} constructor", node)
+            if self._plain_exception_constructor(tag[1]):
+                return self.visit_rule(tag[1], st, args, kwargs, node)
             self.check(node, "call-args", {"TypeError"}, not kwargs,
                        "builtin exception constructor takes no keywords", st=st)
             if kwargs:
@@ -6798,6 +10056,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             return self.visit_rule(f"{tag[1]}.{tag[2]}", st, args, kwargs, node)
         if kind == "cbuiltin":
             from tharkun.solve.contracts.adapters.common import BUILTIN_SHAPE_CONTRACTS
+            if tag[1] == "open":
+                from tharkun.solve.environment import open_effect
+                if open_effect(node) == "read":
+                    return self.visit_rule("open.read", st, args, kwargs, node)
 
             return self.visit_rule(BUILTIN_SHAPE_CONTRACTS.get(tag[1], tag[1]), st, args, kwargs, node)
         raise Unsupported(f"call of {tag}", node)
@@ -6809,7 +10071,11 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         from tharkun.solve.contracts.rules import Refused, get_rule
 
         safe_print = self._nonraising_print_call(st, qualname, args, kwargs, node)
-        if self._try_stack and not (self._primitive_valueerror_call(st, qualname, args, kwargs, node) or safe_print):
+        if self._try_stack and not (self._plain_exception_constructor(qualname) or self._division_rule(qualname) or qualname=='collections.defaultdict.__missing__'
+                                   or self._primitive_valueerror_call(st, qualname, args, kwargs, node) or safe_print
+                                   or self._nonraising_sqrt_call(st, qualname, args, kwargs)
+                                   or self._primitive_numeric_call(qualname, args, kwargs)
+                                   or self._generator_primitive_call(qualname, args, kwargs)):
             # [internal ref]: a rule's non-property raises (the ValueError of str.index, ...) are not routed to handlers
             self._in_try_refuse(f"{qualname} (a contract rule: its non-property raises are not routed)", node)
         rule = get_rule(qualname)
@@ -6824,7 +10090,58 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         result = rule.accept(self.visitor, CallCtx(st, tuple(args), dict(kwargs), node))
         if isinstance(result, Refused):
             raise Unsupported(str(result), node)
+        if self._value_equalities and qualname in {"str.upper", "str.__getitem__", "str.join"}:
+            result = self._string_call_recipe(qualname, st, args, kwargs, result)
         return result
+
+    def _string_call_recipe(self, qualname, st, args, kwargs, result):
+        """Capture pure string results after their normal-return contract transfer."""
+        if (st.bottom or kwargs or not args or args[0].kinds() != ["str"]
+                or result.kinds() != ["str"] or result.value_term is not None
+                or (result.s != ANY_STR and len(result.s) == 1)):
+            return result
+        from .equality import Recipe
+        if qualname == 'str.join':
+            if len(args) != 2 or args[1].kinds() != ['obj'] or len(args[1].refs) != 1:
+                return result
+            obj = st.heap[next(iter(args[1].refs))]
+            if type(obj) is not TupleObj or obj.items is None or any(v.kinds() != ['str'] for v in obj.items):
+                return result
+            if not obj.items:
+                from .equality import literal
+                return result.replace(value_term=literal(''))
+            separator = self._string_term(args[0])
+            term = self._string_term(obj.items[0])
+            for value in obj.items[1:]:
+                if self._clock() >= self.deadline:
+                    raise Unsupported('string join recipe time budget exhausted')
+                term = Recipe('str', 'Add', (Recipe('str', 'Add', (term, separator)), self._string_term(value)))
+            return result.replace(value_term=term)
+        parent = self._string_term(args[0])
+        if qualname == 'str.upper' and len(args) == 1:
+            return result.replace(value_term=Recipe('str', 'str.upper', (parent,)))
+        if qualname != 'str.__getitem__' or len(args) != 2:
+            return result
+        key, bounds = args[1], None
+        if len(key.st) == 1 and key.replace(st=frozenset()).is_bot():
+            tag = next(iter(key.st))
+            if len(tag) == 2 and tag[0] == 'native-slice' and type(tag[1]) is slice:
+                sl = tag[1]
+                if all(x is None or type(x) in (int, bool) for x in (sl.start, sl.stop, sl.step)):
+                    step = 1 if sl.step is None else sl.step
+                    if step:
+                        start = 0 if sl.start is None and step > 0 else sl.start
+                        bounds = (start, sl.stop, step)
+        elif key.replace(i=None, b=frozenset()).is_bot():
+            index = self._as_int(st, key)
+            if index is not None:
+                lo, hi = self.ibounds(st, index)
+                if lo is not None and lo == hi:
+                    # A successful negative last index needs an open stop, not zero.
+                    bounds = (lo, None if lo == -1 else lo + 1, 1)
+        if bounds is None:
+            return result
+        return result.replace(value_term=Recipe('str', 'str.slice', (parent,), bounds))
 
     def _native_string_search_valueerror(self, qualname: str, st: State, node) -> V:
         """Route definite str.index/rindex absence only after the callable rule is admitted."""
@@ -6911,8 +10228,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         contract = _contracts.contract_for_builtin(qualname)
         if contract is None:
             raise Unsupported(f"{qualname} has no tested contract", node)
+        if qualname in ('random.seed','array.array') and (contract.returns is None or not contract.returns.tested):
+            raise Unsupported(f'{qualname}: no tested return contract',node)
         result, proven = self._modelled(st, node, qualname, model, args, kwargs, _MODULE_HOOKS[qualname])
-        self._contract_checks(node, qualname, contract, proven)
+        self._contract_checks(node, qualname, contract, proven,recorded={'TypeError'} if qualname=='random.seed' and self._try_stack else ())
         return result
 
     def _contract_builtin_call(self, st: State, name: str, args, kwargs, node) -> V:
@@ -6931,17 +10250,19 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         from tharkun.solve.contracts.adapters import absint as _contracts
 
         if not (self._primitive_valueerror_call(st, name, args, kwargs, node)
-                or self._nonraising_print_call(st, name, args, kwargs, node)):
+                or self._primitive_numeric_call(name, args, kwargs)
+                or self._nonraising_print_call(st, name, args, kwargs, node)
+                or (self._try_stack and self._generator_primitive_call(name, args, kwargs))):
             self._in_try_refuse(f"{name}() (a contract-driven call: its non-property raises are not routed)", node)
         contract = _contracts.contract_for_builtin(name)
         if contract is None:
             raise Unsupported(f"{name}() has no tested contract", node)
         checks = dict((exc, (ok, fact)) for exc, ok, fact in _contracts.raise_checks(contract))
         result, proven = getattr(self, "c_" + name)(st, args, kwargs, node)
-        self._contract_checks(node, name, contract, proven)
+        self._contract_checks(node, name, contract, proven,recorded={'TypeError','ZeroDivisionError'} if name=='divmod' else ())
         return result
 
-    def _contract_checks(self, node, op: str, contract, proven, lean: bool = False) -> None:
+    def _contract_checks(self, node, op: str, contract, proven, lean: bool = False, recorded=()) -> None:
         """Record the seven property-class checks of a contract-driven call: every class is as the
         contract states it (``raise_checks``: proven only for a TESTED ``never``), and only the
         classes ``proven`` (class -> why) are upgraded by what the model knows of THESE abstract
@@ -6952,6 +10273,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             checks[exc] = ((True, f"contract+model: {fact}") if fact is not None else
                            (False, "the model found a failing check of this call: the contract's never covers its tested shape"))
         for exc, (ok, fact) in checks.items():
+            if exc in recorded:
+                continue  # the model already recorded/routed this exact obligation at its original site
             if lean and ok:
                 continue
             if self._try_stack and exc in proven and proven[exc] is None:
@@ -7030,7 +10353,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             if isinstance(ob, DefaultDictObj) and op == "__getitem__":
                 qualname = f"collections.defaultdict.{op}"
             else:
-                qualname = f"{ob.kind}.{op}" if ob.kind in ("list", "tuple", "dict") else None
+                kind = "list" if a[0][-1] == "frozen list" else ob.kind
+                qualname = f"{kind}.{op}" if kind in ("list", "tuple", "dict") else None
             if qualname in _METHOD_HOOKS and qualname not in out:
                 out.append(qualname)
         return out
@@ -7086,6 +10410,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
 
         if open_effect(node) != "output":
             raise Unsupported("open: not a write-only constant mode", node)
+        self._world_mutated = True
         names = ("file", "mode", "buffering", "encoding", "errors", "newline")
         given = dict(zip(names, args))
         given.update(kwargs)
@@ -7105,12 +10430,130 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 v = given[what]
                 if v.top or v.refs or v.st or v.i is not None or v.b or v.f:
                     raise Unsupported(f"open: {what} of an unknown type", node)
+        for what, supported in (
+            ('encoding', {'ascii', 'usascii', 'utf8', 'utf8sig', 'latin1', 'iso88591',
+                          'utf16', 'utf16le', 'utf16be', 'utf32', 'utf32le', 'utf32be'}),
+            ('errors', {'strict', 'ignore', 'replace', 'backslashreplace', 'xmlcharrefreplace',
+                        'namereplace', 'surrogateescape', 'surrogatepass'}),
+        ):
+            value=given.get(what)
+            if value is not None and value.s is not None and (value.s==ANY_STR or any(
+                    name.lower().replace('-', '').replace('_', '') not in supported for name in value.s)):
+                raise Unsupported(f'open: custom/unknown {what} has no builtin no-callback summary',node)
         if binary and any(w in given for w in ("encoding", "errors", "newline")):
             raise Unsupported("open: a binary mode with a text option", node)
         if ok:
             proven["TypeError"] = "the path is a str and every option is a str or None"
         addr = self.alloc(st, node, lambda sid: OutFileObj(binary), "outfile")
         return V(refs=frozenset({addr})), proven
+
+    def c_world_open(self, st, args, kwargs, node):
+        """Exact declared text, otherwise arbitrary text or an unhandled non-property raise."""
+        import io
+        import os
+        from tharkun.solve.environment import open_effect
+        from tharkun.solve.world import WorldStore
+        from tharkun.lattice import Origin
+        from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES
+
+        if self._try_stack:
+            raise Unsupported("world open: OSError/decoding exception handlers are not modelled", node)
+        if not 1 <= len(args) <= 2 or set(kwargs) - {"mode", "encoding", "errors", "newline"}:
+            raise Unsupported("world open: unsupported call shape", node)
+        if len(args) == 2 and "mode" in kwargs:
+            raise Unsupported("world open: duplicate mode", node)
+        mode = args[1] if len(args) == 2 else kwargs.get("mode", const_str("r"))
+        if mode != const_str("r") and mode != const_str("rt"):
+            raise Unsupported("world open: only read-only text mode is modelled", node)
+        path = args[0]
+        if path.top or path.s is None or path.refs or path.st or path.i is not None or path.b or path.f or path.n:
+            raise Unsupported("world open: path must be a str", node)
+        # A write could invalidate a declared snapshot; generated-file proofs need a later heap model.
+        if getattr(self, "_world_mutated", False) or any(isinstance(n, ast.Call) and (
+                (isinstance(n.func, ast.Name) and n.func.id == "open" and open_effect(n) == "output")
+                or (isinstance(n.func, ast.Attribute) and n.func.attr in
+                    {"write", "writelines", "write_text", "write_bytes", "unlink", "remove", "rename", "replace", "truncate"}))
+               for n in ast.walk(self.tree)):
+            raise Unsupported("world read after possible file mutation", node)
+        options = {}
+        for name in ("encoding", "errors", "newline"):
+            value = kwargs.get(name, NONE)
+            if value == NONE:
+                options[name] = None
+            elif value.s is not None and value.s != ANY_STR and len(value.s) == 1 and value == const_str(next(iter(value.s))):
+                options[name] = next(iter(value.s))
+            else:
+                raise Unsupported(f"world open: {name} must be a constant str or None", node)
+        if self.world is None:
+            self.world = WorldStore()
+        elif not hasattr(self.world, "objects"):
+            self.world = WorldStore(self.world)
+        content = ANYSTR
+        if path.s != ANY_STR and len(path.s) == 1:
+            name = next(iter(path.s))
+            key = os.path.abspath(os.path.join(os.path.dirname(self.filename), name))
+            obj = self.world.get(name) or self.world.get(key)
+            if obj is not None and obj.kind != "file":
+                raise Unsupported("world open: a stream is not a file path", node)
+            if obj is None and key in {os.path.abspath(p) for p in self.declared_files}:
+                from tharkun.solve.world import WorldObject
+                try:
+                    with open(key, "rb") as stream:
+                        obj = WorldObject(key, stream.read(), mode="declared")
+                except OSError as exc:
+                    raise Unsupported(f"world open: cannot snapshot declared file: {exc}", node) from exc
+                self.world.objects[key] = obj
+            if obj is not None and obj.mode in {"policy", "declared"}:
+                try:
+                    with io.TextIOWrapper(io.BytesIO(obj.concrete), **options) as stream:
+                        text = stream.read()
+                    content = const_str(text)
+                    # The text snapshot is checked here; refinement must never rewrite proof input.
+                    if obj.concrete.decode("utf-8") == text:
+                        obj.add(f"content == {text!r}", Origin("absint", node.lineno))
+                except (UnicodeError, ValueError, LookupError) as exc:
+                    raise Unsupported(f"world open: cannot decode declared file: {exc}", node) from exc
+        addr = self.alloc(st, node, lambda sid: ReadFileObj(content), "readfile")
+        return V(refs=frozenset({addr})), {exc: "read-only world open with a str path and exact text options"
+                                         for exc in ALL_PROPERTY_CLASSES}
+
+    def readfile_method(self, st, addr, name, args, kwargs, node):
+        ob = st.heap[addr]
+        if self._try_stack:
+            raise Unsupported("world file: exception handlers are not modelled", node)
+        if name == "__enter__" and not args and not kwargs:
+            if True in ob.closed:
+                raise Unsupported("entering a possibly closed world file", node)
+            return V(refs=frozenset({addr}))
+        if name in {"close", "__exit__"}:
+            if kwargs or (name == "close" and args) or (name == "__exit__" and len(args) != 3):
+                raise Unsupported("world file close: unsupported shape", node)
+            self.update_obj(st, frozenset({addr}), lambda ob, strong: ReadFileObj(
+                ob.content, frozenset({True}) if strong else ob.closed | {True}))
+            return NONE
+        if name not in {"read", "readline"} or len(args) > 1 or kwargs:
+            raise Unsupported(f"world file: unsupported {name}", node)
+        if True in ob.closed:
+            raise Unsupported("reading a possibly closed world file", node)
+        size = -1
+        if args:
+            iv = self._as_int(st, args[0]) if exact_int_value(args[0]) else None
+            bounds = self.ibounds(st, iv) if iv is not None else (None, None)
+            if bounds[0] is None or bounds[0] != bounds[1]:
+                raise Unsupported("world read: size must be an exact int", node)
+            size = bounds[0]
+        content, remaining = ANYSTR, ANYSTR
+        if ob.content.s != ANY_STR:
+            import io
+            reads, tails = set(), set()
+            for text in ob.content.s:
+                stream = io.StringIO(text, newline="")
+                reads.add(getattr(stream, name)(size))
+                tails.add(stream.read())
+            content, remaining = V(s=frozenset(reads)), V(s=frozenset(tails))
+        self.update_obj(st, frozenset({addr}), lambda old, strong: ReadFileObj(
+            remaining if strong else vjoin(old.content, st.zone, remaining, st.zone), old.closed))
+        return content
 
     def c_ord(self, st, args, kwargs, node):
         """``ord(c)``: TypeError iff ``c`` is not a str (or bytes/bytearray) of length 1; the
@@ -7292,6 +10735,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 self.update_obj(st, addrs, lambda ob, s: self.set_len(
                     st, ob.replace(elem=V(top=True)), s, None, 0, None))
 
+        if qualname == "io.BytesIO":
+            # Keep the factory's unknown raise claims; only its returned buffer becomes precise.
+            return self._new_stream(st, args, kwargs, node, binary=True)
         kind = _contracts.simple_return_kind(contract)
         if kind == "float":
             return FLOAT
@@ -7300,6 +10746,25 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         if kind == "bool":
             return BOOL
         return V(top=True)
+
+    def _copy_deepcopy_atomic_args(self, args, kwargs) -> bool:
+        if len(args) != 1 or kwargs:
+            return False
+        value = args[0]
+        return not (value.is_bot() or value.top or value.refs or value.st or value.f)
+
+    def _copy_deepcopy_atomic(self, st, args, kwargs, node):
+        from tharkun.solve.contracts.adapters.absint import contract_for_builtin
+
+        contract = contract_for_builtin('copy.deepcopy')
+        if contract is None or contract.returns is None or not contract.returns.tested:
+            raise Unsupported('copy.deepcopy requires its tested atomic return contract', node)
+        if not self._arity(node, args, kwargs, 1, 1, 'copy.deepcopy'):
+            st.set_bottom()
+            return BOT
+        self.check(node, 'deepcopy-atomic', {'AttributeError'}, True,
+                   'exact atomic input with no supplied memo: no memo lookup or keep-alive access')
+        return self.mat(st, args[0])
 
     def _copy_copy_list_receiver(self, st, args, kwargs) -> bool:
         if len(args) != 1 or kwargs:
@@ -7364,6 +10829,133 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         self.check(node, "arg-type", {"TypeError"}, ok, f"{what} argument: " + ",".join(v.kinds()))
         return ok
 
+    def t_bool(self, st, args, kwargs, node):
+        return self.visit_rule('bool', st, args, kwargs, node)
+
+    def c_bool(self, st, args, kwargs, node):
+        return self._modelled(st, node, 'bool', self._bool_model, args, kwargs,
+                              'builtin truth or the analyzed length protocol; unsupported truth hooks refuse')
+
+    def _bool_model(self, st, args, kwargs, node):
+        if not self._arity(node, args, kwargs, 0, 1, 'bool'):
+            st.set_bottom()
+            return BOT
+        if not args:
+            return const_bool(False)
+        yes, no = self.truth_split(st, args[0], node)
+        return self._merge_branches(st, [(yes, const_bool(True)), (no, const_bool(False))])
+
+    def c_hasattr(self, st, args, kwargs, node):
+        result, proven = self._modelled(
+            st, node, 'hasattr', self._hasattr_model, args, kwargs,
+            'only canonical scalar metadata and authenticated hook-free attribute lookup are admitted')
+        # A caught lookup failure is not an escaping failure of hasattr itself.
+        proven['AttributeError'] = 'every lookup AttributeError is consumed by hasattr'
+        return result, proven
+
+
+    def _hasattr_model(self, st, args, kwargs, node):
+        if not self._arity(node, args, kwargs, 2, 2, 'hasattr'):
+            st.set_bottom()
+            return BOT
+        obj, names = args
+        if obj.top or names.top:
+            raise Unsupported('hasattr requires represented receiver and name kinds', node)
+        self.check(node, 'arg-type', {'TypeError'}, names.s is not None and names.replace(s=None).is_bot(),
+                   'hasattr attribute name is a builtin str', st=st)
+        if names.s is None:
+            st.set_bottom()
+            return BOT
+        if names.s == ANY_STR:
+            raise Unsupported('hasattr requires represented attribute-name alternatives', node)
+        from tharkun.solve.contracts.safety.rules_protocols import _INSTANCE_ATTRS
+
+        scalar = obj.replace(refs=frozenset(), st=frozenset())
+        objects = V(refs=obj.refs, st=obj.st)
+        outs = []
+        fctx = self._fctx_stack[-1]
+        for name in sorted(names.s):
+            if self._clock() > self.deadline:
+                raise Unsupported('hasattr lookup time budget exhausted', node)
+            for kind in scalar.val.kinds.names:
+                outs.append((st.copy(), const_bool(name in _INSTANCE_ATTRS[kind])))
+            if objects.is_bot():
+                continue
+            state = st.copy()
+            frame = _TryFrame(node, fctx, None, None, True)
+            self._try_stack.append(frame)
+            try:
+                self.attr_load(state, objects, name, node)
+            finally:
+                self._try_stack.pop()
+            if not state.bottom:
+                outs.append((state, const_bool(True)))
+            for exc in frame.raised:
+                if self._is_subclass(exc.st, exc.cls, 'AttributeError'):
+                    outs.append((self._leave_handler(None, exc.val, exc.st, fctx), const_bool(False)))
+                else:
+                    self._route_exc(exc, fctx)
+        return self._merge_branches(st, outs)
+
+
+    def c_callable(self, st, args, kwargs, node):
+        return self._modelled(st, node, 'callable', self._callable_model, args, kwargs,
+                              'tp_call inspection never invokes target attribute or call hooks')
+
+    def _callable_model(self, st, args, kwargs, node):
+        if not self._arity(node, args, kwargs, 1, 1, 'callable'):
+            st.set_bottom()
+            return BOT
+        value = args[0]
+        possible = {True, False} if value.top else set()
+        if not value.replace(refs=frozenset(), st=frozenset(), top=False).is_bot():
+            possible.add(False)
+        yes = {'builtin', 'cbuiltin', 'mfunc', 'cfunc', 'type', 'exc', 'native-method', 'contract-callable'}
+        no = {'module', 'excinst', 'native-flag', 'native-slice', 'native-regex', 'abstract-pattern', 'abstract-match'}
+        for tag in value.st:
+            possible.update({True} if tag[0] in yes else {False} if tag[0] in no else {True, False})
+        for addr in value.refs:
+            obj = st.heap[addr]
+            if obj.kind in {'func', 'bmeth', 'bimeth', 'class'}:
+                possible.add(True)
+            elif obj.kind == 'inst':
+                possible.add(self.class_lookup(st, obj.cls, '__call__') is not None)
+            else:
+                possible.add(False)
+        return V(b=frozenset(possible))
+
+    def c_bin(self, st, args, kwargs, node):
+        return self._base_spelling(st, args, kwargs, node, 'bin')
+
+    def c_hex(self, st, args, kwargs, node):
+        return self._base_spelling(st, args, kwargs, node, 'hex')
+
+    def c_oct(self, st, args, kwargs, node):
+        return self._base_spelling(st, args, kwargs, node, 'oct')
+
+    def _base_spelling(self, st, args, kwargs, node, name):
+        def model(st, args, kwargs, node):
+            if not self._arity(node, args, kwargs, 1, 1, name):
+                st.set_bottom()
+                return BOT
+            value = args[0]
+            if not exact_int_value(value):
+                if value.i is not None or value.b or not hook_free_value(st, value):
+                    raise Unsupported(f'{name}: mixed or unmodelled __index__ operands', node)
+                self.check(node, 'arg-type', {'TypeError'}, False, f'{name} requires __index__', st=st)
+                st.set_bottom()
+                return BOT
+            self.check(node, 'arg-type', {'TypeError'}, True, 'exact builtin int/bool conversion', st=st)
+            from .native import concrete, abstract
+            from tharkun.solve.contracts.rules import get_rule
+            values = concrete(self, st, value)
+            # shortcut: large/nonfinite integers retain only str type; add digit facts when needed.
+            if values is not None and all(type(x) in {int, bool} and x.bit_length() <= 4096 for x in values):
+                return abstract(self, st, [get_rule(name).native(x) for x in values], node)
+            return ANYSTR
+        return self._modelled(st, node, name, model, args, kwargs,
+                              'accepted exact builtin int/bool values run no __index__ callback')
+
     def b_abs(self, st, args, kwargs, node):
         return self.visit_rule("abs", st, args, kwargs, node)
 
@@ -7405,6 +10997,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             # A sign flip or a mixed/unknown sign has no "negated" lemma term, so
             # the term is dropped there, same as for a fresh, untermed value.
             term = fa.term if fa.fact.has_interval() and fa.fact.lo >= 0.0 else None
+            if not res.nan and res.lo == res.hi == 0.0:
+                term = ("zero-sign", False)  # abs clears either IEEE zero sign.
             why = fa.why if term is not None else ""
             out = vjoin(out, st.zone, V(f=FloatInfo(res, term, why)), st.zone)
         if out.is_bot():
@@ -7418,6 +11012,40 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return self._modelled(st, node, "len", lambda st, args, kwargs, node: self._len_model(st, args, kwargs, node, "protocol.container_len"),
                               args, kwargs, "an instance's __len__ body is analysed (special); a builtin container runs no hook")
 
+    def _string_length_form(self, st, value):
+        """Length of an immutable str recipe, with opaque values kept distinct."""
+        names = getattr(self, '_string_length_names', None)
+        if names is None:
+            names = self._string_length_names = {}
+        forms, pending = {}, [(value.value_term, False)]
+        while pending:
+            if self._clock() > self.deadline:
+                raise Unsupported('string length query time budget exhausted')
+            current, ready = pending.pop()
+            if current in forms:
+                continue
+            if current.kind != 'str':
+                return None
+            if current.op == 'Add' and len(current.args) == 2:
+                if not ready:
+                    pending.append((current, True))
+                    pending.extend((arg, False) for arg in reversed(current.args))
+                    continue
+                forms[current] = forms[current.args[0]].add(forms[current.args[1]])
+            elif current.op == 'literal' and type(current.data) is str:
+                forms[current] = Lin.const(len(current.data))
+            else:
+                # Retaining recipe keys prevents identity reuse by later draws.
+                if current not in names:
+                    names[current] = 'g:\x00strlen=' + str(len(names))
+                name = names[current]
+                st.zone.add(ZERO, name, 0)
+                forms[current] = Lin.var(name)
+        form = forms[value.value_term]
+        if form.single() is None and st.zone.affine is None:
+            st.zone.enable_affine(self._clock, self.deadline)
+        return form
+
     def _len_model(self, st, args, kwargs, node, protocol=None):
         """``len(x)`` as the analyzer models it; the implicit ``len`` of a truth value and of a length probe (``truth_split``,
         ``_probe_length``) is this model, not the call a program writes.  ``protocol`` is the rule the length of an instance is read
@@ -7426,11 +11054,16 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             st.set_bottom()
             return BOT
         v = args[0]
+        if len(v.st) == 1 and v.replace(st=frozenset(), top=False).is_bot():
+            tag = next(iter(v.st))
+            if tag[0] == "bytes_const":
+                return const_int(len(tag[1]))
         if v.top:
             raise Unsupported("len of an unknown value", node)
         bad = bool(v.i is not None or v.b or v.f or v.n or v.st)
         out = BOT
         set_lens = []
+        dict_lens = []
         for a in v.refs:
             ob = st.heap[a]
             if ob.kind in ("list", "tuple", "array"):
@@ -7440,8 +11073,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             elif ob.kind == "range":
                 raise Unsupported("len(range)", node)
             elif ob.kind in ("dict", "dictview"):
-                lo, hi = self.dict_len(st, {a} if ob.kind == "dict" else ob.dicts)
-                out = vjoin(out, st.zone, int_iv(lo, hi), st.zone)
+                dict_lens.append(self.dict_len(st, {a} if ob.kind == "dict" else ob.dicts))
             elif ob.kind == "set":
                 set_lens.append(ob.length)
             elif ob.kind == "inst":
@@ -7467,6 +11099,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 return self.visit_protocol(protocol, node, length, _PROTOCOL_NATIVE[protocol])
             else:
                 bad = True
+        if dict_lens:
+            his = [hi for _lo, hi in dict_lens]
+            ii = IntInfo.interval(min(lo for lo, _hi in dict_lens), None if None in his else max(his))
+            out = vjoin(out, st.zone, V(i=self.to_temp(st, ii)), st.zone)
         if set_lens:
             # the bounds over every set it may be, copied into ONE temporary as a list's length is (a comparison
             # against it is then decided in the zone; two temporaries would join to no bound at all)
@@ -7475,12 +11111,202 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             out = vjoin(out, st.zone, V(i=self.to_temp(st, ii)), st.zone)
         if v.s is not None:
             lengths = [len(x) for x in v.s] if v.s != ANY_STR else None
-            out = vjoin(out, st.zone, int_iv(min(lengths), max(lengths)) if lengths else int_iv(0, None), st.zone)
+            string_length = int_iv(min(lengths), max(lengths)) if lengths else int_iv(0, None)
+            if (self.record and self._value_equalities and v.kinds() == ['str']
+                    and v.s == ANY_STR and v.value_term is not None):
+                form = self._string_length_form(st, v)
+                if form is not None:
+                    string_length = V(i=IntInfo(form, (ZERO, 0), None))
+            out = vjoin(out, st.zone, string_length, st.zone)
         self.check(node, "arg-type", {"TypeError"}, not bad, "len of " + ",".join(v.kinds()))
         if out.is_bot():
             st.set_bottom()
         return out
 
+
+    def c_map(self, st, args, kwargs, node):
+        return self._modelled(st, node, 'map', self._identity_map_model, args, kwargs,
+                              'capturing a source callback and exact literal iterable executes no callback or target hook')
+
+    def _identity_map_model(self, st, args, kwargs, node):
+        from .map_identity import model
+        return model(self, st, args, kwargs, node)
+
+    def c_enumerate(self, st, args, kwargs, node):
+        return self._modelled(st, node, 'enumerate', self._enumerate_model, args, kwargs,
+                              'native sources and primitive integer starts execute no target hooks')
+
+    def _enumerate_model(self, st, args, kwargs, node):
+        bound = dict(zip(('iterable', 'start'), args))
+        valid = len(args) <= 2 and not (set(kwargs) - {'iterable', 'start'})
+        valid = valid and not (set(bound) & set(kwargs))
+        bound.update(kwargs)
+        valid = valid and 'iterable' in bound
+        self.check(node, 'call-args', {'TypeError'}, valid, 'enumerate argument binding', st=st)
+        if not valid:
+            st.set_bottom()
+            return BOT
+        source, start = bound['iterable'], bound.get('start', const_int(0))
+        if (start.top or start.refs or start.st or start.n or start.f or start.s is not None):
+            raise Unsupported('enumerate start is not a primitive integer', node)
+        info = self._as_int(st, start)
+        if info is None:
+            raise Unsupported('enumerate start integer is unrepresented', node)
+        self.check(node, 'start-index', {'TypeError'}, True, 'native int/bool start', st=st)
+        if source.top or source.st or any(st.heap[a].kind not in (
+                'list', 'tuple', 'array', 'range', 'dict', 'dictview', 'set', 'iterator')
+                for a in source.refs):
+            raise Unsupported('enumerate source may run an unmodelled callback', node)
+        self.check_iterable(st, source, node)
+        # Future source rebinding cannot change enumerate's already captured start.
+        snapshot = self._const_bounds(st, V(i=info), '')
+        address = self.alloc(st, node, lambda sid: EnumerateObj(source, snapshot), 'enumerate')
+        return V(refs=frozenset({address}))
+
+    def _enumerate_row(self, st, obj, node, *, exists=False):
+        source = obj.source
+        _, ceiling, caps = self._zip_source_bounds(st, source, node, prefix=True)
+        if (len(source.refs) == 1 and source.replace(refs=frozenset()).is_bot()
+                and type(st.heap[next(iter(source.refs))]) is ZipObj):
+            field = self._zip_row(st, next(iter(source.refs)), node)
+        else:
+            field = self.elem_summary(st, source)
+        if field is None or ceiling == 0:
+            return None
+        lo, start_hi = self.ibounds(st, obj.start.i)
+        hi = None if start_hi is None or ceiling is None else start_hi + ceiling - 1
+        index = int_iv(lo, hi)
+        if exists and start_hi is not None and caps:
+            # This is an upper bound shared by rows, never their common index value.
+            upper = self.fresh(st)
+            for cap in caps:
+                variable, offset = cap.single()
+                st.zone.add(upper, variable, offset + start_hi - 1)
+            index = V(i=IntInfo(None, None if lo is None else (ZERO, lo), (upper, 0)))
+        address = self.new_list(st, node, None, BOT, tag='enumerate-row', kind='tuple',
+                                items=[index, field])
+        self.demote(st, address[0])
+        return V(refs=frozenset({(address[0], 's')}))
+
+    def _enumerate_materialize(self, st, obj, node, kind):
+        row = self._enumerate_row(st, obj, node)
+        length = IntInfo.interval(0, 0) if row is None else None
+        address = self.new_list(st, node, length, row or BOT, tag=kind, kind=kind)
+        return V(refs=frozenset({address}))
+
+    def c_zip(self, st, args, kwargs, node):
+        return self._modelled(st, node, "zip", self._zip_model, args, kwargs,
+                              "only builtin sources and primitive strict truth are accepted")
+
+    def _zip_model(self, st, args, kwargs, node):
+        if set(kwargs) - {'strict'}:
+            self.check(node, 'call-args', {'TypeError'}, False, 'zip only accepts strict', st=st)
+            st.set_bottom()
+            return BOT
+        self.check(node, 'call-args', {'TypeError'}, True, 'zip call shape is valid', st=st)
+        strict_value = kwargs.get('strict', const_bool(False))
+        if strict_value.top or strict_value.refs or strict_value.st:
+            raise Unsupported('zip strict truth may run an unmodelled callback', node)
+        strict_true, _ = self.truth_split(st, strict_value, node)
+        for value in args:
+            if self._clock() >= self.deadline:
+                raise Unsupported('zip construction analysis budget exhausted', node)
+            if value.top or value.st or any(st.heap[a].kind not in (
+                    'list', 'tuple', 'array', 'range', 'dict', 'dictview', 'set', 'iterator')
+                    for a in value.refs):
+                raise Unsupported('zip source may run an unmodelled iterator callback', node)
+            # A possible TypeError must not erase a mixed value's valid normal arm.
+            self.check_iterable(st, value, node)
+        address = self.alloc(st, node, lambda sid: ZipObj(args, not strict_true.bottom), 'zip')
+        return V(refs=frozenset({address}))
+
+    def _zip_row(self, st, address, node):
+        obj = st.heap[address]
+        st.heap[address] = obj.replace(fresh=False)
+        if obj.strict:
+            self._in_try_refuse('strict zip may raise ValueError when consumed', node)
+            self.check(node, 'zip-strict', {'ValueError'}, False,
+                       'strict zip source lengths may differ', st=st)
+        if not obj.sources:
+            return None
+        fields = []
+        for source in obj.sources:
+            if self._clock() >= self.deadline:
+                raise Unsupported('zip row analysis budget exhausted', node)
+            field = self.elem_summary(st, source)
+            if field is None:
+                return None
+            fields.append(field)
+        address = self.new_list(st, node, None, BOT, tag='zip-row', kind='tuple', items=fields)
+        # One summary represents many distinct native row tuples, never one fresh identity.
+        self.demote(st, address[0])
+        return V(refs=frozenset({(address[0], 's')}))
+
+    def _zip_source_bounds(self, st, value, node, *, prefix=False, seen=frozenset()):
+        """Length caps; prefix caps require a native monotone sequence cursor."""
+        if value.top or not value.replace(refs=frozenset(), s=None).is_bot():
+            return 0, None, ()
+        cases = []
+        if value.s is not None:
+            if value.s == ANY_STR:
+                cases.append((0, None, ()))
+            else:
+                sizes = [len(text) for text in value.s]
+                lo, hi = min(sizes), max(sizes)
+                cases.append((lo, hi, (Lin.const(hi),)))
+        for address in value.refs:
+            if self._clock() >= self.deadline:
+                raise Unsupported('zip length analysis budget exhausted', node)
+            if address in seen:
+                return 0, None, ()
+            obj = st.heap[address]
+            caps = ()
+            if type(obj) is IteratorObj:
+                _, hi, caps = self._zip_source_bounds(st, obj.source, node, prefix=prefix, seen=seen | {address})
+                lo = 0
+            elif type(obj) is ZipObj and prefix:
+                _, hi, caps = self._zip_bounds(st, obj, node, prefix=True, seen=seen | {address})
+                lo = 0
+            elif obj.kind in ('list', 'tuple', 'array', 'range'):
+                length, (lo, hi) = (self._range_len(st, obj) if obj.kind == 'range' else self.len_lin(st, obj))
+                if length is not None and length.single() is not None:
+                    caps = (length,)
+            elif not prefix and obj.kind in ('dict', 'dictview'):
+                lo, hi = self.dict_len(st, {address} if obj.kind == 'dict' else obj.dicts)
+            elif not prefix and obj.kind == 'set':
+                lo, hi = obj.length
+            else:
+                lo, hi = 0, None
+            cases.append((lo or 0, hi, caps))
+        if not cases:
+            return 0, None, ()
+        lo = min(row[0] for row in cases)
+        hi = None if any(row[1] is None for row in cases) else max(row[1] for row in cases)
+        return lo, hi, cases[0][2] if len(cases) == 1 else ()
+
+    def _zip_bounds(self, st, obj, node, *, prefix=False, seen=frozenset()):
+        if not obj.sources:
+            return 0, 0, (Lin.const(0),)
+        bounds = [self._zip_source_bounds(st, source, node, prefix=prefix, seen=seen) for source in obj.sources]
+        lo = min(row[0] for row in bounds) if obj.fresh and not prefix else 0
+        uppers = [row[1] for row in bounds if row[1] is not None]
+        return lo, min(uppers) if uppers else None, tuple(cap for row in bounds for cap in row[2])
+
+    def _zip_materialize(self, st, source, node, kind):
+        obj = st.heap[source]
+        lo, hi, caps = self._zip_bounds(st, obj, node)
+        sid = self.sid(self.site(node, kind))
+        caps = [self.detach(st, V(i=IntInfo(cap)), sid).i for cap in caps]
+        row = self._zip_row(st, source, node)
+        length = IntInfo.interval(0, 0) if row is None else IntInfo.interval(lo, hi)
+        address = self.new_list(st, node, length, row or BOT, tag=kind, kind=kind)
+        result = st.heap[address]
+        for cap in caps:
+            bound = cap.lin.single() if cap.lin is not None else None
+            if bound is not None and isinstance(result.length, str):
+                variable, offset = bound
+                st.zone.add(result.length, variable, offset)
+        return V(refs=frozenset({address}))
 
     def b_iter(self, st, args, kwargs, node):
         if len(args) == 2 and not kwargs:
@@ -7672,6 +11498,96 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             "an instance's __iter__ body is analysed (iterable()) and its __len__ probe is ruled by protocol.length_hint; "
             "a builtin iterable runs no hook")
 
+    def c_collections_namedtuple(self, st, args, kwargs, node):
+        from tharkun.solve.contracts.adapters.absint import contract_for_builtin
+        contract = contract_for_builtin("collections.namedtuple")
+        if contract is None or contract.returns is None or not contract.returns.tested:
+            raise Unsupported("namedtuple needs its tested class return contract", node)
+        return self._contract_module_model("collections.namedtuple", st, self._namedtuple_model, args, kwargs, node)
+
+    def _namedtuple_fixed_items(self, st, value, node, expression=None):
+        if len(value.refs) != 1 or not value.replace(refs=frozenset()).is_bot():
+            raise Unsupported("namedtuple needs a fixed builtin sequence", node)
+        addr = next(iter(value.refs))
+        obj = st.heap[addr]
+        if obj.kind == "tuple" and obj.items is not None:
+            return obj.items
+        # Anonymous literal strings cannot be aliased or mutated by later call operands.
+        if (type(obj) is ListObj and addr == (self.site(expression, "list"), "r")
+                and isinstance(expression, ast.List)
+                and all(isinstance(x, ast.Constant) and type(x.value) is str for x in expression.elts)):
+            return tuple(const_str(x.value) for x in expression.elts)
+        if type(obj) is ListObj and self.len_lin(st, obj)[1] == (0, 0):
+            return ()
+        raise Unsupported("namedtuple list positions are not known", node)
+
+    def _namedtuple_model(self, st, args, kwargs, node):
+        import keyword
+        import unicodedata
+        options = {name: kwargs[name] for name in ("rename", "defaults", "module") if name in kwargs}
+        rest = {k: v for k, v in kwargs.items() if k not in options}
+        bound = self._bind_call(st, node, args, rest, "collections.namedtuple", ("typename", "field_names"),
+                                ("typename", "field_names"))
+        if bound is None:
+            return BOT
+        def string(value):
+            if value.s is None or value.s == ANY_STR or len(value.s) != 1 or not value.replace(s=None).is_bot():
+                raise Unsupported("namedtuple requires known builtin string declarations", node)
+            return next(iter(value.s))
+        typename = string(bound["typename"])
+        ok, rename = self.exact_constant(st, options.get("rename", const_bool(False)))
+        if not ok or type(rename) not in (bool, int, str, float, type(None)):
+            raise Unsupported("namedtuple rename truth is not known without hooks", node)
+        module = options.get("module", NONE)
+        if module != NONE:
+            string(module)
+        value = bound["field_names"]
+        if value.s is not None and value.replace(s=None).is_bot():
+            fields = string(value).replace(",", " ").split()
+        else:
+            expression = None
+            if isinstance(node, ast.Call):
+                if len(node.args) >= 2 and not any(isinstance(x, ast.Starred) for x in node.args):
+                    expression = node.args[1]
+                for part in node.keywords:
+                    if part.arg == "field_names":
+                        expression = part.value
+            fields = [string(x) for x in self._namedtuple_fixed_items(st, value, node, expression)]
+        if rename:
+            seen = set()
+            for index, name in enumerate(fields):
+                if not name.isidentifier() or keyword.iskeyword(name) or name.startswith("_") or name in seen:
+                    name = f"_{index}"
+                seen.add(name)
+                fields[index] = name
+        if (not typename.isidentifier() or keyword.iskeyword(typename)
+                or len(set(fields)) != len(fields)
+                or any(not name.isidentifier() or keyword.iskeyword(name) or
+                       (name.startswith("_") and not rename) or unicodedata.normalize("NFKC", name) != name
+                       for name in fields)):
+            raise Unsupported("namedtuple identifier validation or normalization", node)
+        defaults = options.get("defaults", NONE)
+        defaults = () if defaults == NONE else self._namedtuple_fixed_items(st, defaults, node)
+        if len(defaults) > len(fields):
+            raise Unsupported("namedtuple has more defaults than fields", node)
+        for value in defaults:
+            self.borrow(st, value)
+        addr = self.alloc(st, node, lambda _sid: NamedTupleClassObj(typename, node, tuple(fields), tuple(defaults)),
+                          "namedtuple-type")
+        return V(refs=frozenset({addr}))
+
+    def _namedtuple_construct(self, st, address, cls, args, kwargs, node):
+        self._in_try_refuse("namedtuple argument errors are not routed", node)
+        count = len(cls.fields) - len(cls.defaults)
+        values = self._bind_call(st, node, args, kwargs, cls.name, cls.fields, cls.fields[:count])
+        if values is None:
+            return BOT
+        defaults = dict(zip(cls.fields[count:], cls.defaults))
+        items = tuple(self.borrow(st, self.summarize(st, values.get(name, defaults.get(name, BOT)))) for name in cls.fields)
+        type_v = self.borrow(st, V(refs=frozenset({address})))
+        result = self.alloc(st, node, lambda _sid: NamedTupleObj(items, type_v), "namedtuple")
+        return V(refs=frozenset({result}))
+
     def c_collections_defaultdict(self, st, args, kwargs, node):
         return self._contract_module_model("collections.defaultdict", st, self._defaultdict_model,
                                            args, kwargs, node)
@@ -7724,6 +11640,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             raise Unsupported(f"{kind}() of several possible iterables", node)
         src = next(iter(v.refs))
         ob = st.heap[src]
+        if type(ob) is ZipObj:
+            return self._zip_materialize(st, src, node, kind), iterable_ok
+        if type(ob) is EnumerateObj:
+            return self._enumerate_materialize(st, ob, node, kind), iterable_ok
         if ob.kind == "range":
             lin, iv = self._range_len(st, ob)
             ev = self.elem_summary(st, v) or BOT
@@ -7748,6 +11668,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             elem = self.elem_summary(st, v) or BOT
             return new(None, elem), iterable_ok
         if kind == "tuple" and ob.kind == "tuple":
+            if isinstance(ob, NamedTupleObj):
+                return new(None, BOT, items=ob.items), iterable_ok
             return V(refs=frozenset({src})), iterable_ok
         if ob.kind == "set":
             return new(IntInfo.interval(*ob.length), ob.elem), iterable_ok
@@ -7784,7 +11706,60 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
     def c_int(self, st, args, kwargs, node):
         return self._modelled(st, node, "int", self._int_model, args, kwargs, _NO_USER_DUNDER.format("__int__/__index__"))
 
+    def _int_literal_options(self, st, args, kwargs):
+        from .native import concrete, product
+        if len(args) not in (1,2) or set(kwargs)-{'base'} or len(args)==2 and kwargs:
+            return None
+        text = args[0]
+        if text.s is None or text.s == ANY_STR or not text.replace(s=None).is_bot():
+            return None
+        if any(len(s)>640 for s in text.s):
+            return None  # shortcut: longer literals may observe the process digit limit; model that state before extending
+        base = args[1] if len(args)==2 else kwargs.get('base',const_int(10))
+        if not exact_int_value(base):
+            return None
+        return product([list(text.s),concrete(self,st,base)], analyzer=self)
+
+    def _int_literal_model(self, st, options, node):
+        from ..contracts.registry import get
+        from ..contracts.rules import get_rule
+        contract,rule = get('int'),get_rule('int')
+        claims = {c.case:c for c in contract.other_raises if c.exc=='ValueError' and c.tested}
+        if not {'invalid-base','invalid-literal','digit-limit'} <= claims.keys():
+            raise Unsupported('int: no tested literal ValueError conditions and args',node)
+        self.check(node,'arg-type',{'TypeError'},True,'bounded exact str and primitive integer base bind without coercion hooks',st=st)
+        out=BOT
+        messages=set()
+        for text,base in options:
+            base=int(base)
+            case = 'invalid-base' if base!=0 and not 2<=base<=36 else 'invalid-literal'
+            valid = rule.literal_valid(text,base)
+            try:
+                value=int(text,base)
+            except ValueError as exc:
+                if valid:
+                    raise Unsupported('int: unexpected digit-limit error in bounded literal',node)
+                args=tuple(t.format(base=base,literal_repr=repr(text)[:200]) for t in claims[case].args_template)
+                if exc.args != args:
+                    raise Unsupported('int: literal diagnostic differs from tested contract',node)
+                messages.add(args[0])
+            else:
+                if not valid:
+                    raise Unsupported('int: native parse differs from tested lexical condition',node)
+                out=vjoin(out,st.zone,const_int(value),st.zone)
+        if messages:
+            payload=V(s=frozenset(messages))
+            self.check(node,'int:literal',{'ValueError'},False,'literal syntax or base is invalid',st=st,
+                       exact_args={'ValueError':(payload,)},contract_qualname='int')
+        if out.is_bot():st.set_bottom()
+        return out
+
     def _int_model(self, st, args, kwargs, node):
+        options=self._int_literal_options(st,args,kwargs)
+        if options is not None:
+            return self._int_literal_model(st,options,node)
+        if args and args[0].s is not None and args[0].s != ANY_STR and any(len(s)>640 for s in args[0].s):
+            raise Unsupported('int: long finite literal may observe the process digit limit',node)
         if len(args) == 2 or "base" in kwargs:
             raise Unsupported("int conversion with an explicit base", node)
         if not self._arity(node, args, kwargs, 0, 1, "int"):
@@ -7798,15 +11773,26 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                        "int() literal has no decimal digit", st=st)
             st.set_bottom()
             return BOT
-        if v.s is not None or v.f:
-            # int("x") raises ValueError, int(inf)/int(nan) OverflowError/ValueError: not property classes, the
-            # path continues on the accepted values; inside a try the handlers would see them ([internal ref]): refused
-            self._in_try_refuse("int() of a str or float (ValueError / OverflowError)", node)
+        if v.s is not None:
+            self._in_try_refuse("int() of a str (ValueError)", node)
+        if v.f and self._try_stack:
+            fact = v.f.fact
+            self.check(node, "int:float", {"ValueError"}, not fact.nan,
+                       "NaN cannot convert to int", st=st)
+            self.check(node, "int:float", {"OverflowError"}, not (fact.lo == -math.inf or fact.hi == math.inf),
+                       "infinity cannot convert to int", st=st)
         ok = not (v.n or v.refs or v.st or v.top)
         self.check(node, "arg-type", {"TypeError"}, ok, "int() argument")
         ii = self._as_int(st, v)
         out = V(i=ii) if ii is not None else BOT
-        if v.f or v.s is not None:
+        if v.s is not None and v.s != ANY_STR:
+            for text in v.s:
+                try:
+                    value = int(text)
+                except ValueError:
+                    continue  # unhandled non-property exception; try handlers were refused above
+                out = vjoin(out, st.zone, const_int(value), st.zone)
+        if v.f or v.s == ANY_STR:
             out = vjoin(out, st.zone, int_iv(None, None), st.zone)
         if out.is_bot():
             st.set_bottom()
@@ -7833,7 +11819,90 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 self._in_try_refuse("float() of a str (ValueError)", node)
             ok = not (v.n or v.refs or v.st or v.top)
             self.check(node, "arg-type", {"TypeError"}, ok, "float() argument", st=st)
+            if self._float_conversion_is_total(st, v):
+                return V(f=self.float_view(st, v))
+        else:
+            return V(f=FloatInfo(fv.FloatFact.const(0.0), ("zero-sign", False)))
         return FLOAT
+
+    def t_dict(self, st, args, kwargs, node):
+        return self.visit_rule('dict', st, args, kwargs, node)
+
+    def c_dict(self, st, args, kwargs, node):
+        return self._modelled(st, node, 'dict', self._dict_model, args, kwargs,
+                              'builtin mappings and tuple pairs with scalar keys run no target mapping, iteration, hash or equality hook')
+
+    def _dict_model(self, st, args, kwargs, node):
+        valid = len(args) <= 1
+        self.check(node, 'call-args', {'TypeError'}, valid, 'dict accepts at most one positional source', st=st)
+        if not valid:
+            st.set_bottom()
+            return BOT
+        copied = DictObj({})
+        entries = []
+
+        def pair(value):
+            if len(value.refs) != 1 or not value.replace(refs=frozenset()).is_bot():
+                raise Unsupported('dict: unmodelled iterable pair', node)
+            obj = st.heap[next(iter(value.refs))]
+            if type(obj) is not TupleObj or obj.items is None or len(obj.items) != 2:
+                raise Unsupported('dict: requires fixed two-item tuple pairs', node)
+            key, val = obj.items
+            self.check_hash_key(st, key, node)
+            return key, val
+
+        if args:
+            source = args[0]
+            if len(source.refs) != 1 or not source.replace(refs=frozenset()).is_bot():
+                raise Unsupported('dict: joined or non-builtin mapping/iterable source', node)
+            obj = st.heap[next(iter(source.refs))]
+            if type(obj) in (DictObj, DefaultDictObj):
+                copied = DictObj(dict(obj.items), obj.exact, obj.okeys, obj.ovals)
+            elif type(obj) in {ZipObj, EnumerateObj}:
+                self._in_try_refuse('lazy iterator consumption may raise non-property exceptions', node)
+                row = (self._zip_row(st, next(iter(source.refs)), node) if type(obj) is ZipObj
+                       else self._enumerate_row(st, obj, node))
+                if row is not None:
+                    key, val = pair(row)
+                    copied = DictObj({}, False, self.summarize(st, key), self.summarize(st, val))
+            elif type(obj) is TupleObj and obj.items is not None:
+                entries = [pair(value) for value in obj.items]
+            elif type(obj) is ListObj:
+                length, bounds = self.len_lin(st, obj)
+                lo, hi = lin_bounds(length, st.zone) if length is not None else bounds
+                if hi != 0:
+                    keys, values = BOT, BOT
+                    elem = self.all_elems(st, obj)
+                    if elem.is_bot():
+                        raise Unsupported('dict: pair list has no element summary', node)
+                    for value in self.alternatives(elem):
+                        key, val = pair(value)
+                        keys = self.join_into(st, keys, key)
+                        values = self.join_into(st, values, val)
+                    # shortcut: list pair order is summarized; add ordered facts when lookup proofs need them.
+                    constants = self.key_consts(st, keys)
+                    if lo is not None and lo >= 1 and constants is not None and len(constants) == 1:
+                        copied = DictObj({next(iter(constants)): self.summarize(st, values)})
+                    else:
+                        copied = DictObj({}, False, self.summarize(st, keys), self.summarize(st, values))
+            else:
+                raise Unsupported('dict: unmodelled mapping or iteration hook', node)
+        entries += [(const_str(key), val) for key, val in kwargs.items()]
+        # Captured fields are Python locals; borrow them before alloc can demote an older result.
+        for value in [*copied.values(), *(v for entry in entries for v in entry)]:
+            self.borrow(st, value)
+        addr = self.alloc(st, node, lambda sid: copied, 'dict-constructor')
+        result = V(refs=frozenset({addr}))
+        for key, val in entries:
+            self._subscript_store_model(st, result, ('index', key), val, node)
+        return result
+
+    def textwrapper_method(self, st, receivers, name, args, kwargs, node):
+        if name not in ('wrap', 'fill'):
+            value = self.attr_load(st, V(refs=receivers), name, node)
+            return self.call(st, value, args, kwargs, node)
+        return self.visit_method_rule('textwrap.TextWrapper.'+name,
+                                      MethodCtx(st, receivers, name, args, kwargs, node))
 
     def t_object(self, st, args, kwargs, node):
         raise Unsupported("object()", node)
@@ -7895,38 +11964,128 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
     def b_max(self, st, args, kwargs, node):
         return self.visit_rule("max", st, args, kwargs, node)
 
+    def c_pow(self, st, args, kwargs, node):
+        native = {}
+
+        def model(st, args, kwargs, node):
+            params = ('base', 'exp', 'mod')
+            bound = dict(zip(params, args))
+            valid = len(args) <= 3
+            for key, value in kwargs.items():
+                valid = valid and key in params and key not in bound
+                bound[key] = value
+            valid = valid and 'base' in bound and 'exp' in bound
+            self.check(node, 'arg-type', {'TypeError'}, valid, 'pow argument binding', st=st)
+            if not valid:
+                st.set_bottom()
+                return BOT
+            modulus = bound.get('mod', NONE)
+            if modulus.n and modulus.replace(n=False).is_bot():
+                return self.binop(st, ast.Pow(), bound['base'], bound['exp'], node)
+            if not all(exact_int_value(bound[name]) for name in params):
+                raise Unsupported('pow: three-argument form requires modelled builtin ints/bools', node)
+            mod_bounds = self.ibounds(st, self._as_int(st, modulus))
+            exp_lo, _ = self.ibounds(st, self._as_int(st, bound['exp']))
+            valid_mod = ((mod_bounds[0] is not None and mod_bounds[0] > 0)
+                         or (mod_bounds[1] is not None and mod_bounds[1] < 0))
+            self.check(node, 'pow:modulus', {'ValueError'}, valid_mod and exp_lo is not None and exp_lo >= 0,
+                       'nonzero modulus and nonnegative exponent exclude modular ValueError', st=st)
+            native['ZeroDivisionError'] = 'three-argument integer pow raises ValueError for zero modulus or failed inverse'
+            # shortcut: modular powers retain int type; add residue bounds when a caller needs them.
+            return int_iv(None, None)
+
+        return self._modelled(st, node, 'pow', model, args, kwargs,
+                              'two-argument hooks use the analyzed power protocol; modular operands are exact builtin ints/bools',
+                              native=native)
+
     def c_divmod(self, st, args, kwargs, node):
-        """Model direct ``divmod(int, int)`` calls with one call-site ZeroDivisionError check."""
-        if (kwargs or len(args) != 2 or not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name)
-                or node.func.id != "divmod" or len(node.args) != 2 or node.keywords
-                or any(not v.only_int() for v in args)):
-            raise Unsupported("divmod() requires two exact-int operands", node)
-        a, b = (v.i for v in args)
-        if a is None or b is None:
-            raise Unsupported("divmod() requires two exact-int operands", node)
-        facts = []
-        q, may_zero = self._int_binop(st, ast.FloorDiv(), a, b, node, facts)
-        r, _ = self._int_binop(st, ast.Mod(), a, b, node, facts)
-        lo, hi = self.ibounds(st, b)
-        definitely_zero = lo == hi == 0
-        a_lo, a_hi = self.ibounds(st, a)
-        if a_lo is not None and a_lo == a_hi and lo is not None and lo == hi and not definitely_zero:
-            q = const_int(a_lo // lo)
-            r = const_int(a_lo % lo)
-        proven = {exc: "exact builtin int operands run no user hook" for exc in PROPERTY_EXCS
-                  if exc != "ZeroDivisionError"}
-        if may_zero:
-            proven["ZeroDivisionError"] = None
-            if self._try_stack:
-                self.check(node, "divmod:ZeroDivisionError", {"ZeroDivisionError"}, False,
-                           "integer divisor may be zero", st=st)
-        else:
-            proven["ZeroDivisionError"] = "the integer divisor is nonzero"
-        if definitely_zero:
+        from ..contracts.registry import get
+        from .native import abstract, concrete, product
+        contract=get('divmod')
+        if contract is None or not contract.tested or contract.returns is None or not contract.returns.tested:
+            raise Unsupported('divmod: no tested return contract',node)
+        proven={exc:'closed native operands/binding execute no target hook' for exc in PROPERTY_EXCS}
+        def check(exc,ok,case=None,fact=''):
+            payload=({exc:self.contract_exception_args('divmod',exc,case,(),node)} if case else None)
+            self.check(node,'divmod:'+exc,{exc},ok,fact,st=st,exact_args=payload,contract_qualname='divmod')
+        if kwargs or len(args)!=2:
+            case='native-keywords' if kwargs else 'native-arity-'+str(len(args))
+            check('TypeError',False,case,'native divmod argument binding')
+            check('ZeroDivisionError',True,fact='binding fails before numeric protocols')
             st.set_bottom()
-            return BOT, proven
-        addr = self.new_list(st, node, None, BOT, tag="tuple", kind="tuple", items=[q, r])
-        return V(refs=frozenset({addr})), proven
+            return BOT,proven
+        def kinds(value):
+            if value.top or value.st:return None
+            out=set()
+            if value.i is not None:out.add('int')
+            if value.b:out.add('bool')
+            if value.f:out.add('float')
+            if value.s is not None:out.add('str')
+            if value.n:out.add('NoneType')
+            for address in value.refs:
+                ob=st.heap[address]
+                if type(ob) not in (ListObj,TupleObj,DictObj):return None
+                out.add(ob.kind)
+            return out
+        left,right=args;lk,rk=kinds(left),kinds(right)
+        if not lk or not rk:raise Unsupported('divmod: open operand protocol',node)
+        numeric={'int','bool','float'}
+        if not (lk<=numeric and rk<=numeric):
+            if any(x in numeric and y in numeric for x in lk for y in rk):
+                raise Unsupported('divmod: joined supported and unsupported operand kinds',node)
+            message=BOT
+            for x in lk:
+                for y in rk:
+                    payload=self.contract_exception_args('divmod','TypeError','native-types-'+x+'-'+y,(),node)
+                    message=vjoin(message,st.zone,payload[0],st.zone)
+            self.check(node,'divmod:TypeError',{'TypeError'},False,'native operand types are unsupported',st=st,
+                       exact_args={'TypeError':(message,)},contract_qualname='divmod')
+            check('ZeroDivisionError',True,fact='type dispatch fails before zero division')
+            st.set_bottom()
+            return BOT,proven
+        floating='float' in lk|rk
+        if floating:
+            if lk!={'float'} and rk!={'float'}:
+                raise Unsupported('divmod: joined integer and float result kinds',node)
+            for value in args:
+                ii=self._as_int(st,value)
+                if ii is not None:
+                    lo,hi=self.ibounds(st,ii)
+                    if lo is None or hi is None or max(abs(lo),abs(hi))>2**1023:
+                        raise Unsupported('divmod: int-to-float conversion may overflow before zero check',node)
+            qinfo,qraises,fact=self._float_binop(st,ast.FloorDiv(),self.float_view(st,left),self.float_view(st,right),node)
+            rinfo,rraises,_=self._float_binop(st,ast.Mod(),self.float_view(st,left),self.float_view(st,right),node)
+            q,r=V(f=qinfo),V(f=rinfo)
+            zero='ZeroDivisionError' in qraises|rraises
+            divisor=self.float_view(st,right).fact
+            if qinfo.fact.is_bottom() or rinfo.fact.is_bottom() or (not divisor.nan and divisor.lo==divisor.hi==0):q=r=BOT
+        else:
+            a,b=self._as_int(st,left),self._as_int(st,right)
+            facts=[]
+            q,zero=self._int_binop(st,ast.FloorDiv(),a,b,node,facts)
+            r,_=self._int_binop(st,ast.Mod(),a,b,node,facts)
+            lo,hi=self.ibounds(st,b)
+            if lo==hi==0:q=r=BOT
+            elif lo is not None and lo>0 and b.lin is not None and b.lin.single() is not None:
+                var,offset=b.lin.single()
+                r=V(i=IntInfo(None,(ZERO,0),(var,offset-1)))
+            fact='; '.join(facts)
+        rows=product([concrete(self,st,left),concrete(self,st,right)], analyzer=self)
+        if rows is not None and all(type(x) is not int or x.bit_length()<=4096 for row in rows for x in row):
+            outputs=[];zero=False
+            for row in rows:
+                try:outputs.append(divmod(*row))
+                except ZeroDivisionError:zero=True
+            result=abstract(self,st,outputs,node)
+        elif q.is_bot() or r.is_bot():result=BOT
+        else:
+            addr=self.new_list(st,node,None,BOT,tag='tuple',kind='tuple',items=[q,r])
+            result=V(refs=frozenset({addr}))
+        check('TypeError',True,fact='native numeric operands support divmod')
+        check('ZeroDivisionError',not zero,'native-zero' if zero else None,fact)
+        if result is None:raise Unsupported('divmod: native result is not represented',node)
+        if result.is_bot():st.set_bottom()
+        return result,proven
 
     def c_round(self, st, args, kwargs, node):
         """Model one direct ``round`` call on a built-in int, bool, or float."""
@@ -7982,7 +12141,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             self.check_formattable(st, a, node)
         for k, v in kwargs.items():
             if k == "file":
-                self._print_to_file(st, v, node)
+                self._print_to_file(st, v, args, kwargs, node)
                 continue
             if k not in ("sep", "end", "flush"):
                 raise Unsupported(f"print({k}=...)", node)
@@ -7996,39 +12155,52 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                            "separator/end must be str or None")
         return NONE
 
-    def _print_to_file(self, st: State, v: V, node) -> None:
-        """``print(..., file=X)`` ([internal ref]): sound only when every possible ``X``
-        is a modelled ``io.StringIO`` buffer -- writes the printed text into it,
-        coarsened to ``ANYSTR`` exactly like an explicit ``.write()`` call (see
-        ``StringIOObj``). Anything else (``sys.stdout``, a user file-like object, an
-        unknown or mixed value) is Unsupported: this pass models exactly one file-like
-        kind, and guessing "print(file=X) never raises" for an unmodelled X would risk
-        missing whatever ``X.write()`` itself can do."""
+    def _print_to_file(self, st: State, v: V, args, kwargs, node) -> None:
         if v.top or v.i is not None or v.b or v.f or v.s is not None or v.n or v.st:
             raise Unsupported("print(file=...) with an unmodelled destination", node)
-        addrs = frozenset(a for a in v.refs if a in st.heap and st.heap[a].kind == "stringio")
-        if addrs != v.refs:
+        addrs = frozenset(a for a in v.refs if a in st.heap and st.heap[a].kind == "stringio" and not st.heap[a].binary)
+        if not addrs or addrs != v.refs:
             raise Unsupported("print(file=...) with an unmodelled destination", node)
-        self.update_obj(st, addrs, lambda ob, strong: StringIOObj(ANYSTR))
+        values = [self.exact_constant(st, a) for a in args]
+        sep = self.exact_constant(st, kwargs.get("sep", const_str(" ")))
+        end = self.exact_constant(st, kwargs.get("end", const_str("\n")))
+        exact = all(ok for ok, value in [*values, sep, end]) and all(
+            type(value) in (str, type(None)) for ok, value in (sep, end))
+        text = ((" " if sep[1] is None else sep[1]).join(str(value) for ok, value in values)
+                + ("\n" if end[1] is None else end[1])) if exact else None
+        for addr in addrs:
+            ob = st.heap[addr]
+            if ob.closed != frozenset({False}):
+                raise Unsupported("print to a possibly closed stream", node)
+        def written(ob, strong):
+            if ob.stream is not None and text is not None:
+                stream, result = ob.stream.project("write", text)
+                return self._stream_obj(stream)
+            return ob.replace(content=ANYSTR, stream=None, position=None)
+        self.update_obj(st, addrs, written)
 
     #: the builtin class names an ``isinstance`` classinfo may carry, and the scalar kinds each is a class of
     _ISINSTANCE_SCALARS = {"int": ("int", "bool"), "bool": ("bool",), "float": ("float",), "str": ("str",)}
 
     def _classinfo(self, st: State, t: V, node, names: set, classes: set, depth: int = 0) -> None:
         """Collect what the second argument of ``isinstance`` names: builtin class names (``str``, ``int``,
-        ``float``, ``bool``, ``list``, ``tuple``, ``object``) into ``names``, user class addresses into ``classes``;
+        ``float``, ``bool``, ``list``, ``tuple``, ``dict``, ``object``) into ``names``, user class addresses into ``classes``;
         a tuple of those is every one of them.  Anything else (an unknown value, a scalar, an exception class, a
         tuple that is a summary) refuses: it may be a TypeError, or a class whose instance check this model
         does not know."""
+        if depth and len(t.st) + len(t.refs) != 1:
+            raise Unsupported("joined nested classinfo cannot be flattened as a fixed tuple", node)
         if t.top or t.i is not None or t.b or t.f or t.s is not None or t.n or depth > 3:
             raise Unsupported("isinstance with an unsupported type argument", node)
         if not t.st and not t.refs:
             raise Unsupported("isinstance with an unsupported type argument", node)
         for tag in t.st:
-            if tag[0] == "type" and tag[1] in ("str", "int", "float", "bool", "list", "object"):
+            if tag[0] == "type" and tag[1] in ("str", "int", "float", "bool", "list", "dict", "object"):
                 names.add(tag[1])
             elif tag == ("cbuiltin", "tuple"):
                 names.add("tuple")
+            elif tag == ('cfunc', 'textwrap', 'TextWrapper'):
+                names.add('textwrap.TextWrapper')
             else:
                 raise Unsupported("isinstance with an unsupported type argument", node)
         for a in t.refs:
@@ -8041,6 +12213,64 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             else:
                 raise Unsupported("isinstance with an unsupported type argument", node)
 
+    def b_type(self, st, args, kwargs, node):
+        """``type(x)`` for a value whose exact classes are known: the class of each alternative, as the static class
+        tag ``("type", name)`` of ``int``/``bool``/``float``/``str``/``list``/``dict`` (``("cbuiltin", "tuple")``, the
+        tag the name ``tuple`` already has) or, for an instance of a class of the program, that class's address.  A
+        union of alternatives is the union of their classes.  Python's ``type`` is the object's real type, not its
+        ``__class__`` attribute, but an instance that carries a ``__class__`` of its own or whose class defines one
+        refuses (as ``isinstance`` does), and so does everything whose type this model does not name: ``None``, a
+        function, a class object (its type is a metaclass), an exception instance or class, a set, an iterator, an
+        array, a defaultdict.  ``type(name, bases, dict)`` creates a class and refuses; any other arity is the
+        ``TypeError`` of CPython."""
+        if kwargs:
+            raise Unsupported("type() with keyword arguments", node)
+        if len(args) == 3:
+            raise Unsupported("type(name, bases, dict) creates a class", node)
+        if len(args) != 1:
+            self.check(node, "call-args", {"TypeError"}, False, "type() takes 1 or 3 arguments", st=st)
+            st.set_bottom()
+            return BOT
+        v = args[0]
+        if v.top or v.is_bot() or v.st:
+            raise Unsupported("type of an unmodelled value", node)
+        tags: set = set()
+        classes: set = set()
+        for kind in v.kinds():
+            if kind in ("int", "bool", "float", "str"):
+                tags.add(("type", kind))
+            else:
+                if kind != "obj":
+                    raise Unsupported(f"type of a {kind}", node)
+        for a in v.refs:
+            ob = st.heap[a]
+            if isinstance(ob, NamedTupleObj):
+                classes.update(ob.type_v.refs)
+                continue
+            if type(ob) is InstObj:
+                if "__class__" in ob.attrs:
+                    raise Unsupported("type of an object with a __class__", node)
+                c = ob.cls
+                while c is not None:
+                    co = st.heap[c]
+                    if "__class__" in co.attrs:
+                        raise Unsupported("type of an object whose class defines __class__", node)
+                    c = co.bases[0] if co.bases else None
+                classes.add(ob.cls)
+            elif type(ob) is ListObj:
+                tags.add(("type", "list"))
+            elif type(ob) is TupleObj:
+                tags.add(("cbuiltin", "tuple"))
+            elif type(ob) is ExceptionObj:
+                tags.add(('exc', ob.cls))
+            elif type(ob) is TextWrapperObj:
+                tags.add(('cfunc', 'textwrap', 'TextWrapper'))
+            elif type(ob) is DictObj:
+                tags.add(("type", "dict"))
+            else:
+                raise Unsupported(f"type of a {ob.kind}", node)
+        return V(st=frozenset(tags), refs=frozenset(classes))
+
     def b_isinstance(self, st, args, kwargs, node):
         return self.visit_rule("isinstance", st, args, kwargs, node)
 
@@ -8050,9 +12280,46 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             "classinfo is a modelled class (a metaclass, hence an __instancecheck__, is refused where a class is defined) and an "
             "object with a __class__ of its own is refused")
 
+    def c_issubclass(self, st, args, kwargs, node):
+        return self._modelled(st, node, 'issubclass', self._issubclass_model, args, kwargs,
+                              'modelled class objects and fixed classinfo tuples have no custom subclass or metadata hooks')
+
+    def _issubclass_model(self, st, args, kwargs, node):
+        if not self._arity(node, args, kwargs, 2, 2, 'issubclass'):
+            st.set_bottom()
+            return BOT
+
+        candidates, classinfo = args
+        for value in args:
+            self._classinfo(st, value, node, set(), set())
+        results = set()
+        children = ([V(st=frozenset({tag})) for tag in candidates.st]
+                    + [V(refs=frozenset({addr})) for addr in candidates.refs])
+        for child in children:
+            if any(st.heap[addr].kind != 'class' for addr in child.refs):
+                raise Unsupported('issubclass first argument is not a modelled class', node)
+            child_names, child_classes = set(), set()
+            self._classinfo(st, child, node, child_names, child_classes)
+            for parent in ([V(st=frozenset({tag})) for tag in classinfo.st]
+                           + [V(refs=frozenset({addr})) for addr in classinfo.refs] or [classinfo]):
+                names, classes = set(), set()
+                self._classinfo(st, parent, node, names, classes)
+                member = 'object' in names or bool(child_names & names)
+                member = member or ('bool' in child_names and 'int' in names)
+                if 'tuple' in names and any(isinstance(st.heap[c], NamedTupleClassObj) for c in child_classes):
+                    member = True
+                if not member and any(isinstance(st.heap[c], NamedTupleClassObj) and c[1] != 'r'
+                                      for c in child_classes | classes):
+                    raise Unsupported("issubclass of a summary namedtuple class", node)
+                member = member or any(self.subclass(st, c, p) for c in child_classes for p in classes)
+                results.add(member)
+        if not results:
+            raise Unsupported('issubclass: no modelled class alternatives', node)
+        return V(b=frozenset(results))
+
     def _isinstance_model(self, st, args, kwargs, node):
         """``isinstance(x, classinfo)``: a bool decided per alternative of ``x``.  The classinfo is a builtin class
-        (``str``, ``int``, ``float``, ``bool``, ``list``, ``tuple``, ``object``), a user class, or a tuple of them
+        (``str``, ``int``, ``float``, ``bool``, ``list``, ``tuple``, ``dict``, ``object``), a user class, or a tuple of them
         (``_classinfo``); every other classinfo refuses.  Scalars are exact instances of their kind (``bool`` is also
         an ``int``); an object is an instance of its class and of the classes along its single-inheritance chain
         (``s_ClassDef`` refuses multiple inheritance, metaclasses, and every builtin base except ``object`` and the
@@ -8096,6 +12363,14 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             results.add("object" in names)
         for a in v.refs:
             ob = st.heap[a]
+            if isinstance(ob, NamedTupleObj):
+                member = bool(names & {"object", "tuple"})
+                if not member and classes:
+                    if any(c[1] != "r" for c in ob.type_v.refs | classes):
+                        raise Unsupported("isinstance of a summary namedtuple class", node)
+                    member = bool(ob.type_v.refs & classes)
+                results.add(member)
+                continue
             if ob.kind == "inst":
                 if "__class__" in ob.attrs:
                     raise Unsupported("isinstance of an object with a __class__", node)
@@ -8109,7 +12384,7 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                     c = bases[0] if bases else None
                 results.add(member)
             else:
-                results.add("object" in names or {"list": "list", "tuple": "tuple"}.get(ob.kind) in names)
+                results.add("object" in names or {"list": "list", "tuple": "tuple", "dict": "dict", "textwrapper": "textwrap.TextWrapper"}.get(ob.kind) in names)
         return results
 
     # ------------------------------------------------------ list methods
@@ -8237,7 +12512,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                     st, ob, args[0], args[1:] if name == "index" else ())))
 
     def _try_routes_builtin_raise(self, st: State, ob, name, args, kwargs) -> bool:
-        return (self._absent_search_method(st, ob, name, args) or
+        return (isinstance(ob,DefaultDictObj) and name=='__missing__' and len(args)==1 and not kwargs
+                and ob.factory in (None,'list') or self._absent_search_method(st, ob, name, args) or
                 ob.kind == "list" and name == "pop" and not args and not kwargs and
                 self.len_lin(st, ob)[1][1] == 0)
 
@@ -8393,6 +12669,15 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
     # len_lin/index_ok/elem_at/store_elem/set_len/update_obj are all kind-agnostic) for
     # everything a list already gets for free (indexing, slicing, len, iteration); adds
     # only the typecode-gated element check list has no equivalent of.
+    @staticmethod
+    def _array_bad_typecode(args,kwargs):
+        from ..contracts.rules_array import TYPECODES
+        if kwargs or len(args) not in (1,2):return None
+        value=args[0]
+        if value.s is None or value.s==ANY_STR or len(value.s)!=1 or not value.replace(s=None).is_bot():return None
+        code=next(iter(value.s))
+        return code if len(code)==1 and code not in TYPECODES else None
+
     def _array_typecode(self, v: V, node) -> str:
         """The one-character typecode string ``v`` must be, or ``Unsupported`` -- a
         program-variable or ambiguous typecode is refused outright (never guessed)."""
@@ -8415,8 +12700,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         the element actually holds on the NON-raising path -- narrowed to what real
         ``array`` guarantees a successful store leaves behind (never ``set_bottom`` on
         an unrecognized shape: MG's PR 89 lesson, docs/ABSINT.md)."""
-        if v.top:
-            raise Unsupported("array element from an unknown value", node)
+        if v.top or self.instance_value(st,v):
+            raise Unsupported("array element from an unknown value or open numeric protocol", node)
         is_float_code = typecode in _ARRAY_FLOAT_CODES
         bad_type = bool(v.s is not None or v.n or v.refs or v.st or (not is_float_code and v.f))
         self.check(node, "array:TypeError", {"TypeError"}, not bad_type,
@@ -8426,42 +12711,42 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             return self._array_float_value(st, node, typecode, v)
         return self._array_int_value(st, node, typecode, v)
 
-    def _array_exact_float(self, st: State, v: V):
+    def _array_exact_float(self, st: State, v: V, node):
         """``v``'s exact float value (a Python float), or ``None`` if it isn't one exactly
         known constant (an interval, a NaN-only fact, or an unresolved int)."""
-        if v.f and v.f.fact.has_interval() and v.f.fact.lo == v.f.fact.hi and not v.f.fact.nan:
+        if v.f and v.replace(f=None).is_bot() and v.f.fact.has_interval() and v.f.fact.lo == v.f.fact.hi and not v.f.fact.nan:
             return float(v.f.fact.lo)
-        ii = self._as_int(st, v)
+        ii = self._as_int(st, v) if v.replace(i=None,b=None).is_bot() else None
         if ii is not None:
             lo, hi = self.ibounds(st, ii)
             if lo is not None and lo == hi:
-                return float(lo)
+                try:return float(lo)
+                except OverflowError:raise Unsupported('array: integer-to-float conversion overflows',node)
         return None
 
     def _array_float_value(self, st: State, node, typecode: str, v: V) -> V:
-        exact = self._array_exact_float(st, v)
+        exact = self._array_exact_float(st, v, node)
         if typecode == "d":
-            # a C double IS a Python float: no rounding, no overflow, ever.
+            # A stored C double is a Python float; integer conversion can overflow first.
             if exact is not None:
                 return V(f=FloatInfo(fv.FloatFact.const(exact)))
-            return v if v.f else FLOAT
+            return V(f=self.float_view(st,v))
         # 'f': a C float is NARROWER than a Python double -- every finite value is
         # rounded to the nearest representable float32 on store (measured:
         # `array.array('f', [0.1])[0] == 0.10000000149011612`, never `0.1` exactly).
         # CPython's array module SATURATES an out-of-range magnitude to +-inf rather
         # than raising OverflowError (measured -- see _ARRAY_FLOAT_CODES above), so
         # struct's own OverflowError is not real array behaviour and must not be used
-        # as a check here; struct IS used for the rounding itself, which matches
-        # exactly (same IEEE-754 binary32 conversion CPython's arraymodule.c performs).
+        # as a check here. struct has the same binary32 rounding but raises when
+        # the rounded result overflows; array stores the corresponding infinity.
+        def rounded(value):
+            try:return struct.unpack('<f',struct.pack('<f',value))[0]
+            except OverflowError:return math.copysign(math.inf,value)
         if exact is not None:
-            if math.isnan(exact):
-                return V(f=FloatInfo(fv.FloatFact.const(float("nan"))))
-            if abs(exact) > _FLOAT32_MAX:
-                rounded = math.copysign(math.inf, exact)
-            else:
-                rounded = struct.unpack("<f", struct.pack("<f", exact))[0]
-            return V(f=FloatInfo(fv.FloatFact.const(rounded)))
-        return v if v.f else FLOAT
+            return V(f=FloatInfo(fv.FloatFact.const(rounded(exact))))
+        fact=self.float_view(st,v).fact
+        # Binary32 conversion is monotone; round both bounds and discard unrounded symbolic terms.
+        return V(f=FloatInfo(fv.FloatFact(rounded(fact.lo),rounded(fact.hi),fact.nan)))
 
     def _array_int_value(self, st: State, node, typecode: str, v: V) -> V:
         lo_tc, hi_tc = _ARRAY_INT_RANGES[typecode]
@@ -8496,8 +12781,9 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                               typecode=typecode)
             return V(refs=frozenset({a}))
         init = args[1]
-        if init.top:
-            raise Unsupported("array() of an unknown initializer", node)
+        if (init.top or len(init.refs)!=1 or not init.replace(refs=frozenset()).is_bot()
+                or type(st.heap[next(iter(init.refs))]) not in (ListObj,TupleObj,ArrayObj)):
+            raise Unsupported("array() initializer is not a closed builtin list, tuple or array", node)
         init = self.iterable(st, init, node, consumer="array.array")
         self.check_iterable(st, init, node)
         if len(init.refs) != 1 or init.s is not None:
@@ -8631,11 +12917,18 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return ok
 
     def _os_str_result(self, s: str) -> V:
-        return const_str(s) if len(s) <= 64 else ANYSTR
+        if self._clock() > self.deadline:
+            raise Unsupported("path result time budget exhausted")
+        value = const_str(s)
+        if self._clock() > self.deadline:
+            raise Unsupported("path result time budget exhausted")
+        return value
 
     def m_os_path_join(self, st, a, k, n):
-        if not self._os_arity_ok(a, k, 1, 32):
+        if not a or k:
             raise Unsupported("os.path.join: unmodelled arity/keywords", n)
+        if self._clock() > self.deadline:
+            raise Unsupported("path join time budget exhausted", n)
         # Every argument is checked (not short-circuited on the first imprecise one), same
         # as m_re_sub checks pattern/repl/string independently -- a second bad argument
         # still gets its own recorded check.
@@ -8770,11 +13063,6 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
     def m__sv_verifier_nondet_bool(self, st, a, k, n):
         self._in_try_refuse("a harness draw (its refusal of an invalid draw is a ValueError)", n)
         self._arity(n, a, k, 0, 0, "nondet_bool")
-        # a case split's outcome: used by the FIRST evaluation of that node, in the activation it was forced in
-        pending = self._forced_draws.get(n)
-        if pending is not None and pending[1] == self._activation(st):
-            del self._forced_draws[n]
-            return const_bool(pending[0])
         return BOOL
 
     def m__sv_verifier_nondet_float(self, st, a, k, n):
@@ -8813,13 +13101,113 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             out = vjoin(out, st.zone, value, st.zone)
         return out
 
+    def _nondet_callback_summary(self, st, callback: V, node):
+        """One pure source call summarizes zero or arbitrarily many independent calls."""
+        if len(callback.refs) != 1 or not callback.replace(refs=frozenset()).is_bot():
+            return None
+        address = next(iter(callback.refs))
+        function = st.heap[address]
+        definition = function.node if function.kind == "func" else None
+        if (not isinstance(definition, ast.FunctionDef) or function.flavor != "plain"
+                or function.module_key or definition not in self.tree.body
+                or definition.decorator_list or function.captures or function.capture_frames):
+            return None
+        signature = definition.args
+        if (signature.posonlyargs or signature.args or signature.kwonlyargs
+                or signature.vararg or signature.kwarg):
+            return None
+        locals_, globals_ = _assigned_names(definition.body)
+        if globals_:
+            return None
+        context = FuncCtx(definition, locals_, set())
+
+        def admitted(expression, bound, record=False):
+            if isinstance(expression, ast.IfExp):
+                return (admitted(expression.test, bound) and admitted(expression.body, bound, record)
+                        and admitted(expression.orelse, bound, record))
+            if isinstance(expression, ast.Dict):
+                return (record and all(isinstance(key, ast.Constant) and type(key.value) is str
+                                       for key in expression.keys)
+                        and all(admitted(value, bound) for value in expression.values))
+            if isinstance(expression, ast.Constant):
+                return type(expression.value) in (str, int, bool, float, type(None))
+            if isinstance(expression, ast.Name):
+                return expression.id in bound
+            if not isinstance(expression, ast.Call) or expression.args or expression.keywords:
+                return False
+            callee = expression.func
+            if isinstance(callee, ast.Name) and callee.id not in locals_:
+                value = self.load_name(callee.id, callee, st, context)
+            elif (isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Name)
+                  and callee.value.id not in locals_):
+                module = self.load_name(callee.value.id, callee.value, st, context)
+                if module != V(st=frozenset({("module", "_sv_verifier")})):
+                    return False
+                value = self.module_attr(st, "_sv_verifier", callee.attr, callee)
+            else:
+                return False
+            self._nondet_scalar_summary(st, value, expression, "pure callback draw")
+            return True
+
+        def pure(body, bound=frozenset()):
+            bound, falls_through = set(bound), True
+            for statement in body:
+                if isinstance(statement, ast.Return):
+                    if statement.value is not None and not admitted(statement.value, bound, record=True):
+                        return None
+                    falls_through = False
+                elif isinstance(statement, ast.Assign):
+                    if (not all(isinstance(target, ast.Name) for target in statement.targets)
+                            or not admitted(statement.value, bound, record=True)):
+                        return None
+                    bound.update(target.id for target in statement.targets)
+                elif isinstance(statement, ast.If):
+                    if not admitted(statement.test, bound):
+                        return None
+                    arms = [pure(statement.body, bound), pure(statement.orelse, bound)]
+                    if any(arm is None for arm in arms):
+                        return None
+                    continuing = [names for names, live in arms if live]
+                    if continuing:
+                        bound = set.intersection(*continuing)
+                    else:
+                        falls_through = False
+                elif isinstance(statement, ast.Pass):
+                    continue
+                elif not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+                          and type(statement.value.value) is str):
+                    return None
+            return bound, falls_through
+
+        if pure(definition.body) is None:
+            return None
+        # The container may be empty: a callback's exceptional-only exit must not kill its caller.
+        branch = st.copy()
+        result = self.call(branch, callback, [], {}, node)
+        if branch.bottom or result.top or result.st:
+            raise Unsupported("pure callback has no modeled normal return", node)
+        summaries = set()
+        for address in result.refs:
+            obj = branch.heap[address]
+            if (type(obj) is not DictObj or address[1] != "r"
+                    or any(value.top or value.refs or value.st for value in obj.values())):
+                raise Unsupported("pure callback requires scalar values or fresh scalar records", node)
+            self.demote(branch, address[0])
+            summaries.add((address[0], "s"))
+        scalar = self._const_bounds(branch, result.replace(refs=frozenset()), "")
+        _assign_state(st, branch)
+        # Independent callback invocations cannot share this call's value token.
+        return scalar.replace(refs=frozenset(summaries), value_term=None)
+
     def m__sv_verifier_nondet_list(self, st, args, kwargs, node):
-        """A fresh list of any nonnegative length, with independent supported scalar draws."""
+        """Any nonnegative length, with pure scalar/record callback summaries."""
         self._in_try_refuse("a harness container draw (callback errors are not routed)", node)
         bound = self._bind_call(st, node, args, kwargs, "_sv_verifier.nondet_list", ("nondet_elem",), ("nondet_elem",))
         if bound is None:
             return BOT
-        elem = self._nondet_scalar_summary(st, bound["nondet_elem"], node, "nondet_list callback")
+        elem = self._nondet_callback_summary(st, bound["nondet_elem"], node)
+        if elem is None:
+            elem = self._nondet_scalar_summary(st, bound["nondet_elem"], node, "nondet_list callback")
         length = IntInfo(None, (ZERO, 0), None)
         address = self.new_list(st, node, length, elem, tag="nondet_list")
         return V(refs=frozenset({address}))
@@ -8833,13 +13221,19 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         )
         if bound is None:
             return BOT
-        keys = self._nondet_scalar_summary(st, bound["nondet_key"], node, "nondet_dict key callback")
-        values = self._nondet_scalar_summary(st, bound["nondet_value"], node, "nondet_dict value callback")
+        keys = self._nondet_callback_summary(st, bound["nondet_key"], node)
+        if keys is None:
+            keys = self._nondet_scalar_summary(st, bound["nondet_key"], node, "nondet_dict key callback")
+        if keys.refs:
+            raise Unsupported("nondet_dict requires scalar hashable keys", node)
+        values = self._nondet_callback_summary(st, bound["nondet_value"], node)
+        if values is None:
+            values = self._nondet_scalar_summary(st, bound["nondet_value"], node, "nondet_dict value callback")
         address = self.alloc(st, node, lambda _sid: DictObj({}, False, keys, values), "nondet_dict")
         return V(refs=frozenset({address}))
 
-    def _verifier_check_type_value_kind(self, st, value, node):
-        """Return a single hook-free builtin kind for the deliberately narrow check_type model."""
+    def _verifier_check_type_value_kinds(self, st, value, node):
+        """Return every represented exact kind without assuming the alternatives agree."""
         if value.top or value.st or value.is_bot():
             raise Unsupported("check_type value is not a known primitive or exact builtin container", node)
         kinds = []
@@ -8857,26 +13251,29 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             ref_kinds = set()
             for address in value.refs:
                 obj = st.heap.get(address)
-                if type(obj) not in {ListObj, DictObj}:
+                # Exact functions have builtin repr; bound methods can format a user receiver.
+                if type(obj) not in {ListObj, DictObj, FuncObj}:
                     raise Unsupported("check_type value may be a custom or unsupported object", node)
                 ref_kinds.add(obj.kind)
             kinds.extend(sorted(ref_kinds))
-        if len(kinds) != 1:
-            raise Unsupported("check_type value has mixed or unsupported possible types", node)
-        return kinds[0]
+        return set(kinds)
 
     def _check_type_user_class(self, st, value, caddr, node):
         """``check_type(value, C)`` for a class ``C`` of the program: the benchmark's runtime check is
         ``isinstance(value, C)`` and ``C`` has no metaclass here (``s_ClassDef`` refuses one), so it is exactly the
         decision ``isinstance`` already makes (``_isinstance_results``: the single-inheritance chain, a refusal for an
         object carrying its own ``__class__``).  Proven only when EVERY alternative of ``value`` is an instance;
-        a possible mismatch formats ``value!r`` into the TypeError, which runs a user ``__repr__`` for an object,
-        so only a scalar value may mismatch (an object that may mismatch refuses)."""
+        a mismatch formats ``value!r`` into the TypeError. Only mismatching object alternatives need the
+        existing formatting-safety check; a matching object's repr never runs."""
         if value.top or value.is_bot():
             raise Unsupported("check_type value is not a known primitive or object", node)
         results = self._isinstance_results(st, value, set(), {caddr}, node)
         if value.refs and results != {True}:
-            raise Unsupported("check_type mismatch may invoke a user __repr__", node)
+            self._in_try_refuse("check_type mismatch formatting", node)
+        for address in value.refs:
+            alternative = V(refs=frozenset({address}))
+            if False in self._isinstance_results(st, alternative, set(), {caddr}, node):
+                self.check_formattable(st, alternative, node, closed_objects=True)
         matches = results == {True}
         self.check(node, "check_type", {"TypeError"}, matches,
                    "isinstance(value, <class of the program>) along its single-inheritance chain", st=st)
@@ -8886,14 +13283,20 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return V(n=True)
 
     def m__sv_verifier_check_type(self, st, args, kwargs, node):
-        """Model exact builtin class hints over one known scalar/list/dict value kind, and a class of the program as isinstance."""
+        """Model exact builtin hints over scalar/list/dict alternatives, and program classes as isinstance."""
         bound = self._bind_call(
             st, node, args, kwargs, "_sv_verifier.check_type", ("value", "hint"), ("value", "hint")
         )
         if bound is None:
             return BOT
         hint = bound["hint"]
-        if hint == V(st=frozenset({("check-type-union", "int", "str")})):
+        if (not hint.top and hint.i is None and not hint.b and not hint.f and hint.s is None
+                and not hint.n and not hint.refs and len(hint.st) == 1
+                and next(iter(hint.st))[0] == "check-type-generic"):
+            return self._check_type_generic(st, bound["value"], next(iter(hint.st))[1], node)
+        if (len(hint.st) == 1 and not hint.refs and not hint.top and hint.i is None and not hint.b and not hint.f
+                and hint.s is None and not hint.n and next(iter(hint.st))[0] == "check-type-union"):
+            members = set(next(iter(hint.st))[1:])
             value = bound["value"]
             if value.top or value.st or value.refs or value.is_bot():
                 raise Unsupported("check_type union value is not a known builtin scalar", node)
@@ -8904,10 +13307,24 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 kinds.add("bool")
             if value.s is not None:
                 kinds.add("str")
-            if value.f or value.n or not kinds:
+            if value.f:
+                kinds.add("float")
+            if value.n:
+                kinds.add("NoneType")
+            if not kinds:
                 raise Unsupported("check_type union value has mixed or unsupported possible types", node)
+            # bool is an int: ``int`` in the union covers it; every other kind is covered by its own name only
+            covered = {k for k in kinds if k in members or (k == "bool" and "int" in members)}
+            if covered != kinds:
+                # a value outside the union formats value!r into the TypeError; a scalar's repr runs no user code
+                self.check(node, "check_type", {"TypeError"}, False,
+                           f"isinstance(value, {' | '.join(sorted(members))}) under exact builtin classes", st=st)
+                if not covered:
+                    st.set_bottom()
+                    return BOT
+                return V(n=True)
             self.check(node, "check_type", {"TypeError"}, True,
-                       "isinstance(value, int | str) under exact builtin classes", st=st)
+                       f"isinstance(value, {' | '.join(sorted(members))}) under exact builtin classes", st=st)
             return V(n=True)
         if (not hint.top and hint.i is None and not hint.b and not hint.f and hint.s is None and not hint.n
                 and not hint.st and len(hint.refs) == 1):
@@ -8918,20 +13335,192 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 or hint.refs or len(hint.st) != 1):
             raise Unsupported("check_type hint is not one exact builtin class", node)
         tag = next(iter(hint.st))
+        if len(tag) == 2 and tag[0] == "exc":
+            return self._check_type_builtin_exception_hint(st, bound["value"], tag[1], node)
+        if tag in (("cbuiltin", "tuple"), ("cbuiltin", "set")):
+            return self._check_type_builtin_container_hint(st, bound["value"], tag[1], node)
         if len(tag) != 2 or tag[0] != "type" or tag[1] not in {"int", "bool", "float", "str", "list", "dict"}:
             raise Unsupported("check_type hint is outside the exact builtin class subset", node)
-        value_kind = self._verifier_check_type_value_kind(st, bound["value"], node)
+        value_kinds = self._verifier_check_type_value_kinds(st, bound["value"], node)
         hint_kind = tag[1]
-        matches = value_kind == hint_kind or (hint_kind == "int" and value_kind == "bool")
-        if not matches and value_kind in {"list", "dict"}:
-            # On mismatch the upstream checker formats value!r in its TypeError;
-            # builtin containers can still call a nested user's __repr__ there.
-            raise Unsupported("check_type mismatch may invoke a nested container __repr__", node)
+        covered = value_kinds & ({"int", "bool"} if hint_kind == "int" else {hint_kind})
+        if covered and (value_kinds - covered) & {"list", "dict"}:
+            raise Unsupported("check_type mixed success and container mismatch formatting", node)
+        for address in bound["value"].refs:
+            if st.heap[address].kind in (value_kinds - covered) & {"list", "dict"}:
+                self._in_try_refuse("check_type mismatch formatting", node)
+                self.check_formattable(st, V(refs=frozenset({address})), node, closed_objects=True)
+        self.check(
+            node, "check_type", {"TypeError"}, covered == value_kinds,
+            f"isinstance({' | '.join(sorted(value_kinds))}, {hint_kind}) under exact builtin classes", st=st,
+        )
+        if not covered:
+            st.set_bottom()
+            return BOT
+        # A possible success retains the original over-approximation of its normal continuation.
+        return V(n=True)
+
+    def _check_type_generic(self, st, value, shape, node):
+        """Prove every nested element matches, using only exact builtin heap shapes.
+
+        Failed/uncertain checks retain the normal path: element summaries need not
+        represent a present element, and distinct abstract alternatives may match.
+        Refuse callbacks (including mismatch formatting), recursion and try routing.
+        """
+        self._in_try_refuse("a recursive check_type", node)
+        pending, seen = [value], set()
+        while pending:
+            item = pending.pop()
+            if item.top or item.st:
+                raise Unsupported("check_type nested value is not an exact builtin value", node)
+            for address in item.refs - seen:
+                seen.add(address)
+                obj = st.heap[address]
+                if type(obj) not in {ListObj, TupleObj, DictObj, SetObj}:
+                    raise Unsupported("check_type nested value may invoke a user hook", node)
+                pending.extend(obj.values())
+
+        def accepts(item, hint, active):
+            if item.top or item.st or item.is_bot():
+                raise Unsupported("check_type nested value is not an exact builtin value", node)
+            family = hint[1]
+            results = []
+            for kind in item.kinds():
+                if kind != "obj":
+                    kind = "NoneType" if kind == "None" else kind
+                    results.append(hint[0] == "class" and
+                                   (kind == family or (kind == "bool" and family == "int")))
+            for address in item.refs:
+                obj = st.heap[address]
+                if type(obj) not in {ListObj, TupleObj, DictObj, SetObj}:
+                    raise Unsupported("check_type nested value may invoke a user hook", node)
+                kind = "frozenset" if type(obj) is SetObj and obj.frozen else obj.kind
+                if kind != family:
+                    results.append(False)
+                    continue
+                if hint[0] == "class":
+                    results.append(True)
+                    continue
+                key = (address, hint)
+                if key in active:
+                    raise Unsupported("recursive check_type value", node)
+                children, variadic = hint[2:]
+                active = active | {key}
+                if not children:
+                    # get_args(tuple[()]) is empty: the pinned checker returns
+                    # success before its fixed-tuple length check.
+                    results.append(True)
+                    continue
+                if type(obj) is DictObj:
+                    if obj.exact and not obj.items:
+                        results.append(True)
+                        continue
+                    keys = self.dict_keys_v(st, obj)
+                    values = list(obj.items.values())
+                    if not obj.exact and not obj.ovals.is_bot():
+                        values.append(obj.ovals)
+                    results.append(accepts(keys, children[0], active) and all(
+                        accepts(v, children[1], active) for v in values))
+                elif type(obj) is TupleObj and not variadic:
+                    if obj.items is None:
+                        raise Unsupported("check_type fixed tuple needs exact positions", node)
+                    results.append(len(obj.items) == len(children) and all(
+                        accepts(v, h, active) for v, h in zip(obj.items, children)))
+                else:
+                    _, (_, hi) = self.len_lin(st, obj)
+                    elements = self.all_elems(st, obj)
+                    results.append(hi == 0 or (not elements.is_bot() and accepts(elements, children[0], active)))
+            return bool(results) and all(results)
+
+        matches = accepts(value, shape, frozenset())
+        if not matches:
+            # The runtime reports the entire original value with !r on mismatch.
+            self.check_formattable(st, value, node)
+        self.check(node, "check_type", {"TypeError"}, matches,
+                   "every nested builtin element satisfies the exact generic hint", st=st)
+        return V(n=True)
+
+    def _check_type_builtin_container_hint(self, st: State, value: V, name: str, node):
+        """``check_type(value, tuple)`` / ``check_type(value, set)`` for the exact builtin classes
+        the name evaluation resolves (``("cbuiltin", name)``): the runtime decision is
+        ``isinstance(value, <that class>)`` and every alternative of ``value`` decides it exactly
+        on the heap shapes (a ``TupleObj`` for ``tuple``, a ``SetObj`` whose own ``frozen`` flag
+        is exactly what separates ``set`` from ``frozenset`` at runtime). A mismatch formats
+        ``value!r`` into the TypeError; a scalar repr runs no user code, a heap object may
+        (its elements' hooks), so only a fully-matching value may carry objects."""
+        if value.top or value.st or value.is_bot():
+            raise Unsupported("check_type value is not a known primitive or exact builtin container", node)
+        results: set = set()
+        for kind in value.kinds():
+            if kind == "obj":
+                continue
+            results.add(False)                      # a scalar alternative never matches; repr is safe
+        for a in value.refs:
+            ob = st.heap[a]
+            if ob.kind == "tuple":
+                result = name == "tuple"
+            elif ob.kind == "set":
+                result = name == ("frozenset" if ob.frozen else "set")
+            else:
+                raise Unsupported("check_type value may be a custom or unsupported object", node)
+            if not result:
+                raise Unsupported("check_type mismatch may invoke a nested container __repr__", node)
+            results.add(result)
+        if not results:
+            raise Unsupported("check_type value has no modelled alternative", node)
+        matches = results == {True}
         self.check(
             node, "check_type", {"TypeError"}, matches,
-            f"isinstance({value_kind}, {hint_kind}) under exact builtin classes", st=st,
+            f"isinstance(value, {name}) under exact builtin classes", st=st,
         )
+        if not matches and results == {False}:
+            st.set_bottom()
+            return BOT
+        return V(n=True)
+
+    def _check_type_builtin_exception_hint(self, st: State, value: V, name: str, node):
+        """``check_type(value, <a builtin exception class>)``: the runtime decision is
+        ``isinstance(value, <that class>)``. Exactness: every alternative of ``value`` decides it
+        on its own recorded shape — an ``inst`` of a program class whose single recorded builtin
+        exception base derives the hint (``_exc_base_of``'s chain), a canonical ``ExceptionObj``
+        whose own class is in the runtime's C-tree — never a guess. A mismatch formats
+        ``value!r`` into the TypeError: a scalar repr runs no user code; an instance's repr may,
+        so only a fully-matching value may carry an ``inst``."""
+        if value.top or value.st or value.is_bot():
+            raise Unsupported("check_type value is not a known exception value", node)
+        tobj = getattr(_builtins, name, None)
+        if not isinstance(tobj, type) or not issubclass(tobj, _builtins.BaseException):
+            raise Unsupported(f"check_type hint {name} is not one exact builtin exception class", node)
+        results: set = set()
+        for kind in value.kinds():
+            if kind == "obj":
+                continue
+            results.add(False)                      # a scalar alternative never matches; repr is safe
+        for a in value.refs:
+            ob = st.heap[a]
+            if ob.kind == "inst":
+                if "__class__" in ob.attrs:
+                    raise Unsupported("isinstance of an object with a __class__", node)
+                base = self._exc_base_of(st, ob.cls)
+                bobj = getattr(_builtins, base, None) if base is not None else None
+                if not (isinstance(bobj, type) and issubclass(bobj, tobj)):
+                    raise Unsupported("check_type mismatch may invoke a user __repr__", node)
+                results.add(True)
+            elif ob.kind == "exception":
+                cobj = getattr(_builtins, ob.cls, None)
+                results.add(isinstance(cobj, type) and issubclass(cobj, tobj))
+            else:
+                raise Unsupported("check_type value may be a custom or unsupported object", node)
+        if not results:
+            raise Unsupported("check_type value has no modelled alternative", node)
+        matches = results == {True}
         if not matches:
+            self.check_formattable(st, value, node)
+        self.check(
+            node, "check_type", {"TypeError"}, matches,
+            f"isinstance(value, {name}) under exact builtin classes", st=st,
+        )
+        if not matches and results == {False}:
             st.set_bottom()
             return BOT
         return V(n=True)
@@ -9005,76 +13594,108 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         return ok
 
     def m_io_StringIO(self, st, a, k, n):
-        """``io.StringIO(initial_value='', newline='\\n')`` ([internal ref]). ``newline``
-        only controls universal-newline TRANSLATION -- irrelevant to a model that
-        already coarsens content to "some string" the moment anything is written, so it
-        is accepted without a type check (the same "unmodelled VALUE, not unmodelled
-        SHAPE" reasoning ``re.compile``'s ``flags`` already uses). ``initial_value``
-        given both positionally and by keyword, more than one positional argument, or
-        any other keyword, is an unmodelled call SHAPE (Unsupported), never a guessed
-        TypeError. No ``initial_value`` at all is the one case precise enough to keep
-        exact: a fresh ``io.StringIO()`` starts as the literal empty string, not yet
-        coarsened -- real code that checks emptiness right after construction (before
-        any write) still gets a genuine fact."""
-        unknown_kw = set(k) - {"initial_value", "newline"}
-        if unknown_kw or len(a) > 1 or (a and "initial_value" in k):
-            raise Unsupported("io.StringIO: unmodelled arity/keywords", n)
-        initial = a[0] if a else k.get("initial_value")
-        if initial is None:
-            content = const_str("")
-        else:
-            self._io_str_arg(st, initial, n, "StringIO initial_value")
-            content = ANYSTR
-        addr = self.alloc(st, n, lambda sid: StringIOObj(content), "stringio")
+        return self._new_stream(st, a, k, n, binary=False)
+
+    @staticmethod
+    def _stream_value(value):
+        return V(top=True, st=frozenset({("bytes_const", value)})) if type(value) is bytes else const_str(value)
+
+    def _stream_obj(self, stream):
+        value = stream.concrete if stream.binary else stream.concrete.decode("utf-8", "surrogatepass")
+        return StringIOObj(self._stream_value(value), stream, stream.position, stream.binary,
+                           frozenset({stream.closed}))
+
+    def _new_stream(self, st, a, k, n, *, binary):
+        from tharkun.solve.world import StreamObject
+        if set(k) - ({"initial_bytes"} if binary else {"initial_value", "newline"}) or len(a) > (1 if binary else 2):
+            raise Unsupported("io stream: unmodelled constructor shape", n)
+        name = "initial_bytes" if binary else "initial_value"
+        if (a and name in k) or (len(a) > 1 and "newline" in k):
+            raise Unsupported("io stream: duplicate constructor argument", n)
+        initial = a[0] if a else k.get(name, self._stream_value(b"" if binary else ""))
+        exact, value = self.exact_constant(st, initial)
+        if not binary:
+            if not self._io_str_arg(st, initial, n, "StringIO initial_value"):
+                st.set_bottom()
+                return BOT
+        elif not exact or type(value) is not bytes:
+            raise Unsupported("BytesIO requires exact builtin bytes", n)
+        newline_v = a[1] if len(a) > 1 else k.get("newline", const_str("\n"))
+        exact_nl, newline = self.exact_constant(st, newline_v)
+        if not exact_nl or newline not in (None, "", "\n", "\r", "\r\n"):
+            raise Unsupported("StringIO newline must be a supported constant", n)
+        stream = StreamObject.create(value, binary=binary, newline=newline) if exact else None
+        content = self._stream_value(stream.native().getvalue()) if stream else ANYSTR
+        obj = self._stream_obj(stream) if stream else StringIOObj(content, position=0)
+        addr = self.alloc(st, n, lambda sid: obj, "stringio")
         return V(refs=frozenset({addr}))
 
     def stringio_method(self, st: State, addr, name, args, kwargs, node) -> V:
-        qualname = f"io.StringIO.{name}"
+        qualname = f"io.{'BytesIO' if st.heap[addr].binary else 'StringIO'}.{name}"
         if qualname in _METHOD_HOOKS:
             return self.visit_method_rule(qualname, MethodCtx(st, frozenset({addr}), name, args, kwargs, node))
         return self._stringio_method_model(st, addr, name, args, kwargs, node)
 
     def _stringio_method_model(self, st: State, addr, name, args, kwargs, node) -> V:
-        """Methods on an ``io.StringIO`` buffer ([internal ref]). ``write`` takes exactly
-        one str argument and coarsens ``content`` to ``ANYSTR`` (real ``write`` can start
-        mid-buffer after a ``seek``, so even an "append" reading of it would be a
-        precision claim this pass cannot back -- coarsening is the sound choice).
-        ``getvalue``/``read`` both just return ``content`` (position is not tracked, so
-        neither can be more precise than "the buffer, whatever it is now"); ``read``'s
-        optional size argument is accepted unchecked past being int-or-bool-shaped (the
-        VALUE does not change the result's TYPE). ``tell``/``seek`` return an
-        unconstrained non-negative int, never connected back to ``content``. Every other
-        StringIO method (readline, readlines, truncate, close, ...) still refuses --
-        not modelled, exactly like any other unmodelled method of any other kind."""
+        from tharkun.lattice import Origin
+        allowed = {"write": (1,), "getvalue": (0,), "read": (0, 1), "readline": (0, 1),
+                   "seek": (1, 2), "tell": (0,), "close": (0,), "flush": (0,)}
+        if name not in allowed or len(args) not in allowed[name] or kwargs:
+            raise Unsupported(f"io stream: unmodelled {name} call shape", node)
+        ob = st.heap[addr]
+        exact = [self.exact_constant(st, a) for a in args]
         if name == "write":
-            if len(args) != 1 or kwargs:
-                raise Unsupported("StringIO.write: unmodelled arity/keywords", node)
-            self._io_str_arg(st, args[0], node, "StringIO.write")
-            self.update_obj(st, frozenset({addr}), lambda ob, strong: StringIOObj(ANYSTR))
-            return int_iv(0, None)
+            if not ob.binary and not self._io_str_arg(st, args[0], node, "StringIO.write"):
+                st.set_bottom()
+                return BOT
+            if ob.binary and (not exact[0][0] or type(exact[0][1]) is not bytes):
+                raise Unsupported("BytesIO.write requires builtin bytes", node)
+        if name in {"read", "readline", "seek"}:
+            for a in args:
+                if not (int_or_none_value(a) if name == "read" else exact_int_value(a)):
+                    raise Unsupported("io stream position/size requires int or None", node)
+        if name != "close" and ob.closed != frozenset({False}):
+            if ob.closed == frozenset({True}):
+                st.set_bottom()  # Native ValueError, outside the property classes; handlers are refused by the caller.
+                return BOT
+            raise Unsupported("possibly closed program stream", node)
+        if name == "close":
+            self.update_obj(st, frozenset({addr}), lambda old, strong: old.replace(
+                stream=None, closed=frozenset({True})))
+            return NONE
+        if ob.stream is not None and all(ok for ok, value in exact):
+            try:
+                stream, result = ob.stream.project(name, *[value for ok, value in exact],
+                                                    origin=Origin("absint", node.lineno))
+            except (ValueError, OverflowError):
+                st.set_bottom()
+                return BOT
+            except TypeError:
+                self.check(node, "io-stream-argument", {"TypeError"}, False, "invalid native stream argument")
+                st.set_bottom()
+                return BOT
+            self.update_obj(st, frozenset({addr}), lambda old, strong: self._stream_obj(stream))
+            if result is None:
+                return NONE
+            return const_int(result) if type(result) is int else self._stream_value(result)
         if name == "getvalue":
-            if args or kwargs:
-                raise Unsupported("StringIO.getvalue: unmodelled arity/keywords", node)
-            ob = st.heap.get(addr)
-            return ob.content if ob is not None else ANYSTR
-        if name == "read":
-            if len(args) > 1 or kwargs:
-                raise Unsupported("StringIO.read: unmodelled arity/keywords", node)
-            if args and (args[0].top or (args[0].i is None and not args[0].b)):
-                raise Unsupported("StringIO.read: unmodelled size argument", node)
-            ob = st.heap.get(addr)
-            return ob.content if ob is not None else ANYSTR
+            return ob.content
         if name == "tell":
-            if args or kwargs:
-                raise Unsupported("StringIO.tell: unmodelled arity/keywords", node)
+            return const_int(ob.position) if ob.position is not None else int_iv(0, None)
+        if name == "flush":
+            return NONE
+        if name == "write":
+            if ob.binary:
+                raise Unsupported("unknown binary stream buffer", node)
+            self.update_obj(st, frozenset({addr}), lambda old, strong: old.replace(content=ANYSTR, stream=None, position=None))
             return int_iv(0, None)
-        if name == "seek":
-            if not (1 <= len(args) <= 2) or kwargs:
-                raise Unsupported("StringIO.seek: unmodelled arity/keywords", node)
-            if args[0].top or (args[0].i is None and not args[0].b):
-                raise Unsupported("StringIO.seek: unmodelled position argument", node)
-            return int_iv(0, None)
-        raise Unsupported(f"method {name} of an io.StringIO", node)
+        if name in {"read", "readline"}:
+            if ob.binary:
+                raise Unsupported("unknown binary stream cursor", node)
+            self.update_obj(st, frozenset({addr}), lambda old, strong: old.replace(stream=None, position=None))
+            return ANYSTR
+        self.update_obj(st, frozenset({addr}), lambda old, strong: old.replace(stream=None, position=None))
+        return int_iv(0, None)
 
     # ------------------------------------------------ the write side of an output file ([internal ref])
     def _buffer_arg(self, st, v: V, node) -> bool:
@@ -9131,7 +13752,14 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             raise Unsupported(f"method {name} of an output file", node)
         if not _contracts.output_handle_call_shape(name, len(args), bool(kwargs)):
             raise Unsupported(f"{name} of an output file: unmodelled arity/keywords", node)
+        # s_With retains the checked handle kind for exit after its address may have been collected.
+        if (addr is None and name!='__exit__') or (addr is not None and (
+                type(st.heap.get(addr)) is not OutFileObj or st.heap[addr].binary != binary)):
+            raise Unsupported('output method requires the exact builtin-open handle model',node)
         proven = {"TypeError": "the call has exactly the documented arguments"}
+        if name in {'flush','close','__enter__','__exit__'}:
+            proven.update({c.exc:'builtin open handle with builtin codecs, buffers and no subclass hooks'
+                           for c in contract.raises if c.tested and c.condition!='unknown'})
         result = NONE
         if name == "write":
             v = args[0]
@@ -9150,6 +13778,8 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
                 proven.pop("TypeError")
                 if ok:
                     proven["TypeError"] = "the argument is a str"
+                    proven.update({c.exc:'exact builtin str and builtin-open codec/buffer run no target callback'
+                                   for c in contract.raises if c.tested and c.condition!='unknown'})
             result = int_iv(0, None)
         elif name == "writelines":
             proven.pop("TypeError")
@@ -9195,11 +13825,15 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
             if st.bottom:
                 return st
             if ctx.top or ctx.st or ctx.s is not None or ctx.i is not None or ctx.b or ctx.f or ctx.n or not ctx.refs \
-                    or any(st.heap[a].kind != "outfile" for a in ctx.refs):
+                    or any(st.heap[a].kind not in {"outfile", "readfile"} for a in ctx.refs):
                 raise Unsupported("with: a context manager other than a write-only output file", item.context_expr)
             entered = BOT
             kinds = set()
             for a in sorted(ctx.refs, key=str):
+                if st.heap[a].kind == "readfile":
+                    kinds.add(("readfile", a))
+                    entered = vjoin(entered, st.zone, self.readfile_method(st, a, "__enter__", [], {}, item.context_expr), st.zone)
+                    continue
                 kinds.add(st.heap[a].binary)
                 entered = vjoin(entered, st.zone, self.outfile_method(st, a, "__enter__", [], {}, item.context_expr), st.zone)
             handles.append(kinds)
@@ -9211,7 +13845,10 @@ class Analyzer(RandomMixin, ReducersMixin, SetsMixin):
         if end.bottom:
             return end
         for kinds in reversed(handles):
-            for binary in sorted(kinds):
+            for binary in sorted(kinds, key=str):
+                if isinstance(binary, tuple):
+                    self.readfile_method(end, binary[1], "__exit__", [NONE, NONE, NONE], {}, s)
+                    continue
                 self._outfile_call(end, binary, None, "__exit__", [NONE, NONE, NONE], {}, s)
         return end
 
@@ -9356,21 +13993,23 @@ _ARRAY_TYPECODES = frozenset(_ARRAY_INT_RANGES) | _ARRAY_FLOAT_CODES
 # `struct.pack('f', 1e300)`, which DOES raise; the two are not the same contract). So there is
 # no float OverflowError check to make here at all -- only the ROUNDING to single precision,
 # which is what the required 'f'-rounding never-TRUE control exercises. `struct` IS still used
-# (for the rounding itself, an exact IEEE-754 binary32 round-trip) but only after this
-# saturation check keeps its call in-domain, since `struct.pack('<f', ...)` would otherwise
-# raise on exactly the magnitudes real `array` does not.
-_FLOAT32_MAX = 3.4028234663852886e+38
+# (for the rounding itself, an exact IEEE-754 binary32 round-trip); its
+# packing overflow is converted to infinity at the native rounding threshold, not
+# prematurely at the largest finite binary32 value. Integer-to-float conversion can
+# still raise before that storage conversion.
 ARRAY_METHODS = frozenset({"append", "extend"})
 
-BUILTIN_FUNCS = frozenset({"abs", "len", "iter", "range", "min", "max", "print", "isinstance", "sorted"})
+#: the builtin scalar classes a ``check_type`` union hint (``str | float``) may name
+_UNION_HINT_NAMES = frozenset({"int", "bool", "float", "str"})
+BUILTIN_FUNCS = frozenset({"abs", "len", "iter", "range", "min", "max", "print", "isinstance", "sorted", "type"})
 # [internal ref]: "str"/"bool" added so a bare reference to them (e.g. isinstance's 2nd argument) gets
-# the same ("type", name) static tag "list"/"int"/"float"/"object" already do, instead of an
-# unmodelled top -- CALLING str(x)/bool(x) is unaffected either way (no t_str/t_bool handler
-# exists; call_static's "type" dispatch already raises Unsupported for a missing handler
-# exactly like calling a top value already did, same outcome, different message only).
+# the same ("type", name) static tag "list"/"int"/"float"/"object" already do.
+# Calls to str and bool now reach their tested contract visitors; bare references
+# keep their class identity for isinstance/type checks.
 BUILTIN_TYPES = frozenset({"list", "int", "float", "object", "str", "bool", "dict"})
 
 MODULES = {
+    "abc": {"consts": {}, "funcs": ()},
     "math": {
         # EVERY function of the module (contracts/rules_math.py): _math_call is driven by the contract
         # and the shared model table (contracts/adapters/math_model.py); a name whose contract is
@@ -9388,11 +14027,7 @@ MODULES = {
                    "nondet_list", "nondet_dict", "check_type"},
     },
     "io": {
-        # [internal ref]: StringIO only (BytesIO is not used by any current SV
-        # target; add it the same way if one shows up -- see m_io_StringIO's
-        # docstring). The constructor is the only module-level entry point;
-        # every other operation is a METHOD on the object it returns (see
-        # stringio_method).
+        # Program streams share WorldObject facts; all other IO methods still refuse.
         "funcs": {"StringIO"},
     },
     "re": {

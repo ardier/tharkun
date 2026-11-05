@@ -35,15 +35,18 @@ class BytesDecode(Rule):
     names = ("bytes.decode",)
     CONTRACT = Contract(
         qualname="bytes.decode",
-        raises=never_claims(
-            native={"TypeError": "encoding or errors is given and is not a str"},
-            tested=_ALL_TESTED,
+        raises=dunder_propagation_claims(
+            "registered codec lookup, decoder or error handler",
+            native={"TypeError": "encoding/errors is not str, a codec returns an invalid value, or a registered codec callback raises TypeError"},
+            tested_native=frozenset({"TypeError"}),
         ),
         may_raise_other=True,  # LookupError: unknown encoding/errors; UnicodeDecodeError (a ValueError subclass)
         returns=ReturnSpec("str", tested=True),
-        effects=Effects(deterministic=True),
-        notes="same reasoning as str.encode: the receiver is a real bytes object and encoding/errors are type-checked directly, so no property class ever fires here.",
-        source=(_DOCS, "CPython Objects/bytesobject.c::bytes_decode"),
+        effects=Effects(may_execute_callback=True,clock_or_env=True,deterministic=False,
+                        notes="codec and error-handler registries can dispatch arbitrary Python callbacks"),
+        notes="Builtin argument type checks do not exclude registered codecs or error handlers; their exceptions propagate. Empty input may take the native empty-string fast path. Successful results are always str.",
+        source=(_DOCS, "https://docs.python.org/3.14/library/codecs.html#codecs.register_error",
+                "CPython Objects/bytesobject.c::bytes_decode / Objects/unicodeobject.c::PyUnicode_Decode"),
         tested=True,
     )
 
@@ -87,13 +90,15 @@ class BytesFromhex(Rule):
     names = ("bytes.fromhex",)
     CONTRACT = Contract(
         qualname="bytes.fromhex",
-        raises=never_claims(
+        raises=dunder_propagation_claims(
+            "the argument's __buffer__ (a USER method, read when it is not a str)",
             native={"TypeError": "the argument is not str or bytes-like"},
-            tested=_ALL_TESTED,
+            tested_native=frozenset({"TypeError"}),
         ),
-        may_raise_other=True,  # ValueError: non-hexadecimal digit found
+        may_raise_other=True,  # ValueError: non-hexadecimal digit found; a __buffer__ may raise anything
         returns=ReturnSpec("bytes", tested=True),
         effects=Effects(deterministic=True),
+        notes="SOUNDNESS FIX (standing batch 2): an earlier version used never_claims; a non-str argument is read through PyObject_GetBuffer, so a class whose __buffer__ raises propagates any class (bytes.fromhex(X()) -> IndexError on 3.14.4).",
         source=(_DOCS, "CPython Objects/bytesobject.c::bytes_fromhex"),
         tested=True,
     )

@@ -31,13 +31,17 @@ from __future__ import annotations
 from tharkun.facts import Fact
 from tharkun.knowledge import KnowledgeBase
 from tharkun.sv import engine as _engine
+from tharkun.sv import finite_domain as _finite_domain
 from tharkun.sv.ledger import Ledger
-from tharkun.sv.obligation_table import CLASS_HINTS, ObligationTable
+from tharkun.sv.obligation_table import CLASS_HINTS, SITE_OBSERVATION, ObligationTable
 
 
 #: the share of what remains each ``Stage.deepen`` round may spend ([internal ref]): geometric rounds, so the
 #: whole ledger is reachable and a fuzzer that restarts each round keeps its corpus
 DEEPEN_SHARE = 0.5
+
+#: the share of what remains the order-only small model may spend (sv/order_only.py); the search keeps the rest
+ORDER_ONLY_SHARE = 0.4
 
 
 #: the import graph the SV component reads is at most this many modules (a task is one file plus the odd
@@ -144,7 +148,8 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
            task: str | None = None, specification: str | None = None, witness_dir=None,
            language_version: str | None = None,
            checker_seconds: float = 3.0, cpu_time_only: bool = False,
-           store_witness: bool = True) -> _engine.Verdict:
+           wall_clock: bool = False,
+           store_witness: bool = True, seed_vectors=(), box: bool = False, world=None) -> _engine.Verdict:
     """Decide ``! uncaught(E)`` for every ``E`` in ``classes`` on ``program``.
 
     ``budget_seconds`` is CPU time of the verifier and its children (what BenchExec
@@ -196,7 +201,7 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
        The stages that can keep searching an unbounded draw domain (``Stage.deepen``) get what is
        left, in rounds, until the goal (``ledger.goal``) is met or ``ledger.stopped()``."""
     say = log or (lambda msg: None)
-    ledger = Ledger(budget_seconds, cpu_time_only=cpu_time_only, say=say)   # the ONE CPU-second ledger
+    ledger = Ledger(budget_seconds, cpu_time_only=cpu_time_only, wall_clock=wall_clock, say=say)   # the ONE CPU/wall ledger
     python = python or _engine.sys.executable
     environment, reason = _engine.admit_task(program, task=task, python=python, language_version=language_version)
     if reason:
@@ -214,9 +219,16 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
     if set(parse_property(specification)[1]) != set(classes):
         raise ValueError("specification and selected exception classes differ")
     native_reason = _engine.native_import_reason(proof_source, program)
+    # [internal ref]: only what re-importing the evicted modules cannot repair refuses the program.  A static-tier reason is
+    # executed by the native-equivalent child (``sv/_child.py``), which can find a FALSE but proves nothing.
+    runtime_reason = _engine.native_import_reason(proof_source, program, runtime=True, mapping_reads={}) if native_reason else None
+    if runtime_reason:
+        say(f"native-semantics: {runtime_reason}")
+        return _engine.Verdict("unknown", reason=f"native-semantics: {runtime_reason}")
+    native_reason = _engine.proof_import_reason(proof_source, program)
     if native_reason:
-        say(f"native-semantics: {native_reason}")
-        return _engine.Verdict("unknown", reason=f"native-semantics: {native_reason}")
+        say(f"native-semantics: {native_reason} (search only, no proof)")
+        prove = False
     # A program that binds a property exception name itself gets no TRUE (``engine.shadowed_property_names``).
     shadowed = set(_engine.shadowed_property_names(proof_source, classes))
     local_modules = _engine.local_import_files(program)
@@ -234,6 +246,10 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
     # into it and read their inputs from it (sv/obligation_table.py).
     table = ObligationTable(obligations)
     knowledge = table.kb
+    if world is not None:
+        table.world_store().update_snapshot(world)
+    if box:
+        prove = False  # A mocked world cannot certify the original program.
     publish_module_namespace(table, program, say)
     invariant_locations = {(o.invariant.file_name, o.invariant.line, o.invariant.column,
                             o.invariant.function) for o in obligations.obligations}
@@ -260,13 +276,15 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
     #: the module names ANY run so far found absent ([internal ref]): absence is a fact of the environment, not of a run, so the union over
     #: runs is what the determinism census may take (``_engine._certify_determinism``)
     absent_seen: set = set()
+    observation_points = ()
 
-    def run(vec, hashseed=0, share=1, observe_fields=None):
+    def run(vec, hashseed=0, share=1, observe_fields=None, world_override=None):
         # ``share`` children run at once and the budget is their CPU together, so each may use
-        # only its share of what remains ([internal ref]) -- and of what a cap leaves.
+        # only its share of what remains ([internal ref]) -- and of what a cap leaves. Under a wall-clock
+        # budget ([internal ref]), concurrent children run during the same wall window rather than dividing it.
         left = ledger.allowance()
         is_canary = canary is not None and canary_seconds > 0
-        seconds = max(1.0, left / share) if is_canary else left / share
+        seconds = left if ledger.wall_clock else (max(1.0, left / share) if is_canary else left / share)
         with ledger.reserve(min(run_timeout, seconds), canary=is_canary) as granted:
             if granted <= 0:
                 out = _engine.Outcome("timeout", msg="aggregate CPU allowance exhausted")
@@ -275,17 +293,26 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
                     canary["attempted"] = True
                 out = _engine.run_once(python, program, vec, timeout=granted,
                            hashseed=hashseed, memory_bytes=child_memory, files=files,
-                           observe_fields=observe_fields)
+                           observe_fields=observe_fields, **({"box": True} if box else {}),
+                           **({"observe_invariants": observation_points} if observation_points else {}),
+                           **({"world": world_override if world_override is not None else world}
+                              if world_override is not None or world is not None else {}))
         if canary is not None and canary_seconds > 0:
             if out.status in ("timeout", "crashed") or _engine._resource_exhausted(out):
                 canary.update(cut=True, reason=out.exc or out.status)
         absent_seen.update(out.absent_imports)
+        if out.observations and not out.flags and not out.invalid_draw:
+            table.publish_observations(out.observations)
         return out
 
     def done(v: _engine.Verdict) -> _engine.Verdict:
-        if v.verdict == "true" and shadowed:
+        if box and v.verdict == "true":
+            v = _engine.Verdict("unknown", reason="a mocked file world is not proof evidence")
+        if v.verdict == "true" and (shadowed or native_reason):
             # withheld before any witness is written; FALSE (a built-in instance escaped) stays definitive
-            _engine.withhold_true(v, shadowed)
+            why = [r for r in (_engine.shadow_reason(shadowed) if shadowed else None,
+                               _engine.import_state_reason(native_reason) if native_reason else None) if r]
+            _engine.withhold_true(v, shadowed, reason="; ".join(why))
             say(f"withheld: {v.reason}")
         if task is not None or language_version is not None:
             v.detail.update(language_version=environment.language_version if task and task.endswith((".yml", ".yaml"))
@@ -297,6 +324,30 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
                 from tharkun.sv.proof import finish
                 if _engine.read_source(program) != proof_source:
                     raise ValueError("source changed during verification")
+                closure = v.detail.get("source_closure")
+                if closure:
+                    from pathlib import Path
+                    from tharkun.solve.extern import _task_import_closure
+                    changed = any(hashlib.sha256(Path(row["path"]).read_bytes()).hexdigest() != row["sha256"]
+                                  for row in closure)
+                    if 'source_imports' in v.detail:
+                        from tharkun.solve.extern import find_in_roots, _has_compiled_sibling
+                        for record in v.detail['source_imports']:
+                            found = find_in_roots(record['module'], record['roots'])
+                            paths = None if found is None else [*found[1], found[0]]
+                            changed = changed or paths != record['paths']
+                            if paths is not None:
+                                changed = changed or any(
+                                    _has_compiled_sibling(str(path.parent), path.stem)
+                                    or path.with_suffix('.pyc').exists()
+                                    or any(path.parent.glob('__pycache__/' + path.stem + '.*.pyc'))
+                                    for path in map(Path, paths))
+                        changed = changed or bool(_engine.proof_blocker(
+                            proof_source, environment, filename=program, world_reads=True))
+                    else:
+                        changed = changed or _task_import_closure(program) != tuple(row['path'] for row in closure)
+                    if changed:
+                        raise ValueError("import source closure changed during verification")
                 try:
                     from tharkun.sv.store_witness import record_route
                     record_route(table, v)
@@ -391,7 +442,7 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
         confirmations = 1                 # the discovery run itself is the first trial
         if not fresh:
             # Fork-derived discoveries must reproduce in an independent fresh interpreter.
-            confirmed = run(v.witness['vector'])
+            confirmed = run(v.witness['vector'], **({'world_override': v.witness['world']} if 'world' in v.witness else {}))
             runs += 1
             if not (_engine._replayed(v.witness['vector'], confirmed) and
                     confirmed.violated((v.exception,)) is not None):
@@ -426,7 +477,8 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
                     return done(_engine.Verdict('unknown', reason=(
                         f"violation witness not proven address-independent ({why}) and the budget "
                         f"ran out before {k}/{k} replay confirmations ({confirmations}/{k} so far)")))
-                rep = run(v.witness['vector'], hashseed=confirmations)
+                rep = run(v.witness['vector'], hashseed=confirmations,
+                          **({'world_override': v.witness['world']} if 'world' in v.witness else {}))
                 runs += 1
                 if not (_engine._replayed(v.witness['vector'], rep) and
                         rep.violated((v.exception,)) is not None):
@@ -446,7 +498,15 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
         # the table ([internal ref] step 2).
         site = (v.witness or {}).get("site") or {}
         ledger.goal.record()
-        table.violate(v.exception, site.get("line"), v.component, column=site.get("column"))
+        if v.witness.get("review_required"):
+            from tharkun.solve.world import WorldRefused
+            try:
+                table.world_store().update_snapshot(v.witness["world"])
+            except WorldRefused as exc:
+                return done(_engine.Verdict("unknown", reason=f"confirmed world contradicts run facts: {exc}"))
+            v.detail.update(provenance="obtained via mocking", review_required=True)
+        else:
+            table.violate(v.exception, site.get("line"), v.component, column=site.get("column"))
         return done(v)
 
     def replay_solved(solved) -> _engine.Verdict | None:
@@ -483,6 +543,7 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
         try:
             from tharkun.sv import product_proof as _product_proof
             pv = _product_proof.prove(proof_source, classes, program=program, python=python,
+                                      declared_files=files,
                                       prop_name=prop_name,
                                       run_timeout=max(1.0, min(30.0, remaining())),
                                       timeout_ms=_product_proof.z3_timeout_ms(remaining()))
@@ -496,6 +557,17 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
                 return found(pv, fresh=True)
             say(f"symbolic:product: TRUE, {len(pv.detail.get('sites', []))} check(s) proven")
             proof = pv
+            v = start_canary(proof, f"canary for {proof.component}")
+            if v is not None:
+                return v
+
+    if prove and proof is None and remaining() > 1:
+        try:
+            from tharkun.sv.combined_proof import prove as combine
+            proof = combine(proof_source, program, classes, table, seconds=min(3.0, remaining()))
+        except Exception as error:
+            say(f"proof:combined: refused ({type(error).__name__}: {error})")
+        if proof is not None:
             v = start_canary(proof, f"canary for {proof.component}")
             if v is not None:
                 return v
@@ -524,6 +596,8 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
     # --- stage 3: execution ---
     field_demands = None
     if prove and proof is None:
+        from tharkun.sv.observed_invariants import points
+        observation_points = points(proof_source, program, obligations) if not box and not shadowed else ()
         try:
             from tharkun.solve.absint.contracts import demands
             field_demands = demands(_engine.read_source(program))
@@ -567,6 +641,9 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
             return done(proof or _engine.Verdict("unknown", reason=f"second run {second.status}"))
         if (second.status, second.exc) != (first.status, first.exc):
             return done(proof or _engine.Verdict("unknown", reason="hash-order dependent"))
+        if second.draws or second.flags:
+            # the one-execution claim needs BOTH observations draw- and flag-free (svaudit 2026-10-29)
+            return done(proof or _engine.Verdict("unknown", reason="second run drew or raised a flag"))
         if proof is not None:
             return done(proof)
         # Two hash seeds are samples; only the certificate proves determinism.
@@ -602,20 +679,45 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
     # Producers propose; sv/fact_proof.py certifies each proposal independently and
     # decides TRUE only when every current obligation is independently checked in this invocation.
     # With no producer installed this is one entry-point lookup and nothing else.
-    if prove and proof is None and not first.flags and remaining() > 1:
-        from tharkun.sv.fact_proof import prove_from_facts
+    facts_left = None
+
+    def try_facts(*, initial=False):
+        nonlocal proof, facts_left, observation_points
+        if not prove or proof is not None or first.flags or remaining() <= 1:
+            return None
+        fresh = table.since("facts", SITE_OBSERVATION)
+        if not initial and not fresh:
+            return None
+        from tharkun.sv.fact_proof import PRODUCER_CAP_SECONDS, PRODUCER_SHARE, prove_from_facts
+        if facts_left is None:
+            facts_left = min(remaining() * PRODUCER_SHARE, PRODUCER_CAP_SECONDS) + checker_seconds
+        if facts_left < 1:
+            observation_points = ()
+            return None
+        started, cpu_started = _engine.time.monotonic(), ledger.spent()
+
+        def fact_remaining():
+            spent = max(_engine.time.monotonic() - started, ledger.spent() - cpu_started)
+            return min(remaining(), facts_left - spent)
+
         try:
             fp = prove_from_facts(program, classes, source=proof_source, specification=specification,
-                                  table=table, python=python, remaining=remaining, say=say,
-                                  checker_seconds=checker_seconds, memory_bytes=child_memory)
+                                  table=table, python=python, remaining=fact_remaining, say=say,
+                                  checker_seconds=checker_seconds, memory_bytes=child_memory,
+                                  budget_seconds=facts_left)
         except Exception as e:  # noqa: BLE001 -- a proof stage never decides by crashing
             say(f"facts: internal failure ({type(e).__name__})")
             fp = None
+        facts_left -= max(_engine.time.monotonic() - started, ledger.spent() - cpu_started)
         if fp is not None:
             proof = fp
-            v = start_canary(proof, f"canary for {proof.component}")
-            if v is not None:
-                return v
+            observation_points = ()
+            return start_canary(proof, f"canary for {proof.component}")
+        return None
+
+    v = try_facts(initial=True)
+    if v is not None:
+        return v
     if prove and proof is None and not first.flags and remaining() > 1:
         try:
             from tharkun.sv.prove import prove_dynamic
@@ -623,9 +725,10 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
             prove_dynamic = None
         if prove_dynamic is not None:
             try:
+                # Stage 1b already attempted the same whole-program exact route.
                 dyn = prove_dynamic(program, classes, python=python, remaining=remaining, jobs=jobs,
                                     log=say, run_timeout=run_timeout, memory_bytes=run_memory_bytes,
-                                    knowledge=knowledge, files=files)
+                                    knowledge=knowledge, files=files, exact_attempted=True)
             except Exception as e:  # noqa: BLE001
                 say(f"prove_dynamic: crashed ({type(e).__name__}: {e})")
                 dyn = None
@@ -641,8 +744,10 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
                 if v is not None:
                     return v
 
+    seed_vectors = tuple(list(v) for v in seed_vectors or () if _engine.vector_admissible(list(v), first))
     ctx = _stages.Context(program, tuple(classes), python=python, memory_bytes=child_memory,
-                          first=first, log=say, table=table, files=files, ledger=ledger, task=task)
+                          first=first, log=say, table=table, files=files, ledger=ledger, task=task,
+                          seed_vectors=seed_vectors, box=box)
     exploratory_runs = 0
     available = _engine.queue.Queue()
     server_lock = _engine.threading.Lock()
@@ -658,32 +763,171 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
                         available.put(server)
         return available.get()
 
-    def explore(vec, share=1):
+    def explore(vec, share=1, world_override=None):
         nonlocal exploratory_runs
         with server_lock:
             exploratory_runs += 1
             is_lazy = exploratory_runs <= lazy_vectors and (_engine.time.monotonic() - ledger.started) < lazy_seconds
         if _engine.sys.platform != 'linux' or is_lazy:
-            return run(vec, share=share)
+            return run(vec, share=share, world_override=world_override)
         server = get_server()
         try:
-            with ledger.reserve(min(run_timeout, ledger.allowance() / share)) as granted:
+            allow = ledger.allowance() if ledger.wall_clock else ledger.allowance() / share
+            with ledger.reserve(min(run_timeout, allow)) as granted:
                 if granted <= 0:
                     out = _engine.Outcome("timeout", msg="aggregate CPU allowance exhausted")
                 else:
                     out = server.run(python, program, vec, timeout=granted,
-                                     memory_bytes=child_memory, files=files)
+                                     memory_bytes=child_memory, files=files,
+                                     **({"observe_invariants": observation_points} if observation_points else {}),
+                                     **({"box": True} if box else {}),
+                                     **({"world": world_override if world_override is not None else world}
+                                        if world_override is not None or world is not None else {}))
             absent_seen.update(out.absent_imports)
+            if out.observations and not (set(out.flags) - {"forked"}) and not out.invalid_draw:
+                table.publish_observations(out.observations)
             return out
         finally:
             available.put(server)
 
+    def order_only_stage() -> _engine.Verdict | None:
+        """TRUE (every weak ordering ran clean and the runs are certified deterministic), FALSE (a replayed violation) or
+        None (outside the fragment, incomplete, or not certified: the search goes on)."""
+        nonlocal runs
+        from tharkun.sv import order_only as _oo
+        try:
+            plan = _oo.analyze(proof_source, program)
+            size = _oo.plan_size(plan)
+        except _oo.Refused as why:
+            say(f"order-only: refused ({why})")
+            return None
+        except Exception as e:  # noqa: BLE001 -- an analysis never decides by crashing
+            say(f"order-only: internal error {type(e).__name__}: {e}")
+            return None
+        deadline = ledger.spent() + ledger.share(ORDER_ONLY_SHARE)
+        say(f"order-only: {len(plan.lists)} list(s), {size} orderings x index values to run")
+        batch = _oo.run_plan(plan, program, python, classes, allowance=lambda: min(ledger.allowance(), deadline - ledger.spent()),
+                             memory_bytes=child_memory)
+        if batch.violation is not None:
+            vec = batch.violation["vector"]
+            out = run(vec)
+            runs += 1
+            hit = out.violated(classes)
+            if hit and _engine._replayed(vec, out):
+                say(f"order-only: {hit} on ordering {vec and [e['value'] for e in vec]} after {batch.ran} runs")
+                return found(_engine.Verdict("false", hit, witness=_engine._witness(program, prop_name, hit, out),
+                                             component="order_only"), fresh=True)
+            say("order-only: a violating ordering did not replay in a fresh child; the search goes on")
+            return None
+        if not batch.complete:
+            say(f"order-only: not complete after {batch.ran} runs ({batch.anomaly})")
+            return None
+        det = _engine._certify_determinism(program, absent_imports=frozenset(absent_seen), files=files)
+        # strict census only: the class-only retry is pinned to the three routes of tests/test_class_only_exceptions.py
+        if det is None or not det.ok:
+            say("order-only: every ordering ran clean, but determinism is not certified; the search goes on")
+            return None
+        return done(_engine.Verdict("true", reason=f"order-only small model: {batch.ran} runs cover every input "
+                                    f"(drawn values reach only order operations; runs certified deterministic given the "
+                                    f"draws: {det.reason})",
+                                    component="order_only", detail={"certificate": det.reason, "orderings": batch.ran}))
+
     try:
+        # --- stage 3a': the order-only small model (docs/SV.md "Order-only small model", sv/order_only.py) ---
+        # A bounded list program whose drawn values reach only order and equality operations behaves identically on
+        # order-isomorphic inputs, so the weak orderings of at most MAX_VALUES ranks cover every input.  Decided by a
+        # dataflow check over the whole module (never a name list); anything outside it is a refusal, and the run goes on.
+        gate = ("a proof is pending" if proof is not None else f"flags {sorted(first.flags)}" if first.flags
+                else "a boxed or mocked world" if box or world is not None else "declared files" if any(_engine.os.path.abspath(f) != _engine.os.path.abspath(program) for f in files or ())
+                else "no budget" if remaining() <= 4 else None)
+        if gate is None:
+            v = order_only_stage()
+            if v is not None:
+                return v
+        else:
+            say(f"order-only: skipped ({gate})")
+
+        # Order (measured on the 48 index-only Semantics pairs: same 31 correct, 3464 s against 4220 s in total, subsequences ~100 s -> 8-16 s): a static
+        # analysis (milliseconds) decides whether the program is in the order-only fragment; only then do its native runs (a forked batch, ~7 ms each)
+        # cost anything, at most ORDER_ONLY_SHARE of what remains.  It goes BEFORE the finite-domain sweep because both accept a program whose draws are
+        # all guard-bounded ints and this runner is the faster of the two; a program it refuses (an int used as a number over more than
+        # MAX_INDEX_DOMAIN values, an element used as a number) falls through to the sweep, and a violation is FALSE here as there.
+
+        # --- stage 3b (T178): the inputs are bounded by the program's own early-return guards (sv/finite_domain.py) ---
+        # Before the portfolio, so a box that needs most of the budget (quixbugs get_factors: 1000 fresh runs) is not left what the fuzzers did not
+        # spend; and it cannot starve the proof stages: the sweep stops at the first run that is cut, and a sweep whose measured rate projects past
+        # its deadline (``DEADLINE_SHARE`` of the budget left) stops after a few runs instead of burning it.  The first implementation (2fe973d1,
+        # an AI lane) checked the ledger only between batches and kept going after a cut run, so a box of timing-out runs overran the budget and
+        # starved the absint rounds that decide quixbugs hanoi_1 dynamic-typing / hanoi_2 arithmetic in 19 s (found by lane 1519).
+        if proof is None and not first.flags and not box and world is None:
+            fd_box = _finite_domain.derive_box(proof_source, cap=_finite_domain.BATCH_CAP)
+            if fd_box is not None:
+                say(f"finite domain: {len(fd_box.names)} draw(s), {fd_box.size} vector(s) {list(fd_box.intervals)}")
+                # The runs of a program the strict census certifies deterministic given its draws (``_certify_determinism``, here BEFORE the sweep) are a
+                # function of the draws, so a forked run of the warmed fork server (about 3.5x cheaper than a fresh child) is the same evidence as a fresh
+                # one; without the certificate every run stays fresh, as for ``finite_tree``.  A box over ``BOX_CAP`` (QuixBugs to_base: 35,000 vectors)
+                # needs the batched child as well, which only a program ``batch_admissible`` admits.
+                det0 = _engine._certify_determinism(program, absent_imports=frozenset(absent_seen), files=files)
+                certified = det0 is not None and det0.ok and _engine.sys.platform == "linux"
+                forked = certified
+                batch = certified and _finite_domain.batch_admissible(proof_source)
+                if fd_box.size > _finite_domain.BOX_CAP and not batch:
+                    say(f"finite domain: {fd_box.size} vectors over the cap and no batched sweep for this program")
+                    fd_box = None
+            if fd_box is not None:
+                if forked and not batch:
+                    # the fork server differs from a fresh child in what it started with (``-S``, no PYTHONPATH): the first, a middle and the last vector must
+                    # give the same status, exception and site both ways, else every run stays fresh
+                    vecs = list(fd_box.vectors())
+                    for probe in (vecs[0], vecs[len(vecs) // 2], vecs[-1]):
+                        a, b = run(probe), explore(probe)
+                        if (a.status, a.exc, a.site, len(a.draws)) != (b.status, b.exc, b.site, len(b.draws)):
+                            forked = False
+                            say(f"finite domain: forked and fresh runs differ on {probe}: using fresh runs")
+                            break
+                say(f"finite domain: {'batched' if batch else 'forked' if forked else 'fresh'} runs")
+                deadline = _engine.time.monotonic() + _finite_domain.DEADLINE_SHARE * max(0.0, remaining())
+                if batch:
+                    sw = _finite_domain.sweep_batch(fd_box, proof_source, program, python, run, classes, stopped=ledger.stopped,
+                                                    resource_exhausted=_engine._resource_exhausted, deadline=deadline)
+                else:
+                    sw = _finite_domain.sweep(fd_box.vectors(), explore if forked else run, classes, jobs=jobs, stopped=ledger.stopped,
+                                              resource_exhausted=_engine._resource_exhausted, expected_draws=len(fd_box.names),
+                                              deadline=deadline, total=fd_box.size)
+                runs += sw.runs
+                if sw.status == "violation":
+                    say(f"finite domain: {sw.hit} at {sw.out.site}")
+                    return found(_engine.Verdict("false", sw.hit, witness=_engine._witness(program, prop_name, sw.hit, sw.out),
+                                                 component="enum:finite_domain"), fresh='forked' not in sw.out.flags)
+                if sw.status == "complete":
+                    # strict census only: the class-only retry is pinned to the three routes of tests/test_class_only_exceptions.py
+                    det = _engine._certify_determinism(program, absent_imports=frozenset(absent_seen), files=files)
+                    if det is not None and det.ok:
+                        return done(_engine.Verdict(
+                            "true", reason=f"finite domain: {fd_box.size} input vector(s) (the box the early-return guards leave, "
+                                           f"{list(fd_box.intervals)}) all run, none violating; runs certified deterministic given the "
+                                           f"draws ({det.reason})",
+                            component="proof:finite_domain",
+                            detail={"certificate": det.reason, "box": [list(i) for i in fd_box.intervals], "vectors": fd_box.size,
+                                    "runs": "batched" if batch else "forked" if forked else "fresh"}))
+                    say(f"finite domain: swept, determinism not certified: {det.reason if det is not None else 'unreadable'}")
+                else:
+                    say(f"finite domain: {sw.status} ({sw.why})")
+
+
         # --- stage 4: the solving portfolio (tharkun.sv.stages, [internal ref]): seed stages, and the
         # per-site concolic drive on the sites stage 2 left open ---
         # a helper process gets one child's share of the memory cap, like every run, so the
         # verifier and whatever it has started stay inside the task's limit together
         seeded: dict = {}
+        if seed_vectors:
+            # [internal ref]: the caller's seed vectors' values, ranked right after each kind's head (engine.Candidates)
+            by_kind: dict = {}
+            for vec in seed_vectors:
+                for e in vec:
+                    by_kind.setdefault(e["kind"], []).append(_engine._decode(e))
+            seeded["seed:vectors"] = by_kind
+            say(f"seed vectors: {len(seed_vectors)} from the caller (hybrid corpus, enumeration seeds)")
         proposed = 0                 # vectors the portfolio proposed, over every round ([internal ref])
 
         def replay_stream(stream) -> _engine.Verdict | None:
@@ -695,7 +939,8 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
                 for cand in stream:
                     if ledger.stopped():
                         break
-                    out = run(cand.vector) if proof is not None else explore(cand.vector)
+                    options = {"world_override": cand.detail["world"]} if box and "world" in cand.detail else {}
+                    out = run(cand.vector, **options) if proof is not None else explore(cand.vector, **options)
                     runs += 1
                     proposed += 1
                     hit = out.violated(classes)
@@ -705,6 +950,9 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
                                              component=cand.component, detail=cand.detail),
                                      fresh='forked' not in out.flags)
                     say(f"run {runs}: solved vector did not violate ({out.status} {out.exc or ''})")
+                    v = try_facts()
+                    if v is not None:
+                        return v
             finally:
                 close = getattr(stream, "close", None)
                 if close is not None:
@@ -831,12 +1079,24 @@ def run(program: str, classes, *, prop_name: str = "", python: str | None = None
                                              component=src if src in seeded else f"enum:{src}"),
                                      fresh='forked' not in out.flags)
                     expand(len(vec), out.draws)
+                v = try_facts()
+                if v is not None:
+                    return v
         if complete and finite:
             # one run per draw vector covers the tree only if runs are deterministic given the draws
             det = _engine._certify_determinism(program, absent_imports=frozenset(absent_seen), files=files)
+            class_only = False
+            if det is not None and not det.ok:
+                # as in the deterministic route: a separate re-run, and the verdict is exception classes alone
+                det_class = _engine._certify_determinism(program, absent_imports=frozenset(absent_seen),
+                                                         files=files, class_only_exceptions=True)
+                if det_class is not None and det_class.ok:
+                    det, class_only = det_class, True
             if det is not None and det.ok:
                 return done(_engine.Verdict("true", reason=f"finite draw tree enumerated; runs certified "
-                                                   f"deterministic given the draws ({det.reason})",
+                                                   f"deterministic given the draws" +
+                                                   (", exceptions judged by class" if class_only else "") +
+                                                   f" ({det.reason})",
                                     component="finite_tree", detail={"certificate": det.reason}))
             why = det.reason if det is not None else "the program cannot be read"
             return done(proof or _engine.Verdict("unknown", reason=f"finite draw tree enumerated, but determinism "

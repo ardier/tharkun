@@ -29,8 +29,10 @@ The replacement is exact, not a bound: the iterations are the whole loop.  What 
 * no ``else`` clause and no ``break`` / ``continue`` anywhere in the body (a ``return`` is fine: it is a statement of the
   copy, and the interpreter's early-return merge handles it like any other); a step of ``0`` is not unrolled (``range``
   raises ``ValueError``: the audit refuses the remaining ``for``);
-* at most :data:`MAX_TRIPS` iterations and :data:`MAX_NODES` AST nodes in all, so a program cannot make the proof's
-  input explode;
+* integer folding uses a cumulative :data:`FOLD_WORK_BUDGET` bit-work allowance, shared with the later source audit;
+  exhaustion leaves the operation unexpanded rather than truncating a value or renewing work for another expression;
+* at most :data:`MAX_NODES` generated AST nodes per expansion, costed before materializing the range
+  or copying its body; this is a work budget, not a bound on sequence lengths or integer values;
 * every copy is a deep copy that keeps the ORIGINAL line numbers, so the violation sites (``violation_sites`` is read from
   the original source) are the same lines in every copy, and each copy's draw calls are distinct nodes, so each iteration
   draws a fresh term (``product_proof.py::_lift`` marks them per node).
@@ -64,34 +66,147 @@ import ast
 import copy
 import operator
 
-#: the most iterations of one loop
-MAX_TRIPS = 64
 #: the most AST nodes the unrolled copies of one loop may hold
 MAX_NODES = 20000
+# The largest constant integer exponent the symbolic evaluator (`_symexec.ev_BinOp`) expands EXACTLY (repeated multiplication); the audit admits
+# exactly the powers the evaluator can decide, not one spelling of them.
+EXACT_POW_MAX = 8
 _FOLD = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.FloorDiv: operator.floordiv,
          ast.Mod: operator.mod, ast.LShift: operator.lshift, ast.RShift: operator.rshift}
-_BIG = 1 << 62
+#: Cumulative integer bit-work per normalization and its subsequent source audit.
+FOLD_WORK_BUDGET = 1_000_000
+_DEFAULT_INT = 1 << 62
+
+
+class _FoldWork:
+    def __init__(self):
+        self.remaining = FOLD_WORK_BUDGET
+
+    def spend(self, cost):
+        if cost > self.remaining:
+            self.remaining = 0
+            return False
+        self.remaining -= cost
+        return True
+
+
+def _fold_observed_names(tree):
+    """Bindings reaching a range, counter condition or repetition count, including direct-call parameters."""
+    nodes = tuple(ast.walk(tree))
+    reads = lambda node: {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    wanted, dependencies = set(), {}
+    defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    dependencies.setdefault(target.id, set()).update(reads(node.value))
+        if isinstance(node, ast.While):
+            wanted.update(reads(node.test))
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            if isinstance(node.left, ast.List):
+                wanted.update(reads(node.right))
+            if isinstance(node.right, ast.List):
+                wanted.update(reads(node.left))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == 'range':
+                for argument in node.args:
+                    wanted.update(reads(argument))
+            if node.func.id in defs:
+                for param, arg in zip(defs[node.func.id].args.args, node.args):
+                    dependencies.setdefault(param.arg, set()).update(reads(arg))
+    pending = list(wanted)
+    while pending:
+        for name in dependencies.get(pending.pop(), set()) - wanted:
+            wanted.add(name)
+            pending.append(name)
+    return wanted
+
+
+class _FoldConstants(dict):
+    def __init__(self, tree, values=()):
+        super().__init__(values)
+        self.tree = tree
+        self.work = getattr(tree, '_tharkun_fold_work', None)
+        self.binding = None
+
+    def wide_work(self):
+        if self.tree is not None and self.binding is not None:
+            observed = getattr(self.tree, '_tharkun_fold_observed', None)
+            if observed is None:
+                self.tree._tharkun_fold_observed = observed = _fold_observed_names(self.tree)
+            if self.binding not in observed:
+                return None  # No modeled count or bound can observe this optional constant.
+        if self.work is None:
+            self.work = _FoldWork()
+            if self.tree is not None:
+                self.tree._tharkun_fold_work = self.work
+        return self.work
+
+
+def _wide_fold(a, b, op, consts):
+    work = consts.wide_work()
+    if work is None:
+        return None
+    if op in (ast.UAdd, ast.USub):
+        cost = max(1, a.bit_length())
+    elif op is ast.LShift:
+        cost = a.bit_length() + b if a else 1
+    elif op is ast.RShift:
+        cost = max(1, a.bit_length() - b + 1)
+    else:
+        cost = a.bit_length() + b.bit_length() + 1
+    if not work.spend(max(1, cost)):
+        return None
+    return (+a if op is ast.UAdd else -a) if b is None else _FOLD[op](a, b)
 
 
 def fold_int(node, consts: dict):
-    """The int value of ``node`` (literals, names of ``consts``, ``- + * // % << >>``), or ``None``."""
-    if isinstance(node, ast.Constant):
-        return node.value if type(node.value) is int else None
-    if isinstance(node, ast.Name):
-        return consts.get(node.id) if isinstance(node.ctx, ast.Load) else None
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
-        v = fold_int(node.operand, consts)
-        return None if v is None else (-v if isinstance(node.op, ast.USub) else v)
-    if isinstance(node, ast.BinOp) and type(node.op) in _FOLD:
-        a, b = fold_int(node.left, consts), fold_int(node.right, consts)
-        if a is None or b is None or abs(a) > _BIG or abs(b) > _BIG:
-            return None
-        if isinstance(node.op, (ast.FloorDiv, ast.Mod)) and b == 0:
-            return None
-        if isinstance(node.op, (ast.LShift, ast.RShift)) and not 0 <= b <= 64:
-            return None
-        v = _FOLD[type(node.op)](a, b)
-        return v if abs(v) <= _BIG else None
+    """Keep primitive folding cheap; allocate wide context only for compound expressions."""
+    try:
+        if isinstance(node, ast.Constant):
+            return node.value if type(node.value) is int or type(node.value) is bool else None
+        if isinstance(node, ast.Name):
+            return consts.get(node.id) if isinstance(node.ctx, ast.Load) else None
+        if type(consts) is dict:
+            consts = _FoldConstants(None, consts)
+        if isinstance(node, ast.UnaryOp):
+            op = type(node.op)
+            if op not in (ast.USub, ast.UAdd):
+                return None
+            value = fold_int(node.operand, consts)
+            if value is None:
+                return None
+            if op is ast.UAdd:
+                return +value
+            return -value if abs(value) <= _DEFAULT_INT else _wide_fold(value, None, op, consts)
+        if isinstance(node, ast.BinOp):
+            op = type(node.op)
+            operation = _FOLD.get(op)
+            if operation is None:
+                return None
+            a, b = fold_int(node.left, consts), fold_int(node.right, consts)
+            if a is None or b is None:
+                return None
+            if op in (ast.FloorDiv, ast.Mod) and b == 0:
+                return None
+            shift = op is ast.LShift or op is ast.RShift
+            if shift and b < 0:
+                return None
+            if op is ast.LShift and a == 0:
+                return 0
+            if op is ast.RShift and abs(a) <= _DEFAULT_INT and b > 64:
+                return -1 if a < 0 else 0
+            if abs(a) > _DEFAULT_INT or abs(b) > _DEFAULT_INT or shift and b > 64:
+                return _wide_fold(a, b, op, consts)
+            value = operation(a, b)
+            return value if abs(value) <= _DEFAULT_INT else _wide_fold(a, b, op, consts)
+    except (ArithmeticError, MemoryError, RecursionError):
+        if type(consts) is dict:
+            consts = _FoldConstants(None, consts)
+        work = consts.wide_work()
+        if work is not None:
+            work.remaining = 0
     return None
 
 
@@ -125,9 +240,15 @@ def _param_constants(tree: ast.Module, consts: dict, count: dict) -> None:
     """Add to ``consts`` the def PARAMETERS every call passes the same foldable int (``all_not_none(xs, N)`` for
     ``def all_not_none(xs, n)`` makes ``n`` the constant ``N``): the def is a top-level plain positional ``def`` bound once
     and called at least once, the parameter's name is bound exactly once in the whole module (as that parameter, and the def
-    never assigns it), every load is inside that def's body, and every call of the def is positional with the
+    never assigns it), every load is inside that def's body, the def is only referenced as a direct callee,
+    and every call of the def is positional with the
     argument at that place folding to the one same value.  To a fixpoint, since an argument may be another constant name."""
+    direct = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    # A returned function can be called with arguments the named-call census never sees.
+    escaped = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+               and id(n) not in direct}
     defs = {st.name: st for st in tree.body if isinstance(st, ast.FunctionDef) and count.get(st.name) == 1
+            and st.name not in escaped
             and not (st.args.posonlyargs or st.args.kwonlyargs or st.args.vararg or st.args.kwarg or st.args.defaults)}
     calls: dict = {}
     for n in ast.walk(tree):
@@ -143,7 +264,9 @@ def _param_constants(tree: ast.Module, consts: dict, count: dict) -> None:
             for j, a in enumerate(fd.args.args):
                 if a.arg in consts or count.get(a.arg) != 1 or not calls.get(name) or a.arg in outside_loads:
                     continue
+                consts.binding = a.arg
                 vals = {fold_int(c.args[j], consts) if j < len(c.args) and not c.keywords else None for c in calls[name]}
+                consts.binding = None
                 if len(vals) == 1 and None not in vals:
                     consts[a.arg] = vals.pop()
                     changed = True
@@ -153,22 +276,24 @@ def module_constants(tree: ast.Module) -> dict:
     """Names bound exactly once in the whole module to a foldable int: by a top-level ``name = <expression>``, or as a def's
     parameter every call passes the same value (:func:`_param_constants`)."""
     count = _bindings(tree)
-    consts: dict = {}
+    consts = _FoldConstants(tree)
     for st in tree.body:
         if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
                 and count.get(st.targets[0].id) == 1):
+            consts.binding = st.targets[0].id
             v = fold_int(st.value, consts)
             if v is not None:
                 consts[st.targets[0].id] = v
+    consts.binding = None
     _param_constants(tree, consts, count)
     return consts
 
 
-def _trips(start: int, stop: int, step: int) -> list | None:
-    """The exact range values, or ``None`` when their count exceeds :data:`MAX_TRIPS`."""
+def _trips(start: int, stop: int, step: int, *, node_cost: int = 1, node_overhead: int = 0) -> list | None:
+    """Exact values, or ``None`` before materialization would exhaust the expansion work budget."""
     values = range(start, stop, step)
     try:
-        if len(values) > MAX_TRIPS:
+        if node_overhead + len(values) * node_cost > MAX_NODES:
             return None
     except OverflowError:
         return None
@@ -223,7 +348,8 @@ def _counter_trips(init, loop: ast.While, consts: dict):
     if stop is None or step is None or step == 0 or (step > 0) != (type(t.ops[0]) in (ast.Lt, ast.LtE)) \
             or not _body_leaves_the_counter(loop.body[:-1], name):
         return None
-    return _trips(start, stop + _TEST_OPS[type(t.ops[0])], step)
+    size = sum(1 for st in loop.body for _ in ast.walk(st))
+    return _trips(start, stop + _TEST_OPS[type(t.ops[0])], step, node_cost=size)
 
 
 def _body_leaves_the_counter(stmts, name: str) -> bool:
@@ -247,7 +373,7 @@ def _fuse_counter_loops(stmts: list, consts: dict) -> list:
             values = _counter_trips(out[-1], st, consts)
             if values is not None:
                 size = sum(1 for s in st.body for _ in ast.walk(s))
-                if len(values) <= MAX_TRIPS and size * len(values) <= MAX_NODES:
+                if size * len(values) <= MAX_NODES:
                     for _ in values:
                         out.extend(copy.deepcopy(s) for s in st.body)
                     continue
@@ -258,6 +384,9 @@ def _fuse_counter_loops(stmts: list, consts: dict) -> list:
 class _Unroll(ast.NodeTransformer):
     def __init__(self, consts: dict):
         self.consts = consts
+
+    def visit_Assign(self, node: ast.Assign):
+        return _expand_symbolic_range_unpack(node) or self.generic_visit(node)
 
     def generic_visit(self, node):
         """Children first (an inner loop is plain statements by then), then every statement list of ``node`` has its
@@ -277,11 +406,9 @@ class _Unroll(ast.NodeTransformer):
             return node
         if any(isinstance(n, (ast.Break, ast.Continue)) for st in node.body for n in ast.walk(st)):
             return node
-        values = _trips(*args)
+        size = sum(1 for st in node.body for _ in ast.walk(st)) + 4
+        values = _trips(*args, node_cost=size)
         if values is None:
-            return node
-        size = sum(1 for st in node.body for _ in ast.walk(st)) + 3
-        if len(values) > MAX_TRIPS or size * len(values) > MAX_NODES:
             return node
         out: list = []
         for k in values:
@@ -310,6 +437,103 @@ class _Substitute(ast.NodeTransformer):
 _REBINDING = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.NamedExpr)
 
 
+def _affine(node):
+    """``(coefficients by name, constant)`` of a pure integer expression built from names, int literals, ``+``, ``-``, unary signs and a
+    product with an int literal; ``None`` for anything else (calls, attributes, bool or float literals, non-literal products)."""
+    if isinstance(node, ast.Constant):
+        return ({}, node.value) if type(node.value) is int else None
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+        return {node.id: 1}, 0
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        inner = _affine(node.operand)
+        if inner is None:
+            return None
+        sign = 1 if isinstance(node.op, ast.UAdd) else -1
+        return {k: sign * v for k, v in inner[0].items()}, sign * inner[1]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+        left, right = _affine(node.left), _affine(node.right)
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Mult):
+            for scale, other in ((left, right), (right, left)):
+                if not scale[0]:
+                    return {k: scale[1] * v for k, v in other[0].items()}, scale[1] * other[1]
+            return None
+        sign = 1 if isinstance(node.op, ast.Add) else -1
+        merged = dict(left[0])
+        for name, coefficient in right[0].items():
+            merged[name] = merged.get(name, 0) + sign * coefficient
+        return merged, left[1] + sign * right[1]
+    return None
+
+
+def _constant_difference(start, stop):
+    """``stop - start`` when linear arithmetic over the same names makes it an int constant, else ``None``."""
+    a, b = _affine(start), _affine(stop)
+    if a is None or b is None:
+        return None
+    names = set(a[0]) | set(b[0])
+    return b[1] - a[1] if all(a[0].get(n, 0) == b[0].get(n, 0) for n in names) else None
+
+
+def _expand_symbolic_range_unpack(node: ast.Assign):
+    """Immediate fixed-cardinality scalar generator; complete the RHS before target stores."""
+    if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Tuple) \
+            or not isinstance(node.value, ast.GeneratorExp):
+        return None
+    names = [n.id for n in node.targets[0].elts if isinstance(n, ast.Name)]
+    count = len(names)
+    if count != len(node.targets[0].elts) or len(set(names)) != count:
+        return None
+    expr = node.value
+    if len(expr.generators) != 1:
+        return None
+    gen = expr.generators[0]
+    call = gen.iter
+    if gen.is_async or gen.ifs or not isinstance(gen.target, ast.Name) \
+            or not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) \
+            or call.func.id != 'range' or call.keywords or len(call.args) not in (2, 3):
+        return None
+    start, stop = call.args[:2]
+    # The category is "a range whose trip count is a compile-time constant equal to the number of targets": the stop minus the start is a
+    # constant by linear arithmetic over the same names, however it is spelled (`start + 3`, `3 + start`, `start + 1 + 2`, `n * 2 + 3` ...).
+    step = 1
+    if len(call.args) == 3:
+        literal = _affine(call.args[2])
+        if literal is None or literal[0] or literal[1] == 0:
+            return None
+        step = literal[1]
+    difference = _constant_difference(start, stop)
+    if difference is None or len(range(0, difference, step)) != count:
+        return None
+    allowed = (ast.Name, ast.Load, ast.Constant, ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub,
+               ast.Mult, ast.FloorDiv, ast.Mod, ast.Pow, ast.UAdd, ast.USub)
+    nodes = list(ast.walk(expr.elt))
+    generated_size = 14 + count * (len(nodes) + 3 * sum(isinstance(n, ast.Name) for n in nodes) + 2)
+    if generated_size > MAX_NODES or any(not isinstance(n, allowed)
+            or isinstance(n, ast.Name) and n.id != gen.target.id
+            or isinstance(n, ast.Constant) and type(n.value) is not int for n in nodes):
+        return None
+    # Whole-module admission still authenticates range and rejects generated-name collisions.
+    helper = f'tharkun_genexpr_{node.lineno}_{node.col_offset}'
+    param = 'tharkun_origin'
+    class Bind(ast.NodeTransformer):
+        def __init__(self, offset):
+            self.offset = offset
+
+        def visit_Name(self, n):
+            return ast.copy_location(ast.BinOp(ast.Name(param, ast.Load()), ast.Add(),
+                                              ast.Constant(self.offset)), n)
+    values = [Bind(i * step).visit(copy.deepcopy(expr.elt)) for i in range(count)]
+    args = ast.arguments(posonlyargs=[], args=[ast.arg(param)], vararg=None,
+                         kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[])
+    fd = ast.FunctionDef(helper, args, [ast.Return(ast.Tuple(values, ast.Load()))],
+                         decorator_list=[], returns=None, type_params=[])
+    assignment = ast.Assign(copy.deepcopy(node.targets), ast.Call(ast.Name(helper, ast.Load()),
+                                                                 [copy.deepcopy(start)], []))
+    return [ast.fix_missing_locations(ast.copy_location(st, node)) for st in (fd, assignment)]
+
+
 def _expand_comprehension(node: ast.ListComp, consts: dict):
     """The ``ast.List`` ``node`` stands for, or ``None`` when it is not exactly expandable."""
     if len(node.generators) != 1:
@@ -320,11 +544,11 @@ def _expand_comprehension(node: ast.ListComp, consts: dict):
     args = _range_args(gen, consts)
     if args is None or any(isinstance(n, _REBINDING) for n in ast.walk(node.elt)):
         return None
-    values = _trips(*args)
+    nodes = list(ast.walk(node.elt))
+    size = len(nodes) - sum(isinstance(n, ast.Name) and n.id == gen.target.id
+                            and isinstance(n.ctx, ast.Load) for n in nodes)
+    values = _trips(*args, node_cost=size, node_overhead=2)
     if values is None:
-        return None
-    size = sum(1 for _ in ast.walk(node.elt)) + 2
-    if len(values) > MAX_TRIPS or size * len(values) > MAX_NODES:
         return None
     elts = [_Substitute(gen.target.id, k).visit(copy.deepcopy(node.elt)) for k in values]
     return ast.copy_location(ast.List(elts=elts, ctx=ast.Load()), node)

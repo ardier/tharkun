@@ -83,6 +83,92 @@ class RaiseClaim:
 
 
 @dataclass(frozen=True)
+class ConstantArgsRaiseClaim(RaiseClaim):
+    """An exact raise condition whose exception has this literal string args tuple.
+
+    The inherited tested flag covers both condition and arguments. Unspecified
+    payloads retain RaiseClaim, so legacy class-only checks acquire no args claim.
+    """
+
+    args: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.condition in ('never', 'unknown') or not isinstance(self.args, tuple) or any(type(x) is not str for x in self.args):
+            raise ValueError('constant exception args require a known raising condition and a tuple of strings')
+
+
+@dataclass(frozen=True)
+class ArgumentRef:
+    """An original call argument, receiver included at position zero."""
+
+    position: int
+
+    def __post_init__(self) -> None:
+        if type(self.position) is not int or self.position < 0:
+            raise ValueError('argument reference requires a nonnegative integer position')
+
+
+@dataclass(frozen=True)
+class RaiseArgsCase:
+    """A tested payload relation for one explicit subset of a raise claim."""
+
+    case: str
+    condition: str
+    args: tuple[str | ArgumentRef, ...]
+    tested: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.case or not self.condition or self.condition in ('never', 'unknown'):
+            raise ValueError('payload case needs a name and a known raising scope')
+        if not isinstance(self.args, tuple) or any(type(x) is not str and not isinstance(x, ArgumentRef) for x in self.args):
+            raise ValueError('payload args must be literal strings or original argument references')
+
+
+@dataclass(frozen=True)
+class ScopedArgsRaiseClaim(RaiseClaim):
+    """Payloads known within the cases; other callback payloads remain unspecified."""
+
+    args_cases: tuple[RaiseArgsCase, ...] = ()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if (not isinstance(self.args_cases, tuple) or not self.args_cases
+                or any(not isinstance(c, RaiseArgsCase) for c in self.args_cases)
+                or len({c.case for c in self.args_cases}) != len(self.args_cases)):
+            raise ValueError('scoped args require distinct named payload cases')
+        if self.tested and any(not c.tested for c in self.args_cases):
+            raise ValueError('tested raise claim has an untested payload case')
+
+
+@dataclass(frozen=True)
+class OtherRaiseClaim:
+    """A scoped non-property raise case; args templates use str.format fields.
+
+    These supplement the fixed seven property claims. Absence remains open via
+    Contract.may_raise_other, including arbitrary callback exceptions.
+    """
+
+    exc: str
+    condition: str
+    args_template: tuple[str, ...]
+    tested: bool = False
+    case: str = ''
+
+    def __post_init__(self) -> None:
+        import builtins
+        cls = getattr(builtins, self.exc, None)
+        if self.exc in ALL_PROPERTY_CLASSES or not isinstance(cls, type) or not issubclass(cls, BaseException):
+            raise ValueError('other raise claim must name a builtin non-property exception class')
+        if not self.condition or self.condition == 'never':
+            raise ValueError('other raise case needs a nonempty raising condition')
+        if self.condition == 'unknown' and self.tested:
+            raise ValueError('an unknown raise condition cannot be tested')
+        if not isinstance(self.args_template, tuple) or any(type(x) is not str for x in self.args_template):
+            raise ValueError('exception args templates must be a tuple of strings')
+
+
+@dataclass(frozen=True)
 class ReturnSpec:
     """The return value's type and, where known, its range/shape.
 
@@ -171,8 +257,11 @@ class Contract:
     source: tuple[str, ...]
     tested: bool = False
     notes: str = ""
+    other_raises: tuple[OtherRaiseClaim, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.tested and any(c.condition != 'unknown' and not c.tested for c in self.other_raises):
+            raise ValueError(f'{self.qualname}: tested=True but non-property raise case untested')
         seen = {c.exc for c in self.raises}
         missing = set(ALL_PROPERTY_CLASSES) - seen
         if missing:
@@ -204,6 +293,11 @@ class Contract:
 __all__ = [
     "ALL_PROPERTY_CLASSES",
     "RaiseClaim",
+    "ConstantArgsRaiseClaim",
+    "ArgumentRef",
+    "RaiseArgsCase",
+    "ScopedArgsRaiseClaim",
+    "OtherRaiseClaim",
     "ReturnSpec",
     "Effects",
     "Contract",

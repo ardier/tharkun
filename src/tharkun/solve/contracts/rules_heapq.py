@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from tharkun.solve.contracts._helpers import dunder_propagation_claims, never_claims
 from tharkun.solve.contracts.rules import Rule, Shape, register_rule
-from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec
+from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec, RaiseArgsCase, ScopedArgsRaiseClaim
 
 _DOCS = "https://docs.python.org/3.14/library/heapq.html"
 _ALL_TESTED = frozenset(ALL_PROPERTY_CLASSES)
@@ -52,13 +52,15 @@ class HeapqHeappop(Rule):
     SHAPE = Shape(min_args=1, max_args=1)      # adapters/common.py::CALL_SHAPE: exactly 1 positional, no keyword
     CONTRACT = Contract(
         qualname="heapq.heappop",
-        raises=dunder_propagation_claims(
+        raises=tuple(ScopedArgsRaiseClaim(c.exc,c.condition,c.tested,
+                     args_cases=(RaiseArgsCase('native-empty','native list heap is empty before any comparison',('index out of range',),True),))
+                     if c.exc=='IndexError' else c for c in dunder_propagation_claims(
             "__lt__, comparing the last element against children while sifting it "
             "into the vacated root position -- only needed when the heap has 2+ "
             "elements remaining after the pop",
             native={"IndexError": "the heap (list) is empty"},
             tested_native=frozenset({"IndexError"}),
-        ),
+        )),
         may_raise_other=True,  # REVIEW FIX: __lt__ is arbitrary user code; may raise ValueError, a custom exception, etc.
         returns=ReturnSpec("the element type", "the SMALLEST element, removed", tested=True),
         effects=Effects(mutates_receiver=True, may_execute_callback=True),
@@ -144,3 +146,75 @@ class HeapqNsmallest(Rule):
 
 
 __all__ = ["HeapqHeappush", "HeapqHeappop", "HeapqHeapify", "HeapqNlargest", "HeapqNsmallest"]
+
+
+@register_rule
+class HeapqMerge(Rule):
+    """Construct the lazy merge; consuming it is a separate iterator operation."""
+
+    names = ("heapq.merge",)
+    SHAPE = Shape(keywords_ok=True)
+    SAMPLES = {"heapq.merge": "import heapq\nresult = heapq.merge([1, 3], [2, 4])\n"}
+    TWINS = {"heapq.merge": "import heapq\nresult = heapq.merge(unexpected=True)\n"}
+    CONTRACT = Contract(
+        qualname="heapq.merge",
+        raises=never_claims(native={"TypeError": "argument binding receives a keyword other than key or reverse"},
+                            tested=_ALL_TESTED),
+        may_raise_other=True,  # Resource failures while allocating the generator are not ruled out.
+        returns=ReturnSpec("Iterator[object]", "a fresh generator; input iteration, key calls and comparisons are deferred",
+                           tested=True),
+        effects=Effects(may_execute_callback=True, notes=(
+            "The call only binds arguments and creates a generator. Consumption owns iterator advancement, "
+            "reverse truth tests, key/comparison callbacks and their exceptions; retained-operand cleanup may "
+            "also run callbacks. These are not constructor safety or purity claims for consumption.")),
+        source=(f"{_DOCS}#heapq.merge", "https://github.com/python/cpython/blob/v3.14.4/Lib/heapq.py#L330",
+                "https://github.com/python/typeshed/blob/58c33f3da508976e26d681039bb9a255f9509f5c/stdlib/heapq.pyi"),
+        tested=True,
+    )
+
+
+NATIVE_HEAP_NAMES=('heapify','heappush','heappop','heapify_max','heappush_max','heappop_max',
+                   'heappushpop','heappushpop_max','heapreplace','heapreplace_max')
+_NEW_NAMES=NATIVE_HEAP_NAMES[3:]
+
+
+def _native_heap_contract(name):
+    pops=name.startswith(('heappop','heapreplace'))
+    q='heapq.'+name
+    claims=dunder_propagation_claims('__lt__ comparisons and truth of their results',
+        native={'TypeError':'wrong positional-only binding, receiver is not a list, or a needed element comparison is undefined',
+                **({'IndexError':'heap is empty before any comparison'} if pops else {})},
+        tested_native=frozenset({'TypeError','IndexError'} if pops else {'TypeError'}))
+    if pops:
+        claims=tuple(ScopedArgsRaiseClaim(c.exc,c.condition,c.tested,
+                      args_cases=(RaiseArgsCase('native-empty','native list heap is empty before any comparison',('index out of range',),True),))
+                     if c.exc=='IndexError' else c for c in claims)
+    return Contract(qualname=q,raises=claims,may_raise_other=True,
+        returns=ReturnSpec('None' if name.startswith(('heapify','heappush')) and not name.startswith('heappushpop') else 'object',
+                           'None for heapify/push; pop/replace return an original heap element; pushpop can return the new item; extreme-element guarantee requires a correctly ordered heap',tested=True),
+        effects=Effects(mutates_receiver=True,may_execute_callback=True,
+                        notes='comparison callbacks may raise after partial mutation; no heap-order validation'),
+        source=('https://docs.python.org/3.14/library/heapq.html#'+q,
+                'https://github.com/python/cpython/blob/3.14/Modules/_heapqmodule.c'),tested=True)
+
+
+_NATIVE_CONTRACTS={'heapq.'+name:_native_heap_contract(name) for name in _NEW_NAMES}
+
+
+@register_rule
+class HeapqNative(Rule):
+    names=tuple('heapq.'+name for name in _NEW_NAMES)
+    SAMPLES={q:"import heapq\nh=[7,3]\nx="+q+"(h"+(',5' if q.rsplit('.',1)[1].startswith(('heappush','heapreplace')) else '')+")\n" for q in names}
+    TWINS={q:"import heapq\nx="+q+"()\n" for q in names}
+
+    @classmethod
+    def shape_for(cls,qualname):
+        n=2 if qualname.rsplit('.',1)[1].startswith(('heappush','heapreplace')) else 1
+        return Shape(n,n)
+
+    @classmethod
+    def contract_for(cls,qualname):
+        return _NATIVE_CONTRACTS[qualname]
+
+
+__all__ += ['HeapqNative', 'NATIVE_HEAP_NAMES']

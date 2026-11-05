@@ -122,37 +122,75 @@ class InstObj(Obj):
     (docs/ABSINT.md, "float invariants")."""
 
     kind = "inst"
-    __slots__ = ("cls", "attrs", "qf")
+    __slots__ = ("cls", "attrs", "qf", "exc_args")
 
-    def __init__(self, cls, attrs: dict, qf: dict | None = None):
+    def __init__(self, cls, attrs: dict, qf: dict | None = None, exc_args: V | None = None):
+        self.exc_args = exc_args  # BaseException.__new__ storage, separate from the instance dict
         self.cls = cls  # a class address
         self.attrs = attrs
         self.qf = qf if qf is not None else {}
 
     def values(self):
-        return tuple(e[0] for e in self.attrs.values())
+        return tuple(e[0] for e in self.attrs.values()) + (() if self.exc_args is None else (self.exc_args,))
+
+
+class ExceptionObj(Obj):
+    """A canonical builtin exception, with GC-visible constructor arguments."""
+
+    kind = 'exception'
+    __slots__ = ('cls', 'args')
+
+    def __init__(self, cls: str, args: V):
+        self.cls, self.args = cls, args
+
+    def values(self):
+        return (self.args,)
 
 
 class ClassObj(Obj):
     kind = "class"
-    __slots__ = ("name", "node", "bases", "attrs", "slots")
+    __slots__ = ("name", "node", "bases", "attrs", "slots", "abstracts")
 
-    def __init__(self, name, node, bases, attrs, slots):
+    def __init__(self, name, node, bases, attrs, slots, abstracts=None):
         self.name = name
         self.node = node
         self.bases = bases  # tuple of class addresses
         self.attrs = attrs  # name -> V
         self.slots = slots  # tuple of names, or None (has __dict__)
+        self.abstracts = abstracts  # None: type; frozenset: closed ABCMeta abstract names
 
     def values(self):
         return tuple(self.attrs.values())
 
 
+class NamedTupleClassObj(ClassObj):
+    """A closed stdlib-generated tuple type, never an executed target class."""
+    __slots__ = ("fields", "defaults")
+
+    def __init__(self, name, node, fields, defaults):
+        super().__init__(name, node, (), {}, ())
+        self.fields, self.defaults = fields, defaults
+
+    def values(self):
+        return (*super().values(), *self.defaults)
+
+
+class NamedTupleObj(TupleObj):
+    __slots__ = ("type_v",)
+
+    def __init__(self, items, type_v):
+        super().__init__(items)
+        self.type_v = type_v
+
+    def values(self):
+        return (*super().values(), self.type_v)
+
+
 class FuncObj(Obj):
     kind = "func"
-    __slots__ = ("node", "defaults", "kwdefaults", "qualname", "flavor", "module_key")
+    __slots__ = ("node", "defaults", "kwdefaults", "qualname", "flavor", "module_key", "captures", "capture_frames", "abstract")
 
-    def __init__(self, node, defaults, kwdefaults, qualname, flavor="plain", module_key=""):
+    def __init__(self, node, defaults, kwdefaults, qualname, flavor="plain", module_key="", captures=None, capture_frames=None):
         self.node = node
         self.defaults = defaults  # tuple of V
         self.kwdefaults = kwdefaults  # dict name -> V
@@ -163,9 +201,12 @@ class FuncObj(Obj):
         # file's own key, so a free name in its body resolves against ITS OWN globals, not
         # the caller's -- see interp.py's module_key plumbing.
         self.module_key = module_key
+        self.captures = {} if captures is None else captures
+        self.capture_frames = {} if capture_frames is None else capture_frames
+        self.abstract = False
 
     def values(self):
-        return tuple(self.defaults) + tuple(self.kwdefaults.values())
+        return tuple(self.defaults) + tuple(self.kwdefaults.values()) + tuple(self.captures.values())
 
 
 class BoundMethod(Obj):
@@ -197,7 +238,7 @@ class BuiltinMethod(Obj):
 
 
 class RangeObj(Obj):
-    """``range(lo, hi, step)``: ``lo``/``hi`` are immutable zone variables."""
+    """``range(lo, hi, step)``: endpoints are zone variables or summary intervals."""
 
     kind = "range"
     __slots__ = ("lo", "hi", "step")
@@ -208,7 +249,7 @@ class RangeObj(Obj):
         self.step = step
 
     def zvars(self):
-        return {self.lo, self.hi}
+        return {value for value in (self.lo, self.hi) if isinstance(value, str)}
 
 
 
@@ -296,21 +337,41 @@ class DictView(Obj):
         self.dicts = dicts
         self.which = which
 
+class TextWrapperObj(Obj):
+    """Canonical textwrap.TextWrapper settings, mutable through heap updates."""
+
+    kind = 'textwrapper'
+    __slots__ = ('attrs',)
+
+    def __init__(self, attrs):
+        self.attrs = attrs
+
+    def values(self):
+        return tuple(self.attrs.values())
+
+
 class StringIOObj(Obj):
-    """An ``io.StringIO`` buffer ([internal ref]: a SOUND, COARSE model, matching
-    a coarse model -- ``content`` over-approximates the buffer's text as
-    a single string-shaped value, coarsened to "some string" (``ANYSTR``) the moment
-    anything is written to it; position (``seek``/``tell``) is tracked only as an
-    unconstrained int, never connected back to ``content``.  A program whose correctness
-    depends on the EXACT text written or read back only gets "it's some string", never a
-    wrong precise one.  See interp.py's ``stringio_method``, ``m_io_StringIO`` and
-    ``b_print``'s ``file=`` handling."""
+    """Text or binary program stream, with exact WorldObject facts when available."""
 
     kind = "stringio"
-    __slots__ = ("content",)
+    __slots__ = ("content", "stream", "position", "binary", "closed")
 
-    def __init__(self, content):
-        self.content = content
+    def __init__(self, content, stream=None, position=None, binary=False, closed=frozenset({False})):
+        self.content, self.stream, self.position = content, stream, position
+        self.binary, self.closed = binary, closed
+
+    def values(self):
+        return (self.content,)
+
+
+class ReadFileObj(Obj):
+    """Remaining text and possible closed states of a world file ([internal ref])."""
+
+    kind = "readfile"
+    __slots__ = ("content", "closed")
+
+    def __init__(self, content, closed=frozenset({False})):
+        self.content, self.closed = content, closed
 
     def values(self):
         return (self.content,)
@@ -334,6 +395,35 @@ class OutFileObj(Obj):
         self.binary = binary
 
 
+class GeneratorFrame:
+    """An immutable-by-convention saved local environment at one continuation."""
+
+    __slots__ = ("bindings", "maybe_unbound")
+
+    def __init__(self, bindings, maybe_unbound=()):
+        self.bindings = bindings
+        self.maybe_unbound = frozenset(maybe_unbound)
+
+
+class GeneratorObj(Obj):
+    """Source generator states; None is unstarted, negative one is closed."""
+
+    kind = "generator"
+    __slots__ = ("function", "states")
+
+    def __init__(self, function, bindings=None, *, states=None):
+        self.function = function
+        self.states = {None: GeneratorFrame(bindings)} if states is None else states
+
+    @property
+    def bindings(self):
+        return self.states[None].bindings
+
+    def values(self):
+        return (self.function, *(value for frame in self.states.values()
+                                 for value in frame.bindings.values()))
+
+
 class IteratorObj(Obj):
     """Builtin iterator over a known source; consumption is overapproximated."""
     # ponytail: no cursor precision; add cursor intervals for exhaustion proofs.
@@ -345,3 +435,30 @@ class IteratorObj(Obj):
 
     def values(self):
         return (self.source,)
+
+
+class ZipObj(Obj):
+    """A native zip: sources stay live; remaining consumption is overapproximated."""
+    kind = "iterator"
+    __slots__ = ("sources", "strict", "fresh")
+
+    def __init__(self, sources, strict=False, fresh=True):
+        self.sources = tuple(sources)
+        self.strict = strict
+        self.fresh = fresh  # True guarantees no consumption; False makes no cursor claim.
+
+    def values(self):
+        return self.sources
+
+
+class EnumerateObj(Obj):
+    """Native enumerate with a live source and immutable construction-time start bounds."""
+    kind = "iterator"
+    __slots__ = ("source", "start")
+
+    def __init__(self, source, start):
+        self.source = source
+        self.start = start
+
+    def values(self):
+        return self.source, self.start

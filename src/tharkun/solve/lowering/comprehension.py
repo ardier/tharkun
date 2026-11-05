@@ -25,14 +25,16 @@ exceptions, the same order of every side effect.  What that takes, and what is r
   ``yield``, a comprehension in a loop test, ``with`` item, default value, decorator,
   augmented assignment, lambda or class body) are REFUSED: the comprehension stays where it
   is, and the analysis that does not model it aborts as it did before.
-* **Generator expressions are lazy.**  Lowering one to an eager loop changes WHEN its
-  elements are evaluated relative to the code that consumes them (``any``, ``all``,
-  ``next``, ``sum``, ``min``, ``max``, ``zip``, ``dict`` and ``set`` interleave with it and
-  can stop, raise or have effects part-way).  A generator expression is lowered only as the
-  sole argument of a consumer that drains it completely before doing anything else, which
-  makes it identical to the list comprehension: ``list(g)``, ``tuple(g)``, ``sorted(g, ...)``
-  (the builtins, not rebound anywhere) and ``"...".join(g)`` (``str.join`` builds a
-  sequence first).  Every other generator expression is refused.
+* **Generator expressions are lazy.** Immediate ``all``/``any`` consumers stop
+  every lowered loop at the first decisive truth test. Pattern unpack reads at
+  most arity + one elements, or drains for a starred target. ``list``/``tuple``
+  drain into a buffer; the original consumer receives it. ``sum`` retains the
+  native consumer only for pure integer terms over ranges and a literal integer
+  start: floating compensation and custom addition must not be approximated.
+  Generator-internal StopIteration is wrapped at each step, while consumer truth
+  tests stay outside that boundary. Unknown nested iterable protocols, declared
+  finalizers, suspension and rebound protocol names refuse these new forms.
+  The older eager ``sorted(g, ...)`` and literal ``str.join`` paths are separate.
 * **Dict and set comprehensions** evaluate the key, then the value, then insert: the
   lowering keeps that order with temporaries (``acc[k] = v`` would evaluate ``v`` first).
 
@@ -165,15 +167,17 @@ def comps_in(node: ast.AST) -> List[ast.AST]:
     return [n for n in ast.walk(node) if isinstance(n, COMPS)]
 
 
-def lower_comprehensions(tree: ast.Module) -> Lowered:
+def lower_comprehensions(tree: ast.Module, *, preserve_origins=False) -> Lowered:
     """Lower the list / set / dict comprehensions of ``tree`` (see the module docstring).
 
     ``tree`` is not modified.  A program that can reach its own namespace (``globals()``,
     ``locals()``, ``exec``, ...) is returned unchanged: fresh names would be observable."""
     work = copy.deepcopy(tree)
-    annotate(work)
+    if not preserve_origins:
+        annotate(work)
     names = Names(work)
     lowerer = _Lowerer(names)
+    lowerer.source_tree = tree
     if names.reflective:
         for comp in comps_in(work):
             lowerer.refused.append(_refusal(comp, "the program can reach its own namespace"))
@@ -288,7 +292,14 @@ class _Lowerer:
             return []
         mark = self._mark()
         try:
-            pre, new = self.expr(expr)
+            if (field_name == "value" and isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], (ast.Tuple, ast.List)) and isinstance(expr, ast.GeneratorExp)):
+                from .generator import consume
+                pattern = stmt.targets[0]
+                limit = None if any(isinstance(n, ast.Starred) for n in pattern.elts) else len(pattern.elts)
+                pre, new = consume(self, expr, "unpack", limit=limit)
+            else:
+                pre, new = self.expr(expr)
         except _Refuse as refusal:
             self._reset(mark)
             self._refuse_all(expr, refusal.reason)
@@ -412,8 +423,7 @@ class _Lowerer:
             return self.comp(e)
         if isinstance(e, ast.GeneratorExp):
             raise _Refuse(
-                "generator expression: lazy, so only the sole argument of list/tuple/sorted or "
-                "of str.join on a literal is lowered"
+                "generator expression: lazy; an audited immediate consumer or unpack target is required"
             )
         if isinstance(e, ast.Lambda):
             raise _Refuse("comprehension inside a lambda")
@@ -447,7 +457,7 @@ class _Lowerer:
             return pre, self._like(e, elts=elts)  # type: ignore[return-value]
         if isinstance(e, ast.Dict):
             if any(k is None for k in e.keys):
-                raise _Refuse("dict ** unpacking")
+                return self.dict_unpacking(e)
             flat = [x for pair in zip(e.keys, e.values) for x in pair]
             pre, new = self.ordered(flat)  # type: ignore[arg-type]
             return pre, self._like(e, keys=new[0::2], values=new[1::2])  # type: ignore[return-value]
@@ -456,6 +466,43 @@ class _Lowerer:
         if isinstance(e, ast.IfExp):
             return self.ifexp(e)
         raise _Refuse(f"comprehension inside a {type(e).__name__}")
+
+    def dict_unpacking(self, e: ast.Dict) -> Tuple[List[ast.stmt], ast.expr]:
+        """``{**A, **B, **<comprehension>, ...}`` where exactly one entry holds a comprehension and it is a ``**``
+        entry that follows only ``**`` entries.
+
+        CPython builds the display's dict first and applies each ``**`` operand the moment it is evaluated (BUILD_MAP 0,
+        then DICT_UPDATE per operand), so the unpacking of ``A`` and ``B`` -- which may raise ``TypeError`` or run a
+        mapping's ``keys``/``__getitem__`` -- happens BEFORE the comprehension is evaluated.  The entries before the
+        comprehension therefore become a statement of their own, ``t = {**A, **B}``, that does exactly that and nothing
+        else; the comprehension's statements follow it; the display becomes ``{**t, **<result>, <entries after>}``.
+        ``t`` is a fresh builtin dict, so unpacking it again has no effect and the same contents in the same order.
+        A ``key: value`` entry before the comprehension is refused (when a pair's key is hashed relative to the
+        operands' evaluation depends on how CPython chunks the display), and so is a second comprehension-bearing
+        entry (the first one's unpacking would have to be kept apart from the second one's evaluation)."""
+        bearing = [i for i, (k, v) in enumerate(zip(e.keys, e.values))
+                   if has_comp(v) or (k is not None and has_comp(k))]
+        if len(bearing) != 1 or e.keys[bearing[0]] is not None:
+            raise _Refuse("dict ** unpacking")
+        j = bearing[0]
+        if any(k is not None for k in e.keys[:j]):
+            raise _Refuse("dict ** unpacking after a key: value entry")
+        prelude: List[ast.stmt] = []
+        keys: List[Optional[ast.expr]] = []
+        values: List[ast.expr] = []
+        if j:
+            head = self._like(e, keys=[None] * j, values=list(e.values[:j]))
+            temp = self.names.fresh("unpacked")
+            prelude.append(self._assign(temp, head, e, "unpack"))  # type: ignore[arg-type]
+            keys.append(None)
+            values.append(self._name(temp, e, "unpack"))
+        pre, new = self.expr(e.values[j])
+        prelude.extend(pre)
+        keys.append(None)
+        values.append(new)
+        keys.extend(e.keys[j + 1:])
+        values.extend(e.values[j + 1:])
+        return prelude, self._like(e, keys=keys, values=values)  # type: ignore[return-value]
 
     # -- calls --------------------------------------------------------------------
     def _eager_consumer(self, call: ast.Call) -> bool:
@@ -472,6 +519,23 @@ class _Lowerer:
         if any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
             raise _Refuse("call with *args / **kwargs")
         args = list(call.args)
+        if (args and isinstance(args[0], ast.GeneratorExp) and isinstance(call.func, ast.Name)
+                and self.names.stable_builtin(call.func.id)):
+            consumer = call.func.id
+            if consumer in {"all", "any", "list", "tuple", "sum"}:
+                from .generator import consume, integer_generator
+                if consumer == "sum":
+                    starts = [*args[1:], *[k.value for k in call.keywords]]
+                    if (len(args) > 2 or len(starts) > 1 or any(k.arg != "start" for k in call.keywords)
+                            or any(not isinstance(v, ast.Constant) or type(v.value) not in (int, bool) for v in starts)
+                            or not integer_generator(self, args[0])):
+                        raise _Refuse("generator sum: effectful/noninteger terms or dynamic start")
+                elif len(args) != 1 or call.keywords:
+                    raise _Refuse("generator consumer: unsupported arguments")
+                pre, value = consume(self, args[0], consumer if consumer in {"all", "any"} else "list")
+                if consumer in {"all", "any"}:
+                    return pre, value
+                return pre, self._like(call, args=[value, *args[1:]])
         if self._eager_consumer(call):
             gen = args[0]
             listcomp = ast.ListComp(elt=gen.elt, generators=gen.generators)  # type: ignore[attr-defined]

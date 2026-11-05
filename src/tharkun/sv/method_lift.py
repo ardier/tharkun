@@ -35,8 +35,8 @@ package:
   same shape every other ``Invariant`` candidate already uses.
 * A field's TYPE (needed to synthesize a free Z3 symbol for a field this
   method READS before ever writing it) is inferred from ``__init__``'s own
-  annotated parameter, when that field is a direct, unmodified copy of one
-  (``self.x = x`` where ``x: float`` -- see :func:`_init_field_types`).
+  annotated parameter, when that field is a direct, unmodified copy of one,
+  or an exact scalar literal (including signed literals; see :func:`_init_field_types`).
   ``py_method_lift`` itself is type-agnostic by design (pure shape
   detection), and a class-level ``NAME: TYPE`` annotation is OUT OF the
   shared detector's accepted shape (not a ``def``/docstring/``pass``/literal
@@ -73,14 +73,20 @@ def lift_class(class_def: ast.ClassDef) -> PureDataClassInfo | None:
 
 
 def _init_field_types(info: PureDataClassInfo) -> dict[str, str]:
-    """See the module docstring. Only a field ``__init__`` stores an
-    annotated parameter's value into UNCHANGED gets a sort here."""
+    """Infer a field sort from an unchanged annotated parameter or a scalar literal."""
     out: dict[str, str] = {}
     params = {a.arg: a.annotation for a in info.init.method_node.args.args[1:]}
     for field, expr in info.init_field_map.items():
         ann = params.get(expr.id) if isinstance(expr, ast.Name) else None
         if isinstance(ann, ast.Name) and ann.id in _SORT_NAMES:
             out[field] = ann.id
+        elif isinstance(expr, (ast.Constant, ast.UnaryOp)):
+            try:
+                value = ast.literal_eval(expr)
+            except (ValueError, TypeError):
+                continue
+            if type(value).__name__ in _SORT_NAMES:
+                out[field] = type(value).__name__
     return out
 
 
@@ -130,7 +136,8 @@ def lift_method(info: PureDataClassInfo, method_name: str) -> LiftedFunction | N
     # instance parameter), so every other instance's fields are always reads.
     reads: dict[str, set] = {p: set() for p in instance_params}
     written: set = set()
-    for kind, name, expr in method.body:
+    expressions = method.body + ([("return", "", method.return_expr)] if method.return_expr is not None else [])
+    for kind, name, expr in expressions:
         for prefix in instance_params:
             for n in ast.walk(expr):
                 if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)

@@ -61,8 +61,16 @@ class Context:
     task: Optional[str] = None
     #: what a stage keeps between rounds of ``Stage.deepen`` (the fuzzer's corpus directory, ...)
     state: dict = field(default_factory=dict)
+    #: whole draw vectors the caller seeds the search with (``engine.verify(seed_vectors=)``, [internal ref]): the hybrid
+    #: stage writes them into its corpus first (``hybrid.py::_seed_corpus``); proposals, never verdicts
+    seed_vectors: tuple = ()
     #: closed by the scheduler when the run ends; a stage puts what it created for ``state`` here
     cleanup: contextlib.ExitStack = field(default_factory=contextlib.ExitStack)
+    #: boxed run ([internal ref], ``solve/environment.py::install_files(box=)``): files are mocked unless supplied.
+    #: Whoever starts a boxed run sets it (``sv/scheduler.py::run(box=)``, passed on by find_inputs/Avengers);
+    #: ``False`` -- every SV-COMP run -- is the model unchanged, and a stage sends no ``box`` to its workers
+    #: then (``hybrid.py::search``/``deepen``).
+    box: bool = False
 
     def site_records(self):
         """The abstract interpreter's site records (the latest absint run's), or ``None``."""
@@ -163,7 +171,7 @@ def _solver_seeds(ctx: Context, trick: str) -> dict:
 
 def _guard_values(ctx: Context) -> dict:
     from tharkun.sv.guard_values import seed_values
-    return seed_values(ctx.program, log=ctx.log)
+    return seed_values(ctx.program, log=ctx.log, records=ctx.site_records())
 
 
 def _avengers(ctx: Context) -> dict:
@@ -203,26 +211,46 @@ REGISTRY: tuple = (
     # 0 lost, 0 new wrong official+adjusted, hybrid:atheris 0->4 both times. Real-world
     # 112->112 adjusted (0 new wrong) both times; Float 12->12 (0 new wrong) both times.
     Stage("hybrid", "hybrid:obligation", propose=_hybrid, share=0.15, deepen=_hybrid_deepen),
-    # Avengers receiver synthesis ([internal ref]): construct classes the module defines and
-    # harvest literal constructor/setup arguments, including whatever the restored
-    # Pynguin backend proposes (tharkun.avengers.backends). Measured (direct
-    # invocation, 60s/run, no BenchExec) on all 80 (task, property) pairs of the
-    # 24-task SV-Benchmarks Real-world set, WITH the backend actually installed
-    # and invoked: 0 pairs gained, 0 lost -- identical verdict on every pair,
-    # including the 30 pairs over object-heavy tasks (richards/raytrace/go/chaos)
-    # this stage targets. It also has a real cost: on 19/80 pairs it measurably
-    # crowded out the concolic stage's own run budget (e.g. bm_raytrace_nondet
-    # fell from 1104/1108/1092 runs to 1 on three of its four properties), because
-    # its own search (including the Pynguin subprocess) can spend up to ~30s of a
-    # 60s total budget before enumeration gets a turn. Out of DEFAULT per the
-    # keep-only-if-gain rule -- this is the SAME 0/24-gain result the PR's earlier
-    # (invalid) measurement reported, now independently confirmed with the
-    # correct backend policy actually in effect. Available via
-    # ``--stages ...,avengers`` for re-measurement as the portfolio or the corpus
-    # changes, and the backend itself stays available to Avengers callers outside
-    # SV regardless of this stage's default-on state.
-    Stage("avengers", "avengers", seed=_avengers),
 )
+
+# Avengers receiver synthesis ([internal ref]): construct classes the module defines and
+# harvest literal constructor/setup arguments, including whatever the restored
+# Pynguin backend proposes (tharkun.avengers.backends). Measured (direct
+# invocation, 60s/run, no BenchExec) on all 80 (task, property) pairs of the
+# 24-task SV-Benchmarks Real-world set, WITH the backend actually installed
+# and invoked: 0 pairs gained, 0 lost -- identical verdict on every pair,
+# including the 30 pairs over object-heavy tasks (richards/raytrace/go/chaos)
+# this stage targets. It also has a real cost: on 19/80 pairs it measurably
+# crowded out the concolic stage's own run budget (e.g. bm_raytrace_nondet
+# fell from 1104/1108/1092 runs to 1 on three of its four properties), because
+# its own search (including the Pynguin subprocess) can spend up to ~30s of a
+# 60s total budget before enumeration gets a turn. Out of DEFAULT per the
+# keep-only-if-gain rule -- this is the SAME 0/24-gain result the PR's earlier
+# (invalid) measurement reported, now independently confirmed with the
+# correct backend policy actually in effect. Available via
+# ``--stages ...,avengers`` for re-measurement as the portfolio or the corpus
+# changes, and the backend itself stays available to Avengers callers outside
+# SV regardless of this stage's default-on state.
+
+def _avengers_stage_available() -> bool:
+    """The ``avengers`` stage needs :mod:`tharkun.avengers` and its seed module.  Both are optional (owner ruling
+    2026-11-05: the SV-COMP development branch ships without Avengers, and adding it back is a revert), so without
+    them the stage is not registered and ``--stages avengers`` is the usual "unknown stage" error, not a crash."""
+    import importlib.util
+
+    def real(name: str) -> bool:
+        # origin None: a namespace package, i.e. only a directory left behind by a deleted package (a ``__pycache__``)
+        spec = importlib.util.find_spec(name)
+        return spec is not None and spec.origin is not None
+
+    try:
+        return real("tharkun.avengers") and real("tharkun.sv.avengers_seed")
+    except (ImportError, ValueError):
+        return False
+
+
+if _avengers_stage_available():
+    REGISTRY = REGISTRY + (Stage("avengers", "avengers", seed=_avengers),)
 
 #: the stages ``verify`` runs unless told otherwise
 DEFAULT: tuple = ("guard_values", "comparison", "boundaries", "composition", "producer", "concolic", "hybrid")

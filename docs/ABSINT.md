@@ -1,5 +1,247 @@
 # absint -- Tharkun's sound whole-program abstract interpreter
 
+## Typed string-expression identity
+
+When the program compares values for equality, pure builtin strings carry an
+optional immutable typed recipe in `V.value_term`, separate from float lemma
+terms and heap references. Variable binding snapshots unknown string values;
+canonical str addition records its operands. Equality queries lazily hash-cons
+those recipes and normalize ordered concatenation using SMT-admitted
+associativity and empty-string identities. No user hooks, commutativity,
+integer ring or IEEE reassociation law enters this string slice. `is` remains
+separate from value equality. Exact singleton strings retain their existing
+value equality and constant consumers.
+
+A branch join uses one private choice token for all live frame values: equal
+operand classes on both incoming branches remain equal after the join.
+Different branch merges get distinct choices. Demotion drops value provenance from every scalar slot of the object becoming
+a multi-allocation summary, so independent generated records never share one
+string snapshot. Heap joins keep only common per-value provenance; widening
+drops incompatible recipes. Value equality,
+state ordering and fixpoint reuse include nonredundant provenance, so a new
+draw cannot masquerade as an old one. There is no input length, arity or DAG
+depth cap; the analyzer's existing deadline bounds query work and exhaustion
+returns UNKNOWN. Generic loop induction, weak heap correlation, string methods,
+bytes and other builtin theory plugins remain later precision work. Existing
+scalar transfers keep their fast representation; neither egglog nor Z3 is
+imported by this stdlib-only slice. The larger framework may use guarded Z3
+for checks after cheap congruence; no runtime SMT fallback is installed here.
+
+### Files and how the string slice relates
+
+- `equality.py` owns typed recipes, generic congruence and the string plugin.
+- `aval.py` carries optional provenance; `state.py` defines conservative
+  per-value join/order/widen and correlated frame branch joins.
+- `interp.py` drops scalar provenance at object demotion, records pure-string
+  bindings/addition and consults congruence
+  after the existing comparison callback and constant guards.
+- `benchmarks/absint_equivalences/prove_rules.py` and `rule-proofs.json` retain
+  Python-semantics SMT admission results, including all six rejected laws.
+  Only congruence, string monoid and branch identities are installed here.
+- `tests/test_absint_string_identity.py` compares source laws and failure twins
+  against native CPython, including independent branches, mutation and loops.
+
+## Assertion-demanded integer affine equalities
+
+When assertions compare expressions involving multiple source names, the
+existing integer difference domain carries a private exact affine equality
+component. It retains arbitrary finite linear forms at assignments and list
+length transfers instead of dropping sums to independent intervals. Canonical
+integer and bool transfers retain their usual representation; no concrete
+integers are enumerated and no float arithmetic is treated as exact integers.
+
+Exact rational elimination projects forgotten variables. Joins take the affine
+hull of both inputs, widening keeps equalities common to old and new states,
+and inclusion checks the equality component as well as the existing DBM.
+Exact constants and differences already established by the DBM are shared
+before projection and hulls. Integer queries intersect the original bounds
+with bounds of an equivalent reduced expression. Work uses the analyzer's
+existing deadline, with no arity, coefficient or variable-count domain cap;
+exhaustion yields UNKNOWN, never a partial safe proof.
+
+Source assertions trigger tracking, not observed samples or proposed invariant
+candidates. Programs without that demand keep the DBM path. Multi-variable
+field summaries, symbolic string/sequence identity, pointer/type identity,
+nonlinear and IEEE relations, variable-divisor arithmetic, indexed heap counts
+and general fold induction remain named precision gaps for later mechanisms.
+This slice changes no heap/State/value schema, call transfer, proof producer or
+independent checker.
+
+## Literal source export lists
+
+Flat source stars may bind a literal list/tuple `__all__`, including private
+names and duplicates, after its initializer runs normally. The consumer checks
+one unconditional assignment, actual live bindings, resolver origins, and the
+complete cached initializer closure for metadata changes or reflection. Empty
+stars are authenticated even when no name refers to their module. Exported
+values retain their existing identity; excluded names do not replace caller
+bindings or builtins. Dynamic/nonisolated exports and relative/dotted/package
+stars keep their existing conservative boundary. There is no export-count cut;
+spent analysis budgets return UNKNOWN.
+
+## String truth and guarded integer indices
+
+An exact builtin string's truth test refines its immutable length observation:
+true means at least one code point, false means zero. String integer indexing
+uses the same length and the existing sequence-bound checker, so a nonempty
+guard proves indices 0 and -1 safe and a nonnegative index below len(s) is safe.
+The already evaluated receiver survives index-operand effects; later reads of
+a changed binding have independent lengths. All finite Unicode lengths and
+arbitrary int/bool indices are modeled without a machine-size cutoff.
+Untracked/summarized provenance, custom protocols, and unresolved affine or
+boolean guard relations keep their conservative result. Ordinary callable and
+tested-contract checks remain mandatory; malformed keys and failure payloads
+are unchanged.
+
+## Native list truth and its current length
+
+`truth_split` refines an evaluated exact builtin list's existing live length
+cell: true means at least one item, false means zero. The receiver must denote
+one recent object, so aliases share the refinement and mutations update it
+normally. Element values never run hooks during this test. Every finite length
+and element kind is covered; there is no size cutoff or global affine switch.
+Older summary receivers, mixed values and custom subclasses retain the
+existing conservative behavior. A returned `bool(xs)` does not yet retain its
+relationship to `xs` after its branches merge.
+
+## Known finite lists in native folds
+
+`native.py::concrete` no longer rejects a known exact builtin-list length merely
+because it exceeds eight. A single concrete element alternative is materialized
+in linear work, with checks against the analyzer's existing CPU deadline before
+and during construction. Finite integer alternatives and Cartesian products use
+the same analysis deadline, without a 64-alternative ceiling. Tuple and dictionary
+alternatives and contract callers share that deadline too. Optional expansion also shares
+one 200,000-unit allocation/iteration work allowance across the analysis, rather than
+renewing a per-operation allowance. Exhausting it discards the entire concrete result
+and lets existing abstract transfers continue; it never returns a prefix. A larger
+per-analysis allowance admits more work without changing an operand domain.
+Singleton Cartesian pools are assembled in linear work. Deadline or memory exhaustion raises the existing
+`Unsupported`, yielding UNKNOWN rather than a partial result or abstract fallback.
+Unknown lengths, nonconcrete values, segmented lists, cycles and target hooks
+retain their refusals; recursive builtin values and alias behavior are retained.
+General abstract list lengths and scalar integer domains are unchanged.
+Float singleton bounds at numerical zero cover both IEEE signs. Native
+materialization includes both `0.0` and `-0.0` unless a `FloatInfo.term`
+`("zero-sign", negative)` records a known sign from a source literal or concrete
+native output. Unary negation flips that fact; joining different signs drops it.
+`abs` records positive zero for either input zero sign. Known-sign zeros retain
+one alternative, and nonzero floats keep their existing
+path. Nested builtin values use the same rule and existing shared work budget;
+exhaustion never selects one sign or returns a partial product. Universal
+binary64 coverage and negation obligations are recorded in
+`benchmarks/absint_equivalences/zero-sign-rule-proofs.json`.
+If analysis stops with an unsupported construct or a spent parent budget, its UNKNOWN
+diagnostics retain already observed unproven sites. Incomplete safe sites are omitted;
+no partial safe records, complete-analysis flag or certificate is published.
+
+Native callers retain their separate resource guards. `native_limit` counts
+builtin container delimiters, separators and primitive representation cost
+against its existing 4096-unit eager-fold work budget, including every rendered
+occurrence of shared nested values. It has no container-length cutoff. Cheap
+65/256-item tuples, lists and dicts, and 1024/1300-item zero tuples/lists, are
+focused test points rather than semantic bounds. Cycles, traversal recursion or
+memory exhaustion refuse; format width, integer representation cost, codec and regex
+guards remain. The string consumer checks the existing analyzer deadline before
+operand materialization, during resource traversal and between alternatives;
+memory/deadline exhaustion discards all results. Native absence-of-exception
+claims still require current tested, non-unknown contract claims. Long output
+content may remain abstract; these focused folds claim no whole-program or
+portfolio recovery.
+
+Formatting does not equate integer magnitude or literal text digits with output
+width. The same 4096-unit operand budget counts builtin representation cost;
+separate accounting of bounded builtin fields counts actual aggregate output.
+The stdlib format parser separates literals, names and item lookups from specs.
+Static/dynamic width, numeric precision and integer base-output work are checked
+before rendering each bounded field. String precision truncates rather than
+expands output. Percent mapping keys and argument consumption retain native
+semantics; the existing RegexFlag operator bit-work guard remains separate.
+Nested replacement specs and attribute-field cost remain named UNKNOWN
+boundaries. Closed builtin validation, deadlines and tested-claim authority
+remain required; no target hook is called to estimate cost. Conversion errors
+are left to the original native consumer, including conversion before nested
+f-string specs with a test-local CPython decimal cap restored in `finally`.
+
+## Pure source callbacks in verifier containers
+
+`interp.py::_nondet_callback_summary` authenticates a module-level plain
+zero-argument source function. Its body may contain any finite number of local
+assignments, branches, returns, pass statements and docstrings. Expressions
+are scalar literals, local reads, conditionals, authenticated verifier scalar
+draws, or fresh records with literal string keys and scalar values. Every draw
+is checked against its current binding. A local read must be definitely assigned
+on every reaching path; branch continuations intersect their assigned names,
+while an early return supplies no later bindings. A same-named global cannot
+stand in for an unbound local. A locally shadowed callee or module
+cannot authenticate as a verifier draw. There is no callback-body or container
+length bound. Arbitrary calls, external reads/writes, loops, captured values,
+nested mutable fields, dynamic record keys and other unproved forms refuse.
+
+The ordinary function interpreter analyzes the body on a copied state. An
+exceptional-only callback cannot eliminate the zero-invocation container path:
+it refuses instead. Scalar results lose frame-local numeric correlations;
+returned records immediately demote to existing heap summaries, so different
+invocations cannot gain definite identity or strong cross-record updates.
+The pure body cannot change caller state whether it runs zero, one or any
+finite number of times. The invariant feeds both `nondet_list` elements and
+`nondet_dict` callbacks; dictionary keys must be hashable scalars, and repeated
+keys overwrite. Callback/hash errors inside try blocks remain refused.
+
+`interp.py::_dict_union` reuses `_dict_unpack` for `left | right` on exact
+builtin dict objects with non-float primitive keys and values. It allocates a
+fresh result, copies left then right, and preserves uncertainty when an
+unknown right key could replace a definite left entry. Neither operand is
+mutated. Dictionary sizes are unrestricted; open mapping protocols, float or
+object fields and in-place union remain UNKNOWN. No list comparison or key
+membership relation is added by this change.
+
+## Program stream buffers and facts ([internal ref])
+
+`heap.py::StringIOObj` carries a `world.py::StreamObject` when its bytes and
+cursor are exact. `interp.py::_new_stream`, `::_stringio_method_model` and
+`::_print_to_file` project native StringIO/BytesIO operations onto those facts.
+`write`, `print(file=)`, `getvalue`, `read`, `readline`, `seek`, `tell`, `flush`
+and `close` preserve exact content/cursor when their operands are known. Joins
+retain an exact stream only when both states agree; otherwise text contents and
+positions widen conservatively. Unknown binary content/cursors refuse. Exact
+builtin byte literals/results use a static bytes value; broader bytes protocols
+and iteration remain unsupported. No user formatting or buffer callback is run.
+
+
+The existing `io.BytesIO` factory contract retains its unknown raise obligations;
+precise binary buffer facts do not invent a proof for those claims. Opaque bytes
+remain top outside the explicitly supported stream, equality and length operations.
+
+## File world facts ([internal ref])
+
+`solve/absint/__init__.py::_prove_once` admits read-only builtin `open` to
+`visitor.py::AbsintVisitor.visit_open_read`, using the tested `open.read` shape
+in `contracts/rules_fileio.py`, then `interp.py::Analyzer.c_world_open`.
+The union `open` contract and the write-only `open.output` shape retain their
+own audit cells; the new consumer does not borrow an output contract for a read.
+A file declared by `TaskEnvironment.files`
+or an exact policy world object contributes its decoded text. An undeclared or
+search-mutated object contributes arbitrary text; opening/decoding can also end
+the path with OSError or a decoding error. Exception handlers around these reads
+remain unsupported, so no proof silently drops their continuations. Write/read
+programs and binary reads also remain UNKNOWN in this first text-file consumer.
+
+`heap.py::ReadFileObj` tracks remaining text and closed states. `read` and
+`readline` advance it, heap joins join both components, and `with` closes it.
+Exact reads add an `Origin("absint", ...)` content equality only after checking
+the original bytes. Search-only facts are never promoted to proof assumptions.
+Finite string-to-int conversion now retains exact native integer values, which
+lets the owner's prefix/parsed-integer/threshold example prove its declared-file
+outcome. `lattice.py::FactState.meet` checks `Clauses.contradictions`; deeper
+world contradictions are refused by `WorldObject.materialize`, and producer
+failure/timeout is a refusal rather than proof of unsatisfiability.
+
+The contract audit records `open.read` as consumed by absint. The union `open`
+sample is now modelled through that shape rather than refused; its own union
+contract remains unconsumed. Only these two audit files were regenerated with
+`tests.contracts._frozen`; the existing union contract digest is unchanged.
+
 *Plan [internal ref] group C, lane E. Status: slice 1 (intervals, lengths and relations, fixpoints plus
 inlining) and slice 2 (list segmentation, floats on the shared value facts, per-object float
 invariants with named lemmas, per-site records). Later slices are listed under "Ruled, not built".*
@@ -58,6 +300,12 @@ stack of frames, a heap, and a zone.
   - list lengths (`L.<site>`);
   - range bounds (`R.<site>.lo/hi`);
   - statement temporaries (`$<depth>_<n>`).
+  Full closure after widening uses row-indexed Floyd-Warshall. It considers every
+  finite incoming/outgoing path for each variable and detects negative cycles;
+  absent bounds remain infinity. This changes lookup cost only, retaining exact
+  Python integer weights, every finite variable count and all derived bounds.
+  Independent Bellman-Ford checks cover sparse/dense and disconnected graphs,
+  contradictions, idempotence, sizes through 129 and weights beyond 128 bits.
 
   The matrix is kept closed. `!=` tightens a bound that sits exactly at the excluded value
   (`interp.py::_refine_ne`), which is what turns `while r != 1` with `r >= 1` into `r >= 2`.
@@ -80,6 +328,38 @@ stack of frames, a heap, and a zone.
      regression.
 - **Calls** to the program's own functions are inlined, context-sensitive by call string. Recursion
   aborts. Arity is a checked `TypeError`, and so are keyword and default binding.
+  Nested functions and lambdas retain the fast snapshot path for immediate enclosing
+  parameters which neither that scope nor descendants can rebind or delete. Otherwise,
+  compiler metadata identifies each cell's lexical owner and the function references that
+  existing live frame. A per-call activation number authenticates its lifetime independently
+  of reused frame-depth names. Nonlocal reads, writes and handler cleanup share the owner's
+  normal environment and zone; forwarded cells keep the original owner. Integer reads from
+  cells, including parent locals exposed to nonlocal writes, are materialized before later
+  operands can change the binding. Mutable referents retain their normal heap aliases.
+  Compilation and bytecode inspection execute no target code. Every finite capture count
+  and every existing value kind uses the same mechanism, governed by the run deadline.
+  Implicit class cells still require a representation this model does not have. Expired
+  mutable-cell owners, unfilled/deleted cells, incompatible owner joins, explicit deletion
+  statements and reflective cell access remain UNKNOWN. Immutable snapshots can still
+  outlive their original frame. Class-body functions keep the separate no-cell guard.
+  Source-bound bindings and facts are withheld for live-closure bodies until the export
+  schema represents lexical owners; every check, status and source site remains recorded.
+  Existing body, string-content, non-singleton identity, scalar-summary and arithmetic precision
+  gaps remain conservative; no numeric representation or input-size bound is changed.
+  A capture-free lambda stored in a class has ordinary function descriptor binding: `C.f`
+  leaves its arguments unchanged, while `C().f` prepends the instance. The exact-arity
+  TypeError twin and variadic bound-instance counts are compared with native CPython.
+  Attribute calls with starred arguments retain the separate lookup-order refusal.
+  Identity with a known `None` result uses the actual evaluated operands: two known
+  `None` values are identical, and any known non-None value differs from `None`.
+  This applies to call results and both operand orders without invoking equality or
+  truth hooks. Mixed/unknown values retain the existing conservative refinement;
+  calls, effects, argument checks and tested contracts still execute abstractly first.
+  Ordinary decorators evaluate in source order before defaults, then apply inside out through
+  the existing abstract call/binding path. The name is stored after successful application;
+  replacement values need not be callable. Function aliases, bound methods and callable
+  instances use their existing transfers. Builtin descriptor syntax needs the existing source
+  binding/reflection checks; mixing builtin descriptors with ordinary decorators remains UNKNOWN.
 - **Loops** (`interp.py::Analyzer.s_While`/`s_For`; the fixpoint is `Analyzer._solve_fixpoint`, behind the reuse of
   `Analyzer._fixpoint`, "Fixpoint reuse" below) are analysed in three parts ("The first iteration on its own", below):
   iteration 1 from the entry state, then the fixpoint of iterations 2 and on, then a final pass from that fixpoint.
@@ -105,6 +385,38 @@ stack of frames, a heap, and a zone.
   Checks are recorded in the first-iteration pass and in the final pass, never inside the fixpoint iterations, and a
   site is proven only if it is proven in both. A `for` over a range binds the loop variable with
   `lo <= i <= hi - 1` to the range's immutable bounds.
+
+  Pure geometric integer loops additionally retain normal-exit facts without
+  replacing those passes. `_geometric_loop_entry` authenticates an integer
+  counter initially equal to 1, one doubling update (`r=r*2`, `r=2*r`, `r=r<<1`, `r=r+r`, or the augmented `r*=2`, `r<<=1`, `r+=r`: every spelling of
+  "the counter becomes twice itself"), and the exact guard `r<n` (or `n>r`) or `(n//r)%2==0`. (Correction: the first implementation, by an AI lane (a5b9382b, Codex),
+  was WRONG: it matched `ast.Mult` by the literal 2 and one comparison spelling, so `r << 1` lost the proof. The meaning is
+  doubling, not the spelling.) Both operands must be
+  existing distinct scalar cells; the bound is an integer/bool, or a float for
+  the counter's power fact alone. Calls, attribute hooks, extra body effects,
+  class namespaces, other seeds/guards and `else` suites keep ordinary analysis.
+  The original guard/body contracts, exception checks and fixpoint budgets all
+  run before `_geometric_loop_exit` records a fact. An exhausted budget gives
+  UNKNOWN; no finite prefix certifies a loop.
+
+  Input and result use fresh immutable zone snapshots in the existing integer
+  value-term representation. A query must establish that the current scalar
+  equals its certified result, and input-dependent queries must establish the
+  same identity with the saved input. Equal intervals are insufficient. This
+  proves the power mask `r&(r-1)==0`, integer ceiling bounds/minimality, and
+  divisor/remainder/odd-quotient properties after normal exit. Counter/input
+  reassignment and independently generated records cannot reuse a certificate.
+  Float bounds, including NaN, confer no integer input relation or minimality.
+
+  These are induction rules over all finite Python integer widths, not bounded
+  unrolling or machine-bit identities. The admission script
+  `benchmarks/absint_equivalences/prove_geometric_loops.py` checks binary-word
+  base/step obligations and unbounded floor/mod arithmetic; its JSON includes
+  rejected unguarded rules. Native tests include negative/zero/bool inputs and
+  1024-bit values, plus observable 81-to-161-bit multiplication growth. Existing
+  unsupported operations (including open protocols and unrelated bool ordering
+  or zero/negative-mask precision) remain conservative; no general bitwise,
+  nonlinear loop, termination, invariant-export or checker rule is claimed.
 - **Exceptions.** A check that is not proven records `ok=False`, and the analysis continues on the
   non-raising states. A raising execution ends the program, so it cannot reach a later site. `raise`
   of a class records exactly the property classes that class is, or derives from, including user
@@ -129,8 +441,101 @@ So `for i in range(n): xs[i] = X` ends with `P = n = len(xs)`, and every element
 Operations that shift indices, or that could leave `len < P`, collapse the segmentation: `insert`,
 `pop`, `reverse`, slice assignment. In-place repetition aborts.
 
+## Finite integer memberships
+
+Stored singleton builtin integers may seed `V.int_values`, a finite set that
+over-approximates their possible values independently of interval bounds and
+immutable value identity. `join_into` uses the actual value's current bounds;
+`vjoin` unions known alternatives, includes a plain singleton when appropriate,
+and drops the coordinate for unknown alternatives or mixed kinds. Inclusion
+checks this coordinate as well as the ordinary interval/zone facts. Arithmetic
+creates a new value without it; same-value view changes, copies and recency
+summaries preserve membership, without equating independent elements.
+Seeding requires a possible supported integer comparison in the current source
+scope. Demand is cached per AST scope under the run deadline; a length-only or
+otherwise unobserved collection retains the original interval path.
+
+Interval widening is unchanged. The membership coordinate retains finite
+unions, so a stable list of links can keep excluding a sentinel even when its
+interval widens. A growing set must still reach the ordinary verified fixpoint;
+run-budget or convergence exhaustion gives UNKNOWN. There is no cardinality,
+integer-width or input-size cutoff, and integer ranges are never enumerated.
+
+After ordinary primitive comparison and contract checks, a bare-name/literal
+integer comparison against a singleton can filter the actual memberships for
+each branch and project their minimum/maximum into the existing zone. An empty
+branch is infeasible. Work checks precede each alternative; no partial hull is
+used after exhaustion. Effectful expressions, class namespaces, non-singleton
+opponents and other kinds keep existing conservative transfers. This provides
+ordinary index checks with facts such as `link != tail` implying a valid index,
+without a queue recognizer, unrolling, a new heap shape or checker rule.
+Admission: `benchmarks/absint_equivalences/integer-choice-rule-proofs.json`.
+
+## Positional string snapshots
+
+Known tuple items capture nonpoint exact builtin strings at construction when
+existing value-equality demand is active. `new_list` creates a fresh immutable
+term for each actual position after recency demotion, reuses existing terms,
+and then applies the ordinary summary operation. A shared abstract `ANYSTR`
+view never equates two independent draws. Literal singleton strings need no
+extra term; other kinds and undemanded constructions retain their old path.
+
+This makes repeated pointed reads, copies, slices and returned tuples available
+to the existing string congruence and length observers. Tuple arity and string
+length have no cutoff; each fresh capture checks the run deadline. Existing
+demotion and nondeterministic callback summaries still erase scalar provenance
+where independent values are merged. Nonpositional sequence summaries stand
+for independent members and receive no common snapshot; mutable lists and
+nonpoint index relations remain separate gaps. The existing authenticated positional
+list retry also benefits when selected, with no change to its classifier or
+retry policy. No new equality law, heap shape or checker rule is introduced.
+
+## String length observations
+
+For a captured builtin string, `_len_model` can retain the exact affine length
+of its immutable `value_term`. `_string_length_form` walks concatenation recipes
+iteratively, counts literal Python code points, and gives each opaque captured
+value its own nonnegative length variable. Recipe keys stay alive during the
+analysis so fresh draws cannot reuse an old identity. A changed binding has a
+different recipe; a nontrivial join remains opaque. These observations use the
+existing linear/zone representation and its optional affine equations, with no
+depth, operand-count or string-size cutoff. The analyzer deadline applies before
+each DAG step; exhaustion refuses the query without a partial length.
+
+Tracking runs only on the recording path when existing source equality demand
+and string provenance are present. The default numeric path, invariant iteration,
+finite-string length bounds, non-string containers and user `__len__` calls keep
+their existing transfers. Call-return, heap and loop provenance gaps still lose
+precision conservatively. The current tested `len` contract is still required.
+Admission covers a 21-bit sequence alphabet containing every Python code point,
+including astral characters and isolated surrogates; UTF-8 byte counts do not
+enter the model. See `benchmarks/absint_equivalences/string-length-rule-proofs.json`.
+
+For example, a readonly closure adding captured `"tail"` to `"head"` retains an
+`Add(literal("head"), literal("tail"))` recipe. Length projects this to `4+4`, so
+its equality to 8 is proved. Content equality to literal `"headtail"` still loses
+precision: the existing content congruence flattens concatenations and removes
+empty strings, but does not fold adjacent literals. That rule is unchanged.
+
 ## Floats: value terms, focus, object invariants and lemmas (slice 2)
 
+The numeric `float` constructor reuses `float_view` only when the existing
+total-conversion guard accepts the operand. Float copies retain their facts
+(including NaN/infinity and known zero signs); bool and finite bounded integer
+conversion reuse the shared outward-rounded transfer. Integers that may overflow
+and other inputs retain the prior conservative fallback. The overflow threshold
+is CPython's conversion boundary, not a chosen integer-width limit. No-argument
+`float()` yields known positive zero. Constructor chains have no length cutoff;
+general IEEE arithmetic relations are a separate precision gap. The rounding
+projection obligations and rejected NaN/zero-sign/integer-exactness shortcuts
+are in `benchmarks/absint_equivalences/float-cast-rule-proofs.json`.
+
+- **Exact dyadic terms** (`exactfloat.py`, V_TERMS): `float(i)` of an int with bounds inside +-2**53, a float literal such as 0.5, and `+`, `-`, `*` by a
+  literal and `**2` of such values are the real number `(c + sum k*x)/2**s` itself while `|value| * 2**s < 2**53` (IEEE `+ - *` are correctly
+  rounded, so a representable exact result is returned exactly): their result intervals are not rounded outward, a sum/difference keeps a term, and
+  `==` between two terms is decided by the difference as an int linear form (the same real number is the same double; no NaN, -0.0 == 0.0). A
+  conversion with no int variable to name gets a fresh atom. `x // x` and `x % x` of one value are 1 and 0 (the divisor 0 raises). Tests:
+  `tests/test_absint_exact_floats.py`.
 - **Value terms** (`lemmas.py`) name how a float was computed:
   - `trig(f, key, k)` for `k * sin/cos(x)`;
   - `rd(addr, attr, ver)`, an attribute's value;
@@ -199,8 +604,9 @@ Operations that shift indices, or that could leave `len < P`, collapse the segme
   `compare_split`): when at least one operand is a float and both are purely numeric, the operands'
   facts go through `values.py::refine_compare` (NaN makes every ordered comparison and `==` False and
   `!=` True; an int is compared with a float exactly; `-0.0 == 0.0`), and a side that leaves no pair of
-  values is an impossible branch. Only that: the operands are not narrowed inside the branches (a name
-  keeps its fact), so `x >= 0.0 or x < 0.0` over a range that excludes NaN is still not proven. Int
+  values is an impossible branch. A pure float name in the current frame retains the refined fact when
+  compared with a numeric literal. Other operands remain unchanged: an effectful comparison cannot
+  refine a stale name read, and global reads inside callees are not current-frame bindings. Int
   against int keeps the zone.
   An int beyond the float range sits between the finite floats and the infinity (`inf > 10 ** 400` is True): the view of
   a huge positive int is `[largest finite float, inf]` (`values.py::_cmp_view`; it used to put it AT `inf`, which pruned
@@ -255,6 +661,36 @@ reads natively over every pair of draws and fails on a TRUE for a class the prog
 `tests/contracts/test_builtins.py::TestAnyAll` (the new `any`/`all` contracts) and
 `tests/test_symexec_reducers.py`. `scripts/absint_fuzz.py` draws the reducers over the list, tuple and ranges.
 
+## Pure integer callback folds
+
+`ReducersMixin._integer_reduce` consumes `functools.reduce` through its existing
+Rule visitor. It proves a type invariant for an arbitrary number of elements,
+without removing the census call site. Sources must be exact builtin integer
+lists/tuples; an optional positional or keyword `initial` must also be an exact
+integer. A missing initial retains the TypeError obligation unless nonemptiness
+is proved; a certainly empty source with an initial returns that initial.
+
+The callback must resolve to one plain source function or lambda with two
+positional parameters. Its only body is a parameter-only expression built from
+integer literals, unary `+`, `-`, `~`, and binary `+`, `-`, `*`, `&`, `|`, `^`.
+No other names, calls, attributes, subscriptions, statements, decorators, open
+hooks, floats, bools or iterator operands enter this transfer. Existing generic
+contract handling remains the fallback outside that domain.
+
+All integers contain the seed and are closed under these operations. The
+ordinary abstract function-call machinery checks the callback on two arbitrary
+integers; the result is an unconstrained integer, with no invented equality to
+another fold. Parameter-only primitive expressions cannot mutate the iterable
+or observe changing callback state. The tested registry contract, return and
+raise claims gate this precision; withdrawal removes it. Tests in
+`tests/test_absint_reduce.py` cover the invariant, native raising callbacks,
+binding, empty sources, aliasing and contract withdrawal on CPython 3.14.4.
+
+This recovers local absint arithmetic/data-lookup proofs of the public
+`type-eval-py/builtins_functools` example while its census remains nonempty.
+It supplies no model for `groupby` cursor sharing or non-scalar verifier
+callbacks; those examples can correctly remain UNKNOWN.
+
 ## Site records (shared with lanes A and B)
 
 Every check also yields a record (`AbsintResult.records`; `--json` prints them) with these fields:
@@ -267,6 +703,10 @@ Every check also yields a record (`AbsintResult.records`; `--json` prints them) 
 - `scope`: **must-facts only**. They are the zone and float bounds of the residual's names in the
   proven invariant at the site, intersected over every visit;
 - `types`;
+- assertion records also carry `type_sets` and `entry_scope`: all represented kinds and
+  must-facts before evaluating the assertion. Their `scope` describes the possible failing
+  state, and `residual` names the failing condition. Repeated visits union the kinds and
+  intersect the must-facts;
 - `context`: the inlining call string;
 - `loop_iteration`: `"any"`;
 - `source_sha`.
@@ -276,16 +716,30 @@ every operation of the program that can raise the property's classes, because ab
 anything it does not model. Lane A solves `may_raise` records for a witness, and lane B refutes
 them for a certificate.
 
+The SV run publishes these records in its existing `ObligationTable`. Guard-value seeds
+solve open failure conditions together with their site bounds and relations; comparison
+and boundary seeds use the failure intervals' endpoints. A proved assertion gets no
+concolic solve marker. Bounds constrain these site queries only: a reassigned local is
+not an entry draw, unrelated sites keep separate domains, and enumeration retains its
+full input domain. A spent guidance budget supplies no further seeds and proves nothing.
+
 ## Soundness rules (absolute: a wrong TRUE costs 32 points)
 
+An indexed store is strong only when the entire receiver value denotes one
+recent object. Selecting a singleton subset of lists, dicts or arrays from a
+mixed receiver does not establish which object Python will mutate. Dictionary
+constant-key updates and list/array element updates all use the whole-receiver
+guard; ambiguous alternatives keep their old values possible.
+
 - **Every unmodelled construct aborts** (`interp.py::Unsupported`):
-  - `with`/`match`, generators, lambdas;
+  - `with`/`match`, generators, unsupported lambda forms;
   - comprehensions the exact lowering refuses (below: the lowering turns the others into loops
     before the analysis runs, so only a refused shape aborts);
-  - nested functions and closures, recursion;
-  - `eval`/`exec`/`getattr`/`setattr` (unmodelled builtins);
+  - expired mutable-cell activations, unfilled/deleted cells, incompatible cell-owner joins, unavailable or ambiguous lexical scopes;
+  - `getattr`/`setattr` and `eval`/`exec` outside the finite module-source lowering
+    ([LOWERING.md](LOWERING.md), "Finite module code sources");
   - any library function outside the model table (`interp.py::MODULES`);
-  - multiple inheritance, metaclasses, decorators other than `staticmethod`;
+  - multiple inheritance, metaclasses, unrepresented descriptor/decorator composition;
   - classes that define an implicitly called dunder (`__eq__`, `__getitem__`, `__add__`, ...;
     `interp.py::UNSUPPORTED_DUNDERS`);
   - `__str__`/`__repr__` reached by printing or formatting;
@@ -369,17 +823,62 @@ them for a certificate.
   wrongly end the path); a callable the table does not know, given an instance whose class defines `__len__`,
   is refused. `tests/contracts/test_swallowing_native.py` pins the table against CPython.
 
+## Refusing per check instead of per program (decided not to build: 2026-11-05, [internal ref])
+
+The owner agreed in principle to replace "any unmodelled construct aborts the whole analysis" by "model the construct as havoc, keep analysing, prove the checks the havoc cannot reach".
+This section records what such a havoc must do to keep "never a wrong TRUE", and the measurement that says what it can and cannot decide. The decision (2026-11-05, [internal ref]): the havoc is NOT built -- the measurement below shows no score gain and the wrong-TRUE risk of an unsound havoc; this section stays as the record of what a sound one would have to over-approximate and of the typed-opaque-values alternative. Nothing here changes the analyzer.
+
+**What a sound havoc must over-approximate** (each item is an existing invariant of this analyzer, see "Soundness rules" above):
+1. *Heap and aliasing*: every object reachable from the construct's operands, from any global, and from any mutable cell may change contents, length and class-visible attributes; recency/summary objects it
+   could touch become unknown summaries (weak, unbounded) and any symbolic bound or zone fact that names them is rewritten away (`State.rewrite_bounds_away`) before the havoc.
+2. *Locals*: only names the statement rebinds (and cells, below) change; a scalar local the statement cannot rebind keeps its fact.
+3. *Cells and closures*: every mutable cell owned by an activation the construct can call into becomes unknown; an expired activation stays unreachable only if nothing unknown can hold it.
+4. *Exceptions*: the construct may raise any exception class; an uncaught one ends the program, so it is a potential violation of EVERY property class unless a contract summary bounds it, and
+   inside a `try` it must be routed to the handlers with the pre-state havoced (today: refused by name, "static callable raises are not routed").
+5. *Callbacks*: an unmodelled callee may run any user function it can reach (a callback, a `__len__`, a `key=`) with arbitrary arguments: the sites inside those functions must be reported as unproven too.
+   Analysis by inlining never sees them, so a havoc needs an independent inventory of all sites (the census, `census.py::site_census`) and every inventory site not matched by a recorded check is unproven.
+   `AbsintResult.complete` no longer implies "the records cover every operation": that implication holds only because absint aborts on what it does not model.
+6. *Time*: the havoc happens inside loop fixpoints too; it must be monotone and idempotent on the widening path.
+
+**What it can decide, measured.** The frozen held-out suite (`tests/heldout/BASELINE-20261105.md`, branch 1519/heldout-suite) on main 28467f87: 82 TRUE pairs of the originals are UNKNOWN. In 21 absint ran to the end and a check
+is genuinely unproven (18 assertions, 3 index/key/type sites): a havoc changes nothing there. In 61 absint aborts with `Unsupported`. By reason: `type.list` / static callable raises inside a `try` 7 (+1 `nondet_int` mfunc), `len` of an unknown value 7,
+captured closure cells 6, expired closure activation 4, subscript store on an unknown value 5, `.most_common` 4, enumerate over an unmodelled callback 4, comparison with an unknown value 3, `str.__contains__` contract 3, subscript of an
+unknown value 2, call of an unknown value (`next`, `ChainMap`, `MyClass`, ...) 5, `.func` / `.move_to_end` / `.append` method on an unknown value 4, `__hash__` class 1, class decorator 1, truth value of an unknown value 1, `*args` 1, others 3.
+The 16 such cases of the lane-1519 library-style programs were read one by one: in every one the unmodelled construct produces or mutates a value that a property check of that pair then reads (a deque or OrderedDict
+guard, a Counter lookup, a closure-built divisor, a property setter's clamp, `super().__init__`'s attributes). The slicer (`solve/slicing.py`) already removes statements no check depends on, so what is left feeds a check.
+Under a sound havoc such a check reads an unknown value and stays unproven, so the verdict stays UNKNOWN: **per-check refusal alone is expected to decide almost none of these 61 TRUE pairs**; it pays only where an
+unmodelled statement lies on no dependency path of a check and the slicer kept it conservatively, or where a contract summary bounds what the construct can raise.
+
+**What would decide them: typed opaque values (proposal, needs the owner's go).** The result of a stdlib constructor the contracts layer knows (`deque`, `OrderedDict`, `Counter`, `defaultdict`, `ChainMap`, `collections.abc` views) is an
+opaque heap object of a KNOWN class with unknown contents: a havoc whose class is known. Its methods are served by the contract rules (`solve/contracts/adapters/rules_collections.py` and neighbours: arity checked, which property
+classes each method can raise under which argument conditions), its mutations are weak updates of the unknown contents, and `len`, truth, iteration and `in` of it return unconstrained non-negative / bool / element values with
+exactly the contract's raises. That decides the sites a class's contract proves safe (a Counter or defaultdict lookup never raises KeyError, `len` of a deque cannot raise TypeError, `deque.append` cannot raise on any argument) and
+leaves the data-dependent ones (`OrderedDict.move_to_end` of a possibly absent key, `popleft` of a possibly empty deque) unproven. Its soundness rests on the contracts being exact over-approximations (they are pinned against CPython
+by `tests/contracts/`). Closures, `try` routing of static callable raises and expired cell activations are separate modelling tasks (they are the next three rows of the blocker table).
+
 ## Comprehensions: the exact lowering ([internal ref])
 
 `interp.py` has no model of a comprehension. `prove` therefore runs `solve/lowering`
 (`lower_comprehensions`, [LOWERING.md](LOWERING.md)) on the sliced program first, builds the `Analyzer`
 on the lowered tree, and puts every report back in terms of the original program. The lowering is the
 SAME program (same value, exception and order of effects), so a proof of the lowered program is a proof
-of the original. It refuses what it cannot make exact: a lazy generator expression (`any`, `all`, `next`,
-`sum`, `min`, `max`, `zip`, ...), `*args`, `**kwargs`, f-strings, assignment expressions, comprehensions
+of the original. It refuses what it cannot make exact: stored or partially consumed
+generators (`next`, `min`, `max`, `zip`, ...), unadmitted numeric/protocol consumers, `*args`, `**kwargs`, f-strings, assignment expressions, comprehensions
 in a loop test, a `with` item, a default value, a decorator, an augmented assignment, a lambda or a
 class body, and any program that can reach its own namespace (`locals()`, `globals()`, a frame
 attribute). A refused comprehension stays in the tree and absint aborts on it as before.
+
+### Immediately consumed generator expressions
+
+The comprehension normalizer also handles stable all/any/list/tuple consumers,
+integer-only native sum and one pattern-unpack target; see [LOWERING.md](LOWERING.md).
+all/any stop every nested loop, and unpack consumes only the source arity plus
+one unless starred. Per-step StopIteration handlers preserve generator exception
+conversion without catching errors from consumer truth tests. Absint permits
+primitive power, bool and isinstance only across these structurally verified,
+lowering-owned boundaries; user handlers, finalizers and unknown protocol calls
+keep their existing conservative gates. The independent witness checker has not
+acquired generator syntax support through this change.
 
 Findings are about the original program:
 
@@ -392,7 +891,47 @@ Findings are about the original program:
 make an unsafe division look safe, and `tests/test_absint_lowering_fuzz.py` runs every program absint
 calls TRUE for real.
 
+### Assignment expressions in while guards
+
+When the source contains `:=`, `prove` also applies
+`solve/lowering/walrus.py::lower_walrus_loops` to the origin-aware analysis tree.
+For a function-local target, `while prefix and (name := value)` keeps the prefix as its loop condition, then
+assigns `name`, breaks if it is false, and executes the original body. A sole
+`while (name := value)` uses a true loop condition. An `and` prefix may have any
+number of operands. Evaluation order, short-circuiting, assignment before the
+truth test, and original body `break`/`continue` behavior are preserved. No
+temporary variable, scope, input-size bound or numeric representation is added.
+The loop, body and moved operands retain their node identity and source origin;
+introduced assignments/guards stand for the original assignment expression.
+
+Module/class scopes, global/nonlocal targets, targets mentioned in nested scopes,
+namespace reflection, any declared finalizer, a while-else suite, an assignment expression elsewhere in the guard, and other
+assignment-expression contexts remain unchanged and reach the analyzer's general
+unsupported-expression UNKNOWN rule. The normalizer does not run on source
+without `:=`. `tests/test_lowering_walrus.py` compares native effects, exceptions,
+binding and truth tests over sizes 0,1,2,3,17,65,129, including custom truth
+protocols and integers wider than the machine representation, and checks original
+site reporting and an unsafe assertion. Class namespace interception and finalizers
+that rebind globals/closure cells are native refusal controls: re-reading a target
+in those contexts need not yield the value of the original assignment expression.
+A finalizer can also observe the extra RHS reference held by the original assignment
+expression during its store, so programs declaring `__del__` are not rewritten.
+The independent source checker and proof finalizer retain their existing admission rules.
+
 ## Import boundary ([internal ref]): read-and-recurse, not allow-by-name
+
+An absint TRUE used by SV carries the raw-byte hashes of every source module
+and package initializer its resolver actually parsed, plus the module names,
+ordered roots and paths used for resolution. Child resolvers share this evidence;
+inert initializers are included even when they need no interpreter execution.
+Hashes are captured at the read, not after the proof returns. Conflicting reads
+or lookup results during a proof refuse. The SV engine hashes the exact primary
+bytes it decodes and passes to absint using the existing PEP 263 semantics.
+Before exporting TRUE, the scheduler rechecks these bytes, import resolutions,
+compiled/bytecode competitors and the existing native-import blocker. A change gives
+UNKNOWN before witness export. This does not route regular packages through
+the product prover's intentionally narrower flat-source shortcut; its existing
+independent closure check remains in place. Proof rules and domains are unchanged.
 
 Before this, an import from outside `interp.py::MODULES`'s small model table (`math`,
 `random`, `_sv_verifier`) was always built `top` (`src/tharkun/solve/absint/interp.py::Analyzer.module_attr`),
@@ -855,6 +1394,8 @@ points are the contract's, not the model's: `list.pop`'s `IndexError` is the cal
 index check (`pop` of an empty list stays unproven); and a class the contract says `never` is VETOED when the model recorded a failing
 check of the call (`proven[exc] = None`), because the `never` of `list.append`, `list.reverse`, `dict.keys`, `dict.values` and
 `StringIO.getvalue` holds for the shape its tests ran: `xs.append()` raises `TypeError` and its `list.append:TypeError` op is unproven.
+Under a `try`, a builtin method whose raises are not routed is refused (`Analyzer._try_routes_builtin_raise`); `interp.py::_TRY_METHOD_ALLOWLIST` adds the one exact shape
+`xs.append(v)` (one positional argument, no keywords, a direct call on a list, not a bound alias), whose `never` contract is proven for any value.
 The read-only and shrinking list methods are modelled the same way (third PR of step 2): `copy` (a NEW list with the receiver's length and
 element summary, one receiver only, like `list(x)`), `clear` (length 0, no elements), `count` (an int in `[0, len]`), `index` (an int in
 `[0, len - 1]`; absent is a `ValueError`, which is no property class, so the path ends: a list that cannot hold the value ends every path),
@@ -1161,7 +1702,33 @@ other results take 36.4 s of CPU at the base and 33.3 s (-8.6 %) at delay 0, for
 * **Records change** as the passes add up: a site's `fact` text lists the facts of both passes, and 13 Real-world and Solve-only
   records lose one `scope` fact (the first visit is part of the intersection of must-facts). No record loses its residual.
 
+## Definite-key dictionary get
+
+`Analyzer._dict_method_model` uses the existing `dict_load` presence proof to
+exclude `dict.get`'s fallback when the key is definitely present. This retains
+the selected value and its shallow aliases, including dataclasses-json's
+`field.metadata.get('dataclasses_json', {})` mapping. All key/default argument
+expressions still run before lookup. Uncertain presence keeps the previous
+value/default join; a definitely absent key keeps the existing default result.
+The added precision requires the current tested return contract and excludes
+float values. No lookup, membership, mutation, callback, census or state
+mechanism changes. `tests/test_absint_dict_get_present.py` covers aliasing,
+argument effects/exceptions, uncertain keys and return-contract withdrawals.
+The direct metadata check is bounded; no complete schema factory is claimed.
+
 ## Dict keys from the zone ([internal ref])
+
+For an exact builtin `DictObj`, `Analyzer.truth_split` uses the existing
+`dict_len` bounds: a must-key proves nonempty, an exact empty map proves false,
+and unknown cardinality retains both branches. This makes the existing `and`,
+`or`, `not` and conditional machinery select the correct mapping/effects,
+including dataclasses-json `mm.py:284`'s `field.metadata or {}` fragment.
+Values' truth hooks are never invoked; user/subclass truth hooks retain their
+existing handling. No key-presence relation is inferred from an otherwise
+unknown nonempty map, and no heap, state, comparison or callback mechanism
+changes. `tests/test_absint_dict_truth.py` checks native order/alias/callback
+controls and positive/negative proofs. The later `get` selector in that source
+is a separate consumer; this fragment check is no complete factory proof.
 
 A dict key is a set of constants when the zone bounds it (`interp.py::Analyzer.key_consts`, at most 64 values), not only
 when the value carries literal bounds. A name reads as a zone variable (`IntInfo.lin`), so `EMPTY, WHITE, BLACK = 0, 1, 2;
@@ -1173,11 +1740,174 @@ dict and contributes summarized key/value facts to `okeys`/`ovals`; float keys a
 float fact. It does not make any possible key definite. Earlier constant keys remain present, with their values joined when a
 later uncertain key may collide (`True == 1 == 1.0`). This summary loses cardinality and key identity: in particular, it
 cannot prove lookup by a same-object NaN key. Float keys are never placed in the definite constant-key map. Reference/custom
-hash/equality keys and dict unpacking remain refused. For a non-strong subscript store, each definitely-present key that the
+hash/equality keys remain refused. Closed dict unpacking is described below. For a non-strong subscript store, each definitely-present key that the
 incoming scalar key may equal keeps its presence but joins the incoming value; the open-key/value summary is updated as well.
 The tests are `tests/test_absint_dict_keys.py` (native key semantics plus a differential over named, looped and drawn keys,
 with a bug injected into the key set caught).
 `go`'s next blocker behind it was `set()` (line 147): absint had no set heap kind (built by [internal ref]: "Sets", below).
+
+### Direct primitive dictionary items loops
+
+`Analyzer.s_For` admits one builtin items view of one exact `DictObj` as a
+direct statement iterable. `iter_elem` constructs its two-field tuple from
+the current dictionary at each loop entry, using the existing length, key,
+value and tuple-allocation mechanisms. Keys and values must be primitive and
+non-float. An exact empty dictionary has no element; unknown cardinality
+never gains a definite key or key/value identity relation.
+
+The view remains live: later value mutations join into subsequent elements,
+while rebinding the dictionary name does not retarget an existing view.
+Snapshotting values before the loop would be unsound and is covered by a
+native counterexample that changes a later integer value to a string.
+The global `check_iterable` refusal and `elem_summary` stay unchanged, so
+explicit iterators and generic materializers gain no items-view admission.
+Existing sorted-items behavior is unchanged. Active `try` loops retain the
+existing refusal for unmodelled RuntimeError exits from size mutation.
+
+This covers the statement shape `for k, v in kvs.items()` in dataclasses-json
+`core.py:98`. It does not establish inversion or safety of the owning encoder:
+membership/read-back and configured callbacks are separate consumers.
+`tests/test_absint_dict_items_for.py` checks native order, aliases, live
+mutation, subclass callbacks and positive/negative statement proofs.
+
+### Closed primitive dictionary setdefault
+
+`Analyzer._dict_setdefault_model` consumes the existing tested `dict.setdefault`
+rule through the method visitor. The domain is a recent exact builtin dict,
+any int/bool/str/None key summary and primitive non-float fields/defaults.
+The existing single concrete tuple-key insertion path remains supported.
+The default expression is evaluated by ordinary analysis even when the key is
+present. Reference-bearing defaults remain refused because discarding the
+unused temporary may run cleanup code. Float/custom keys, summary receivers,
+stored bound methods and builtin exceptional continuations retain named refusals.
+
+For one constant key, a definite existing entry returns its value without
+overwriting it. Otherwise the value joins a possibly present, colliding entry
+with the default and the existing strong subscript store guarantees that key
+after success.
+Possible unrelated keys remain possible; no key-identity relation or new
+state field is introduced. With an uncertain key, every definite existing entry
+is preserved; the return joins matching existing values and any possible default,
+and only possible insertions enter the open key/value summaries. A finite set
+of already-present keys cannot insert the default. The existing summary does
+not track that a selected open key is now present: reading back through that
+key can still be UNKNOWN. No cardinality bound is imposed; finite-key expansion
+is only a precision choice, and a spent run budget remains UNKNOWN.
+Binding stays positional only, and current registry
+contract/return/raise withdrawals remove the corresponding proof.
+
+The unchanged call in dataclasses-json `mm.py:301` supplies a `None` default
+for optional-field options. The direct check covers bounded scalar options;
+it does not prove the complete schema factory or callable defaults.
+`tests/test_absint_dict_setdefault.py` covers native argument order, discarded
+default cleanup, numeric collisions, hash/equality propagation for all seven
+property exceptions, and positive/negative transfer and withdrawal checks.
+
+### Closed dictionary display unpacking
+
+`Analyzer.e_Dict` and `_dict_unpack` model `{**left, key: value, **right}`
+through the existing `DictObj` fields. Computed keys and operand calls go through
+ordinary `Analyzer.eval`, retaining their authentication, effects and exception
+checks. Each expanded
+value must identify one exact builtin dict, with int/bool/str/None keys.
+Open mapping protocols, subclasses, custom hash/equality, floating keys and
+unresolved/alternative receivers remain refused; no callbacks are skipped.
+
+Operands retain source order. Later definite entries replace earlier values;
+possible later keys preserve earlier key presence and join any colliding value.
+Possible-only keys never become definite. Open keys/values remain summarized,
+without an invented length bound or cross-dictionary key-identity relation.
+Copied references are borrowed against allocation demotion and remain shallow
+aliases; changing the new dict's entries does not change the source dict.
+An unpacking display keeps its partial result in an existing pinned `DictObj`;
+after each operand it reads that live object again. Thus ordinary calls may
+mutate source mappings or shared nested values without retroactively replacing
+an earlier copied entry, losing temporary lifetimes or reusing stale Python
+locals. Pin shape changes are refused. Effectful displays inside an enclosing
+handler scope stay refused because that exception continuation is not admitted;
+handlers entirely inside an operand use the ordinary call machinery. Existing
+finalizer/class refusals remain intact.
+No new contract, census exception exemption, state field or checker is added.
+
+The actual public `type-eval-py/dicts_merge` source stops at unpacking on the
+base. With this transfer its abstract analysis completes, but data-lookup is
+still UNKNOWN at later reads indexed by keys iterated from another dict. That
+relational consumer gap remains explicit; no full-property gain is claimed.
+`tests/test_absint_dict_unpack.py` records native CPython 3.14.4 overwrite,
+alias, collision, evaluation-order and exception boundaries plus positive and
+negative proofs. In particular, DICT_UPDATE converts an AttributeError from
+the mapping/key merge into TypeError; open callback shapes remain refused.
+
+Sources: [Python 3.14 dictionary displays](https://docs.python.org/3.14/reference/expressions.html#dictionary-displays)
+and [CPython v3.14.4 dict implementation](https://github.com/python/cpython/blob/v3.14.4/Objects/dictobject.c).
+
+The computed-key follow-up is source-matched to dataclasses-json `mm.py:363`:
+its unchanged dictionary display includes `f'make_{cls.__name__.lower()}'` and
+`**schema_`. On the previous transfer that display is refused by the syntax
+gate; with source-defined `Record` and closed scalar bindings it proves the
+selected key/value results locally. This is a consumer demonstration, not a
+whole schema-factory, portfolio or checked-witness recovery claim. Source and
+property names do not participate in production dispatch.
+
+### Closed primitive dictionary updates
+
+`Analyzer._dict_update_model` consumes the existing tested `dict.update` rule
+through the method visitor. It accepts a recent exact builtin receiver, zero
+or one exact builtin mapping argument, and keyword entries. Both mappings have
+int/bool/str/None keys and primitive non-float values; reference-bearing values
+remain refused because replacing their last reference can run cleanup code.
+Summary receivers, open mappings, pair iterables and stored bound methods stay
+refused. Argument expressions still run through ordinary analysis before the
+transfer; builtin exceptional continuations retain the existing refusal.
+
+The unchanged `_dict_unpack` helper preserves definite versus possible keys,
+joins possible overwrites and retains scalar numeric-key collisions. Keyword
+entries use the existing strong subscript store after the mapping update.
+Object aliases see the mutation, source mappings remain independent, and the
+tested return is `None`. Withdrawing the contract or its return proof removes
+the transfer; unknown raise claims remain unproved. No new state, contract,
+callback admission or cross-dictionary relation is introduced.
+
+This covers scalar configuration updates shaped like dataclasses-json
+`core.py`'s class override merge; it does not prove the complete
+dataclass factory or reference-valued encoder/decoder configurations.
+`tests/test_absint_dict_update.py` checks native precedence, aliasing, argument
+order, partial pair failure, cleanup and all seven callback exceptions before
+the positive and negative consumer checks. Unlike dictionary-display unpacking,
+method `dict.update` propagates callback `AttributeError` unchanged.
+
+### Atomic deepcopy leaves
+
+`AbsintVisitor.visit_copy_deepcopy` and the `_copy_deepcopy_atomic` helpers
+consume the existing tested rule for one positional int/bool/str/None value.
+CPython 3.14.4 returns these atomic inputs unchanged before consulting a memo
+or copy/pickle hook. The transfer retains the captured argument's abstract
+value and existing integer relations, gated on its current tested return
+claim; all seven raise claims still pass through the normal contract model.
+Argument expressions and callee authentication retain ordinary analysis.
+
+Containers, cycles, custom objects, floats, bytes, keywords and provided memos
+keep the generic path. The existing refusal inside `try` remains. This is no
+recursive-copy or general alias model and adds no state, contract or census
+metadata. `tests/test_absint_deepcopy_atomic.py` checks native identity,
+memo/hook/cycle boundaries, aliases, binding, effects and withdrawals, while
+the existing list-copy tests retain their separate transfer.
+
+The unchanged `copy.deepcopy(obj)` leaf in dataclasses-json `core.py:338` is
+checked for bounded atomic inputs. No complete `_asdict` or serializer result
+is claimed. The `copy.deepcopy` audit cell was already consumed through its
+generic visitor and retains its existing frozen row.
+
+The copy contracts use the broad return type `object`: hooks and supplied memo
+cache entries may replace the result with an unrelated type. Atomic identity
+is the closed transfer's native argument proof, gated on the tested return
+claim. A supplied deepcopy memo is declared in the existing `mutates_args`
+field; memo callbacks remain open, and malformed get/keep-alive operations can
+raise native AttributeError or TypeError without invoking an object hook. The
+atomic transfer explicitly rules out that memo access before upgrading the
+native AttributeError claim. `tests/contracts/test_copy_memo_boundaries.py`
+backs the mutation, cache, hook, binding and malformed-memo boundaries. This
+does not admit a supplied-memo transfer or a recursive copy model.
 
 ## Sets ([internal ref]): `SetObj`, one kind for `set` and `frozenset`
 
@@ -1383,6 +2113,44 @@ proved everything but the `TypeError`.
 `tests/test_absint_str_getitem.py` (the five MIN tasks, native controls, the negative probes) and ten negative controls (each part of the
 fix undone, the tests fail).
 
+## str methods with hook-free arguments (contracts-r1)
+
+`AbsintVisitor._abstract_string` (the visit of every `str.*` rule when an operand is not finite: a `nondet_str()` receiver) proved only the
+zero-argument methods. `s.startswith(p)`, `s.split(",")`, `",".join(xs)`, `s.replace(a, b)` left all seven classes of the rule unproven,
+because the rules (`rules_str.py`) say what is true of them in general: the position arguments (`start`, `end`, `maxsplit`, `count`, `width`,
+`tabsize`) are read by a USER `__index__`, `join` iterates a user iterable, `keepends` is read by `__bool__`, and `TypeError` is the call's own logic.
+So a program that used one was never TRUE for `arithmetic`, `data-lookup` or `dynamic-typing` (36 pairs of `type-eval-py` on the pending set).
+
+A call is **admitted** when the receiver is a definite builtin `str` (`V.s` and nothing else) and every argument has exactly the kind the method takes.
+`contracts/adapters/str_shapes.py` is the engine-neutral half: `SIGNATURES` (the parameters after the receiver, which are optional, which may be keywords in CPython
+3.14), `bind` (the call as CPython's argument parser binds it, or `None` for a call that does not bind), and the kinds: `s` a str, `S` a str or a tuple of str,
+`c` a str or None, `i` an int or bool, `n` an int, bool or None, `L` a list or tuple of str. `visitor.py::_str_kind_ok` maps a kind to an abstract value, and
+accepts nothing else: not `top`, not a float where an int is taken, not a static object, not an instance of a program class, not an `array` or set where a list is
+taken. An admitted call proves all seven classes (`contract+model: ... no user hook runs`), for these methods: `startswith`, `endswith`, `count`, `find`,
+`rfind`, `index`, `rindex`, `split`, `rsplit`, `strip`, `lstrip`, `rstrip`, `replace`, `removeprefix`, `removesuffix`, `join`, `zfill`, `splitlines`, `expandtabs`.
+Anything else (a call that does not bind, a wrong kind, a union with an object, `startswith("a", start=1)`, `s.split(",", sep=",")`) keeps the contract's claims, exactly as before.
+
+- **join.** The argument is a list or tuple whose element summary is `str` only (`ListObj.elem`, `pre` of a segmented list, or the items of a tuple). The summary is
+  universal and the analysis keeps it true across aliases, calls, stores in containers and objects, index and slice assignment, `append`/`extend`/`insert`/`+=`/`+`
+  (`tests/fixtures/absint/str_methods/sm_join_*`: each writes a non-str by one of those ways and CPython raises `TypeError`, and no property is TRUE for it). A str, dict, set, generator
+  or iterator argument is valid in CPython and is refused here; so is an element of a class with a builtin base (`class S(str)`: refused where it is defined).
+- **Results.** `startswith`/`endswith` are `bool`; `count`/`index`/`rindex` are at least 0 and `find`/`rfind` at least -1 (`INT_RESULT_LOWER`); `split`/`rsplit` with a
+  str separator return a list of at least one part (`"".split(",") == [""]`), without a separator (None) the list may be empty (`"".split() == []`).
+- **Non-property raises.** `ValueError` (empty separator, absent substring), `OverflowError` (`maxsplit`, `count` and `width` at 2**63, `tabsize` at 2**31) and `MemoryError` (a `zfill`
+  or `expandtabs` width the result cannot be allocated at) are not property classes: `NON_PROPERTY_RAISES` names them per method and `tests/contracts/test_str_shapes.py` measures them on
+  CPython 3.14.4. Outside a `try` they end the run, so the proof goes on past the call; **inside a `try` the rule call is refused** (`Analyzer.visit_rule`:
+  "a contract rule: its non-property raises are not routed"), so `try: s.zfill(n) except Exception: 1 // 0` is never TRUE. `start`/`end` clamp and never raise.
+
+**Safety template.** `solve/contracts/safety/rules_str.py` states the `TypeError` claim of each of these methods as cases over the exact scalar tags of the arguments (the
+receiver a `str`; one case per assignment of `int`/`bool`/`float`/`str`/`NoneType` to each argument; a call raises iff some argument's tag is one its parameter does not take,
+`splitlines(keepends)` taking all of them). It is registered in `safety/__init__.py::_case_builders` and `tests/contracts/test_safety_str_templates.py` holds it to CPython for
+every tag assignment of every arity. The record schema binds operators only, so no site record of a method call reaches it yet; it is the half of "feeds witnesses with no rework"
+that belongs to the contract.
+
+`tests/contracts/test_str_shapes.py` is the CPython three-way test (the outcome of the real method, the rule's `native`, and the table, on both sides of every parameter's
+boundary, plus a user hook raising each of the seven classes in every position that reaches one); `tests/test_absint_str_methods.py` runs 86 adversarial programs natively
+over every combination of a small set of draws (2**31 and 2**63 included) and holds absint to what they do.
+
 ## try/except/else/finally ([internal ref])
 
 `interp.py::Analyzer.s_Try` models a `try` statement exactly; what it does not model is a named refusal
@@ -1430,6 +2198,22 @@ proven TRUE.  The rules now:
   range/list/tuple/array can still be iterated in a try. Harness draws are static calls and refuse there;
   native scheduler replay still checks the vector. These refusals preserve UNKNOWN rather than ignore
   a handler which could raise a property exception.
+  Exact builtin tuple destructuring is admitted when every alternative has a recorded item list of
+  the target's arity: iteration has no callback and the arity check cannot raise `ValueError`.
+  Nested targets are checked at each level, and target assignments still run in order with their
+  own routed exceptions. Lists, strings, custom iterables and mismatched/unknown tuple arities retain
+  the refusal. Native controls in `tests/test_absint_try.py` cover normal/finally continuations,
+  nested arity failures and a subscript target failing after an earlier name assignment.
+  Native scalar float addition, subtraction and multiplication also pass this boundary when
+  `_float_conversion_is_total` proves any integer operand converts: IEEE overflow returns infinity,
+  and operations involving infinity/NaN return a float without a Python domain exception.
+  Possible integer conversion overflow and powers retain the refusal. Native controls include
+  nonfinite results, mixed bounded int/float operands and a failing overflow handler.
+  A `None` alternative alongside the numeric part is a routed `TypeError`; it does not add a
+  non-property exception. Guarded `math.sqrt` is admitted only for one exact native numeric operand
+  with total conversion and a nonnegative numeric domain (NaN itself remains a successful NaN result).
+  `tests/test_absint_float_guards.py` checks both guard branches, zero/NaN/infinity, optional floats,
+  target rebinding, effectful comparisons and a custom conversion hook against native execution.
 - **Contract wrappers preserve routed exceptions.** An unproven model check inside a try has already
   handed its original state to the handler. When the current contract wrapper vetoes that same class
   (`_proven_classes` returns `None`), `_contract_checks` does not duplicate it using a nonexistent
@@ -1488,34 +2272,54 @@ child); `tests/contracts/test_swallowing_engines.py` (`except_non_exception_clas
 
 ## Case splits on a boolean draw
 
+> **Corrected 2026-11-05 (T178, lane 1518; owner 1419: "it feels like cheating because it uses the competition function names to score
+> points ... the nondet bool one is bad"; 1420, 1426: keep the split, remove the name dependence).** The first implementations of this
+> section's mechanism were WRONG: an AI session (Claude Sonnet 5.5, `ab64360d`, 2026-10-16) split only the one call spelled
+> `_sv_verifier.nondet_bool`, gated the retry on the source text `nondet_bool`/`nondet_int` (`_splittable`, tokenised but still a
+> spelling in `b64fe40c`, Claude Opus 5.5, whose own reason was "bit-for-bit identical on the benchmark corpus"), enumerated an int only
+> when a direct `nondet_int` call sat in the assignment (`_int_outcomes`), and recognised the conditional-alias cover by an attribute
+> spelled `.nondet_bool()` (`_scalar_identity_cover`, `eabff14a`, opencode lane). Each keyed on a spelling instead of the value's
+> domain; the sweep measured 21 of 69 TRUEs lost when only the draw's spelling changed (`nondet_int() % 2 == 0`) and 7 of 21 for a
+> helper. What is true now: **a case split is decided from the value**, a `bool`-typed abstract value that may be either, derived
+> from an input; the API's own name appears only to recognise an input by its origin (`_sv_verifier.nondet_*` resolved through the import
+> graph) and to state its contract (`nondet_bool` returns False or True).
+
 The join at the end of an `if` (or the join of a returning call) keeps what both arms agree on and drops the
 correlation between a harness draw and what was computed from it. SV-COMP's `type-eval-py` tasks are built on exactly
 that correlation:
 
 ```python
-flag = _sv_verifier.nondet_bool()
+flag = _sv_verifier.nondet_bool()      # equally: _sv_verifier.nondet_int() % 2 == 0, not (...), a helper's return
 v = "s" if flag else 1
 if flag:  _sv_verifier.check_type(v, str)
 else:     _sv_verifier.check_type(v, int)
 ```
 
 Joined, `v` is `str | int` and `check_type` refuses ("check_type value has mixed or unsupported possible types").
-`_sv_verifier.nondet_bool()` takes exactly the values `False` and `True`, so an execution is one of two, and the
+A value that is a `bool` and may be either takes exactly two values, so an execution is one of two, and the
 analysis may run the rest of the program once per value and join only where the block ends.
 
-- **What is split** (`Analyzer._draw_to_split`, `_once_draws`, `_exec_split`): a statement of the program's own file
+- **What is split** (`Analyzer._draw_to_split`, `_once_choices`, `_is_bool_choice`, `_exec_split`): a statement of the program's own file
   that is an `Assign`/`AnnAssign` value, an `Expr` value or an `If` test, with a non-empty rest of its block, holding
-  exactly ONE `nondet_bool()` call that the statement evaluates at most once and in an unconditional position: call
+  exactly ONE call, comparison or `not` that derives from an input (`_has_input`: a call the import graph resolves to the verifier's
+  `nondet_*` family, or a call of a function the program defines, which may return a draw) AND whose abstract value, probed on a
+  copy of the state without recording (`_is_bool_choice`), is a `bool` that may be either; the statement evaluates it at most once
+  and in an unconditional position: call
   callee/arguments/keyword values, operator operands, the first comparator of a comparison, the first operand of
   `and`/`or`, the test of a conditional expression, the base and index of an attribute or subscript, the elements of
-  a display. The statement runs twice with that call forced to `False` / `True`, then `stmts[idx + 1:]` runs on each
+  a display. The statement runs twice with that expression's value forced to `False` / `True` (`eval` overrides the value of a bool-typed node,
+  `cond` empties the other branch), then `stmts[idx + 1:]` runs on each
   outcome, and the two end states are joined by `_exec_split` (the block's own end).
 - **What is not**: a draw in a `while`/`for` header, a comprehension, a lambda, a conditional arm or the tail of a
   short circuit; two or more eligible draws in one statement; a statement inside a loop body (`lctx`), a `try` (also
   of a caller: the draw's own refusal is routed there), an extern file or a pass that does not record; a `return`
-  value (no rest to keep apart). `nondet_int`/`str`/`float` draws are never split.
+  value (no rest to keep apart). Values that are not bool-typed are not forced; an int drawn small is enumerated instead
+  (`_int_outcomes`: an assignment whose right side derives from an input, `_has_input`, and whose value is an int with a small or
+  comparison-partitionable interval).
 - **The retry** (`absint.prove`): `split_draws=None` (the default) runs the joined analysis exactly as before and only
-  when it did not prove TRUE, and the source mentions `nondet_bool`, runs it once more with `split_draws=True` on at
+  when it did not prove TRUE, and the joined run EXECUTED a statement that evaluates an input or a program function, a list display bound
+  by an assignment or a starred rest (`Analyzer.split_hint`, read by `absint/__init__.py::prove`; it replaces the token test
+  `_splittable`), runs it once more with `split_draws=True` on at
   most `max(3 s, 8x)` of the joined run's CPU and never beyond the caller's `time_budget`. TRUE from the retry is
   returned (`AbsintResult.draw_splits` counts the splits; `explain()` says so); otherwise the JOINED run's result,
   reason and records are returned unchanged. A program the joined run proves is analysed exactly as before.
@@ -1557,47 +2361,198 @@ exceptions).
 
 - **Proven** only when EVERY alternative of `value` is an instance of `C` (a subclass instance included): the check holds.
 - **A possible mismatch of a scalar value** (`1`, `None`, ...) is an unproven `TypeError` check; a certain one ends the path as an
-  unproven check does everywhere. A possible mismatch of an object (a `repr` of a user class runs user code that may raise any
-  class, `KeyError` included) refuses by name, as the mismatch of a builtin container already did.
+  unproven check does everywhere. Object alternatives are checked separately: a matching instance never runs its `repr`, even
+  when another alternative mismatches. Mismatching objects use the existing `check_formattable` hook check. Exact builtin
+  containers are traversed through their represented elements with cycle detection; default object repr is also safe. A custom
+  instance formatting hook or unknown element refuses. The six original builtin hints use the same check on mismatching
+  list/dict alternatives, without inspecting a matching container's elements. There is no length or nesting cutoff.
+  Their mixed-success/container-mismatch values retain UNKNOWN; this admission
+  does not extend formatting proofs across an unrefined mixed normal state.
+  Newly admitted mismatch formatting inside a `try` remains UNKNOWN: formatting can fail before TypeError construction
+  (for example the integer string-digit limit), and those intermediate exception payloads are not modelled.
 - **Unchanged**: a hint that is not one class address (a union of classes is a case split of the program, a `typing` form, a builtin
   other than the supported ones) keeps its refusal.
+- **The exact container/exception hints beyond the six** (`m__sv_verifier_check_type`'s `("cbuiltin", "tuple"|"set")` and
+  `("exc", <name>)` branches): the runtime decision stays `isinstance(value, <class>)`. A `tuple` hint matches a `TupleObj`
+  exactly, a `set` hint matches a `SetObj` whose `frozen` is False (`frozenset` never), an exception hint matches an instance whose
+  class records exactly one builtin exception base (`s_ClassDef`'s `__exc_base__`: `_exc_base_of`'s chain) or a canonical
+  `ExceptionObj` whose own C-tree derives the hint. A mismatch formats `value!r` into the TypeError: a scalar repr runs no user
+  code, an object's repr may, so only a fully-matching value may carry objects, and every other shape refuses (`tests/
+  test_absint_builtin_class_hints.py`). The default set/`frozenset` distinction is by the `SetObj`'s own `frozen` flag; an
+  `Exception` hint's `("exc", name)` tag never forms under a `typing` form or an unknown builtin, so none of those came here.
 - Tests: `tests/test_absint_class_hints.py` runs 27 adversarial programs (`tests/fixtures/absint/class_hint/`) natively over every
   boolean draw vector; a metaclass with `__instancecheck__`, a `__class__` property, `a.__class__ = B`, a `__getattribute__` that
   answers `__class__`, a `repr` that raises, a rebound class name and a class object or function passed as the value are among them.
+
+## Recursive builtin check_type hints
+
+Inline verifier hints such as `list[list[int]]` and
+`dict[str, list[tuple[int, str]]]` use the shared
+`solve/check_type_hints.py::builtin_hint_shape` grammar. Absint also checks
+each name's current binding before constructing an inert hint description.
+Only direct verifier hint arguments receive this model; aliases that escape,
+typing forms, custom classes and unsupported syntax retain their refusals.
+
+The transfer requires exact builtin list, tuple, dict, set or frozenset heap
+objects throughout the value. It checks element summaries recursively, fixed
+tuple positions individually, mapping keys and values separately, and empty
+containers vacuously. Bool remains an int. `tuple[()]` follows the pinned
+runtime checker: its empty parameters cause success for any builtin tuple.
+Unknown values, subclasses and user callbacks refuse. An uncertain or failing
+check records an unproven TypeError and preserves the possible normal path;
+it never treats a summary element as proof that the container is nonempty.
+Checks inside try statements currently refuse.
+
+The plain builtin-exception hint model also refuses mismatch formatting of
+exception arguments: their repr can execute user code. Regression and
+differential tests are in `tests/test_absint_nested_hints.py` and
+`tests/test_absint_builtin_class_hints.py`.
+
+## type(x), class identity and scalar disequality
+
+- **`type(x)`** (`Analyzer.b_type`, the builtin tag `("builtin", "type")`): the class of each alternative of `x`, as the static class tag
+  (`("type", "int" | "bool" | "float" | "str" | "list" | "dict")`, `("cbuiltin", "tuple")`) or, for an instance of a class of the
+  program, that class's address. A union of alternatives is the union of their classes, so `bool` and `int` stay two classes
+  (`type(True) is int` is False). It refuses what it does not name: `None`, a function, a class object (its type may be a
+  metaclass), a set, an array, an iterator, a `defaultdict` (not an exact `dict`), an exception instance, an object carrying its own
+  `__class__` or whose class defines one, `type(name, bases, dict)` and any keyword; any other arity is the `TypeError` of CPython.
+- **Identity and equality of classes** (`Analyzer._class_identity`, used by `Is`/`IsNot` in `compare_split` and by `_decide_eq`): two
+  class values are the same object when both are one builtin tag, or one class address `(site, "r")`; different objects when their
+  tag sets and address sets are disjoint (a builtin class is no class of the program, and `(site, "r")` and `(site, "s")` are different
+  objects: the most recent and the older ones). Anything else is not decided. A class of the program has no metaclass here, so `==`
+  on classes is `is`.
+- **Scalar disequality** (`_decide_eq`): a `str`, a number (`int`/`bool`/`float`) and `None` are never equal to a value of another of the
+  three; `==`/`!=` on pure builtin scalars of different classes is decided. (`1 == 1.0 == True` stays undecided.)
+- **Scalar union hints**: `check_type(v, A | B | ...)` for any number (>= 2) of operands, each `int`/`bool`/`float`/`str` or `None`, in
+  any order (`_UNION_HINT_NAMES`; first `int | str` only, then any two names: both were decided by the hint's spelling, not by what
+  `isinstance(v, <union>)` means). `int` covers `bool`, every other name covers itself, `None` covers `None`; `None | None` is a
+  TypeError of the hint itself and is not admitted. An uncovered scalar (`None` included) is an unproven `TypeError` check (its repr
+  runs no user code), an object or a static value refuses. Tests: `tests/test_absint_union_hints.py`.
+- **Starred method calls** (`obj.f(*args)`, `mod.f(**kw)`): admitted when every argument is a name or a constant, bare or starred
+  (`interp.py::_effect_free_arguments`): Python looks the attribute up before it evaluates the arguments, and nothing such an argument does
+  can rebind what the attribute names. Any other argument (a call, an attribute, a subscript, a display) keeps the refusal "method call
+  with *args (attribute lookup order)". The starred value itself must still be one fixed-length list or tuple
+  (`call_positional_args`). Tests: `tests/test_absint_starred_method_calls.py`.
+- **What this needs from the rest**: `type(x) is type(y)` is decided when each side is one class, which the boolean case split provides
+  for a value drawn as `int` or `str`; a class made in a loop is refused where it is defined (`tests/test_absint_class_in_loop.py`).
+- Tests: `tests/test_absint_type_call.py` (39 adversarial programs, `tests/fixtures/absint/type_call/`, natively checked over every draw
+  vector): subclass versus base, bool versus int, metaclass, `__new__`, `__class__` property and reassignment, a shadowed `type`,
+  three-argument `type`, a class made in a loop, defaultdict, union coverage of bool/int/float/None/objects.
+
+## Positional string joins
+
+String joins of exact positional string snapshots retain their value as existing string concatenation recipes after the ordinary
+tested contract transfer. Empty and singleton sequences are included; mutable summaries and key-view order are not inferred.
+See `tests/test_absint_positional_string_join.py`.
+
+## List displays nothing observes as a list
+
+A list display keeps ONE joined element (`ListObj.elem`), so `a = [func1, func2, func3]; a[1]()` calls "any of the three" however exact
+the index is. A tuple display keeps one value per position (`TupleObj.items`). `frozen_list_displays` (interp.py) finds the list
+displays that may be built the second way, and only in the retry (`prove(split_draws=None)` re-runs the analysis with the case splits
+AND these displays; `split_draws=False` never does):
+
+- **Admitted**: a module-level name (or inside a module-level `if`) bound ONLY by `name = [d0, d1, ...]` statements (no star item), or as a starred-rest target, in
+  which every other occurrence, in every file the program reads, is `name[index]` read (not a slice, not a store, not `del`),
+  `len(name)` with the builtin `len` (`len` bound nowhere), the right side of an unpacking assignment (including a star),
+  or a literal builtin str receiver's `"separator".join(name)`. The starred rest is a fresh list. These reads preserve
+  the list's observable behavior; variable or custom join receivers remain ordinary call arguments.
+- **Starred rests**: exact source positions are retained only when the same escape audit admits the rest name and all successful source alternatives have the same known middle arity. Otherwise the ordinary list summary remains. The rest keeps native list IndexError payloads; a list-type observation withdraws positional storage. Tuple-only starred assignments also trigger the existing bounded retry. There is no size cap.
+- **Withdrawn for the name**: anything else, an alias, a call argument (`f(a)`, `f(*a)`, `list(a)`), an attribute (`.append`), a loop
+  or `in`, a comparison, a slice, a store, `del`, `+=`, a walrus or any other binding (parameter, def, class, import, `global`,
+  `except ... as`, `for`/`with` target), a binding anywhere but the module level, and ANY mention of the name in another file
+  (a sibling can mutate it through `from main import a`).
+- **Withdrawn for the whole program**: any channel to a module global that does not name it, in any file: `globals()`, `vars()`,
+  `locals()`, `__dict__`, `getattr`/`setattr`/`delattr`, `eval`/`exec`/`compile`, `__import__`/`importlib`, `sys.modules`, `__main__`,
+  `inspect`, `gc`, `builtins`, a star import, or a sibling that imports the program by its file name.
+- **Exception payloads retain the original list semantics**: out-of-range subscripts use the list contract even though the
+  positions use tuple storage, so a caught `IndexError.args` has the list message. Elements keep their own heap identity: an element that is
+  itself a list is the same `ListObj` the display built, so `x = a[0]; x.append(9)` is seen through `a[0]` (`fl21`-`fl24`).
+- `type(a)`, `isinstance(a, ...)`, `a == ...` and every other use are not reads, so they withdraw the name and the program keeps the
+  joined `ListObj`; the admitted reads cannot reach the tuple-ness.
+- Tests: `tests/test_absint_frozen_lists.py` (40 adversarial programs in `tests/fixtures/absint/frozen_list/`, natively checked over every
+  draw vector, an eligibility table of 37 sources, three multi-file programs with a sibling that mutates through `__main__`, star-imports over the
+  name and imports the program).
+
+## Case splits on a small int, and three exact-constant decisions
+
+- **A small int drawn by `nondet_int`** (`Analyzer._int_outcomes`, `_exec_int_split`; the retry only, like the boolean splits). After
+  a plain `name = <expression holding a nondet_int() call>` statement (outside a loop body, a try and an extern file, in a recording
+  pass, with a non-empty rest of its block), the analysis' OWN value of `name` is read: when it is an int and only an int, whose
+  interval holds 2 to `MAX_INT_SPLIT` (16) values (`abs(nondet_int()) % 3` is `[0, 2]`), the post-state is refined to `name == v` for
+  each `v` (`cond` on a synthesized comparison; an infeasible `v` is dropped) and the rest of the block runs once per outcome, joined
+  at the block end. The interval holds every value `name` can have, so the outcomes cover every execution: nothing about the
+  right-hand side is trusted, only the interval, and a wider one, an unbounded one, a float, a draw inside an index expression
+  (`xs[abs(nondet_int()) % 2]`), a tuple target or a statement in a loop stays joined. The budget is `MAX_DRAW_SPLITS`, shared with the
+  boolean splits: an outcome beyond the first costs one. As for booleans, candidate invariants are not taken while outcomes run apart.
+- **Membership in a tuple of the program** (`_tuple_membership`): `x in (1, -2)` is decided when `x` and every position are
+  constants (`_decide_eq`, so `True in (1, 2)` is True and an unequal class is False); otherwise undecided.
+- **Identity with the bool singletons** (`_bool_singleton_identity`): `x is True`/`x is False` is True when `x` is that constant and
+  False when `x` can never be it (no such bool among its alternatives; an int, a str, None, an object are never `True`).
+- **A strong store into a one-element list** (`store_elem`): `b[0] = v` / `b[-1] = v` on a RECENT list whose length is exactly 1 leaves
+  `v` as its only element; any other store (two elements, a summary, an unknown index) joins as before.
+- Tests: `tests/test_absint_int_split.py` (27 adversarial programs in `tests/fixtures/absint/int_split/`, run natively over every draw
+  vector with ints over `range(-3, 20)`): a wider modulus, a negative remainder, two and three draws, a draw in a loop, in a function, behind
+  a boolean, a float target, an index expression, the one-value IndexError and ZeroDivisionError, tuple membership across classes, a
+  one-element list stored through an alias, a callee, in a loop and after an append.
 
 ## Files and how they relate
 
 Measured from the committed source in this branch by `scripts/doc_import_map.py::compute_ast_imports`, including lazy imports.
 
-### Subsystem: `tharkun.solve.absint` (15 files)
+### Subsystem: `tharkun.solve.absint` (22 files)
+
+- `src/tharkun/solve/absint/tail_loops.py`
+  - **Role**: Proof-only direct tail loops for primitive calls with an explicit base return and no frame observation; unsupported bodies retain ordinary call interpretation.
+  - **Imports (tharkun.solve.absint)**: none
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`
+
 
 - `src/tharkun/solve/absint/__init__.py`
   - **Role**: Public package entry point: `prove()` running abstract interpretation and producing verdicts; `component_for` names `proof:shape` for TypeError/AttributeError properties and `proof:interval` otherwise.
   - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/state.py`
   - **Is imported by (tharkun.solve.absint)**: none
+- `src/tharkun/solve/absint/__main__.py`
   - **Role**: CLI entry point (`python -m tharkun.solve.absint`) with `--property` and `--explain`.
   - **Imports (tharkun.solve.absint)**: none
   - **Is imported by (tharkun.solve.absint)**: none
+- `src/tharkun/solve/absint/affine.py`
+  - **Role**: Private exact affine equality basis, with projection and affine-hull joins under the analyzer deadline; enabled by assertion demand alongside the DBM.
+  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/errors.py`, `src/tharkun/solve/absint/zone.py`
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/zone.py`
 - `src/tharkun/solve/absint/aval.py`
   - **Role**: Abstract value representation (`V`) combining intervals, float info, types, and zone references.
   - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/zone.py`
-  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/contracts.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/rand.py`, `src/tharkun/solve/absint/reducers.py`, `src/tharkun/solve/absint/sets.py`, `src/tharkun/solve/absint/state.py`, `src/tharkun/solve/absint/visitor.py`
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/contracts.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/map_identity.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/rand.py`, `src/tharkun/solve/absint/reducers.py`, `src/tharkun/solve/absint/sets.py`, `src/tharkun/solve/absint/state.py`, `src/tharkun/solve/absint/visitor.py`
 - `src/tharkun/solve/absint/contracts.py`
   - **Role**: Demanded scalar and list-shape class invariants, checked independently of call contexts.
   - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/state.py`
   - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`
+- `src/tharkun/solve/absint/equality.py`
+  - **Role**: Lazy typed value recipes, congruence closure and SMT-admitted string concatenation identities under the existing analysis deadline.
+  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/errors.py`
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/state.py`
+- `src/tharkun/solve/absint/exactfloat.py`
+  - **Role**: Exact dyadic float terms (`("xd", s, c, ((("iv", var), k), ...))`): a float known to be the real number `(c + sum k*x)/2**s` itself, representable in binary64; arithmetic on them, exact result intervals, and the `==` decision of two of them (V_TERMS, [internal ref]). Pure stdlib (`fractions`).
+  - **Imports (tharkun.solve.absint)**: none (stdlib only).
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`
 - `src/tharkun/solve/absint/errors.py`
   - **Role**: `Unsupported` exception definition indicating unmodelled Python constructs.
   - **Imports (tharkun.solve.absint)**: none
-  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/rand.py`, `src/tharkun/solve/absint/reducers.py`, `src/tharkun/solve/absint/sets.py`
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/affine.py`, `src/tharkun/solve/absint/equality.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/map_identity.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/rand.py`, `src/tharkun/solve/absint/reducers.py`, `src/tharkun/solve/absint/sets.py`, `src/tharkun/solve/absint/visitor.py`
+- `src/tharkun/solve/absint/generators.py`
+  - **Role**: Compile structured source generator bodies into immutable `ContinuationGraph` and `Instruction` continuation graphs, preserving yield, branch and loop control edges; unsupported suspension shapes raise `Refused`.
+  - **Imports (tharkun.solve.absint)**: none (stdlib `ast` and `dataclasses` only).
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`
+  - **Calls and callers (measured AST)**: `interp.py::Analyzer._resume_generator` has one `compile_program` call site, guarded by its per-function cache. `compile_program` invokes the supplied lexical-suspension callback; the caller supplies `interp.py::_is_generator` through a lambda. The compiler makes no direct call into another absint module.
 - `src/tharkun/solve/absint/heap.py`
-  - **Role**: Heap objects of the absint abstract state (`OutFileObj` [[internal ref]], `ListObj` with segmentation, `TupleObj`, `ArrayObj` subclassing `ListObj` with `typecode` [[internal ref]], `InstObj` with `qf`, `ClassObj`, `FuncObj` carrying `module_key` [[internal ref]], `BoundMethod`, `BuiltinMethod`, `RangeObj`, `SetObj`).
+  - **Role**: Heap objects of the absint abstract state (`OutFileObj` [[internal ref]], `ListObj` with segmentation, `TupleObj`, `ArrayObj` subclassing `ListObj` with `typecode` [[internal ref]], `InstObj` with `qf`, `ClassObj`, `GeneratorObj` and per-position `GeneratorFrame`, `FuncObj` carrying `module_key` [[internal ref]], `BoundMethod`, `BuiltinMethod`, `RangeObj`, `SetObj`).
   - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`
-  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/contracts.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/sets.py`, `src/tharkun/solve/absint/state.py`, `src/tharkun/solve/absint/visitor.py`
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/contracts.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/map_identity.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/rand.py`, `src/tharkun/solve/absint/sets.py`, `src/tharkun/solve/absint/state.py`, `src/tharkun/solve/absint/visitor.py`
 - `src/tharkun/solve/absint/interp.py`
   - **Role**: The absint interpreter (`Analyzer`) covering statements, expressions, calls, and loop machinery (`s_While` / `s_For`: first iteration, `_solve_fixpoint` with `_fixpoint` reuse, final pass, `fresh_pass`, `_visit_invariant`), builtin and list models, float terms, focus/blur, and site records.
-  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/contracts.py`, `src/tharkun/solve/absint/errors.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/lemmas.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/rand.py`, `src/tharkun/solve/absint/reducers.py`, `src/tharkun/solve/absint/sets.py`, `src/tharkun/solve/absint/state.py`, `src/tharkun/solve/absint/visitor.py`, `src/tharkun/solve/absint/zone.py`
-  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/__init__.py`, `src/tharkun/solve/absint/contracts.py`
+  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/contracts.py`, `src/tharkun/solve/absint/equality.py`, `src/tharkun/solve/absint/errors.py`, `src/tharkun/solve/absint/exactfloat.py`, `src/tharkun/solve/absint/generators.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/lemmas.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/map_identity.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/polynomial.py`, `src/tharkun/solve/absint/rand.py`, `src/tharkun/solve/absint/reducers.py`, `src/tharkun/solve/absint/sets.py`, `src/tharkun/solve/absint/state.py`, `src/tharkun/solve/absint/tail_loops.py`, `src/tharkun/solve/absint/visitor.py`, `src/tharkun/solve/absint/zone.py`
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/__init__.py`, `src/tharkun/solve/absint/contracts.py`, `src/tharkun/solve/absint/map_identity.py`, `src/tharkun/solve/absint/visitor.py`
 - `src/tharkun/solve/absint/lemmas.py`
   - **Role**: Named numeric lemmas (`TRIG_PAIR`, `NORMALIZE`) and widening landmarks for float/numeric domains.
   - **Imports (tharkun.solve.absint)**: none
@@ -1605,14 +2560,22 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
 - `src/tharkun/solve/absint/linear.py`
   - **Role**: Linear forms (`Lin`, `lin_bounds`, `IntInfo`) and symbolic integer bounds connected to zone DBMs.
   - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/zone.py`
-  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/rand.py`, `src/tharkun/solve/absint/state.py`, `src/tharkun/solve/absint/visitor.py`
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/polynomial.py`, `src/tharkun/solve/absint/rand.py`, `src/tharkun/solve/absint/state.py`, `src/tharkun/solve/absint/visitor.py`
+- `src/tharkun/solve/absint/map_identity.py`
+  - **Role**: Closed identity/scalar-callback map source and consumer proof, imported only when a map call is reached.
+  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/errors.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/interp.py`
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`
 - `src/tharkun/solve/absint/native.py`
   - **Role**: Finite builtin values for string/format/regex operations; never executes target objects.
-  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/state.py`
+  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/errors.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/state.py`
   - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/visitor.py`
+- `src/tharkun/solve/absint/polynomial.py`
+  - **Role**: Budgeted exact polynomial division returning only proved affine integer quotients.
+  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/linear.py`
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`
 - `src/tharkun/solve/absint/rand.py`
   - **Role**: `RandomMixin` implementing abstract transfer functions and argument binding for the `random` module.
-  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/errors.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/state.py`
+  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/errors.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/state.py`
   - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`
 - `src/tharkun/solve/absint/reducers.py`
   - **Role**: `ReducersMixin` implementing abstract transfer functions for iterable-reducing builtins (`min`, `max`, `sum`).
@@ -1624,16 +2587,17 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
   - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`
 - `src/tharkun/solve/absint/state.py`
   - **Role**: Abstract execution state (`State`, `Frame`) and lattice operations (`vjoin`, `vleq`, `vwiden`, `ojoin`, `oleq`); includes `State.strip_terms` and `State.equiv` for equality fixpoint reuse tests.
-  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/lemmas.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/zone.py`
+  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/equality.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/lemmas.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/zone.py`
   - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/__init__.py`, `src/tharkun/solve/absint/contracts.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/rand.py`, `src/tharkun/solve/absint/reducers.py`, `src/tharkun/solve/absint/sets.py`, `src/tharkun/solve/absint/visitor.py`
 - `src/tharkun/solve/absint/visitor.py`
   - **Role**: Contract-rule visitor (`AbsintVisitor`, `exact_int_value`, `hook_free_value`) translating tested contracts into abstract transfer operations; absent visits refuse.
-  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/state.py`
+  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/errors.py`, `src/tharkun/solve/absint/heap.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/native.py`, `src/tharkun/solve/absint/state.py`
   - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/sets.py`
 - `src/tharkun/solve/absint/zone.py`
   - **Role**: Difference-bound matrix (`Zone`, `ZERO`) domain tracking relational integer inequalities (`x - y <= c`).
-  - **Imports (tharkun.solve.absint)**: none
-  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/state.py`
+  - **Imports (tharkun.solve.absint)**: `src/tharkun/solve/absint/affine.py`
+  - **Is imported by (tharkun.solve.absint)**: `src/tharkun/solve/absint/affine.py`, `src/tharkun/solve/absint/aval.py`, `src/tharkun/solve/absint/interp.py`, `src/tharkun/solve/absint/linear.py`, `src/tharkun/solve/absint/state.py`
+
 
 ### External dependencies and consumers
 
@@ -1655,6 +2619,7 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
 
 - `tests/test_absint.py`: target tasks that must be proven (`tests/fixtures/absint/targets/`) and mutants that must never be TRUE (`tests/fixtures/absint/never_true/`).
 - `tests/test_absint_peel.py`: first-iteration loop peeling (`tests/fixtures/absint/peel/`).
+- `tests/test_absint_str_methods.py`: `str` methods with hook-free arguments; 86 adversarial programs (`tests/fixtures/absint/str_methods/`) natively checked over every combination of a small set of draws. `tests/contracts/test_str_shapes.py` and `tests/contracts/test_safety_str_templates.py`: the CPython three-way tests of the admitted shapes and of the TypeError template.
 - `tests/test_absint_fixpoint_reuse.py`: fixpoint cache invariance across loop solves.
 - `tests/test_absint_float_range.py`: `nondet_float_range` bounds domain and float branch pruning.
 - `tests/test_absint_reducers.py`: `min`, `max`, `sum` reductions over abstract containers.
@@ -1669,6 +2634,9 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
 - `tests/test_absint_dict_keys.py`: bounded integer key sets and constant dictionary lookups.
 - `tests/test_absint_lowering.py` and `tests/test_absint_lowering_fuzz.py`: comprehension lowering interface and soundness fuzzing.
 - `tests/test_absint_class_hints.py`: `check_type(value, C)` for a class of the program (`tests/fixtures/absint/class_hint/`), exhaustively checked against native runs.
+- `tests/test_absint_int_split.py`: enumerating a small drawn int, tuple membership, bool-singleton identity and the one-element strong store (`tests/fixtures/absint/int_split/`).
+- `tests/test_absint_frozen_lists.py`: list displays nothing observes as a list are built per position (`tests/fixtures/absint/frozen_list/`).
+- `tests/test_absint_type_call.py`: `type(x)`, class identity, scalar disequality and scalar union hints (`tests/fixtures/absint/type_call/`).
 - `tests/test_absint_class_in_loop.py`: a class statement that runs more than once is refused (an older instance read as an instance of the newer class).
 - `tests/test_absint_bound_method_loop.py`: a bound method of an older function of a re-run `def`/lambda keeps naming that function.
 - `tests/test_absint_draw_split.py`: case splits on a boolean draw (`tests/fixtures/absint/draw_split/`), exhaustively checked against native runs.
@@ -1766,6 +2734,10 @@ classes left unproven are recorded (a clean read adds no site; the model's own `
 that defines `__getattribute__` or `__getattr__` is refused where it is defined (`UNSUPPORTED_DUNDERS`), which is why no lookup hook can
 run. An untested or withdrawn contract is the named refusal `protocol.<name> has no tested contract`. The protocols the analyzer still
 refuses (`__contains__`, a custom `__bool__`, `__hash__`, the unary operators, `__int__`/`__index__`, `__enter__`/`__exit__`) are unchanged.
+The read of an attribute of a builtin scalar (`interp.py::Analyzer._attr_load_model`) is decided by the pinned exact-builtin attribute
+inventory `contracts/safety/rules_protocols.py::_INSTANCE_ATTRS`: a name the inventory lists is still refused (the bound method or
+data is not modelled), a name no scalar kind has is a real `AttributeError` check ([internal ref]), so `x = 5; x.foo` reaches the `attr`
+check instead of the refusal "attribute foo of a builtin scalar".
 `tests/contracts/test_absint_protocol_rules.py`.
 
 Each admitted operation uses the existing function transfer with its receiver
@@ -1847,3 +2819,1346 @@ failure does not alter the run classification. These samples are optional
 `__init__`, preserved by every method and satisfied by the current receiver.
 Falsified or malformed samples never justify a TRUE result. SOLVE remains static:
 the SV child owns observation, and the interpreter only checks proposed facts.
+
+**This check produces a claim, not a certified fact ([internal ref]).** docs/AVENGERS.md "Guessed invariants, proved facts"
+makes this check one *producer* of class invariants. Its contracts serve absint's own query transfers. Only the
+SV-COMP checker (`src/tharkun/sv/validate.py`) certifies a fact, and it never reads this verdict. Exactly what
+`src/tharkun/solve/absint/contracts.py::infer` accepts, guesses and requires:
+
+- **Shapes it refuses (no contract for the whole class):**
+  - any base class;
+  - any class attribute that is not one plain, undecorated function taking only the receiver. That excludes other
+    parameters, defaults, `*args`/`**kwargs` and keyword-only parameters;
+  - a class with no `__init__`;
+  - an `__init__` statement other than a docstring or `self.f = <literal>`, where the literal is an `int` or a list
+    of `int`s;
+  - a method body that `src/tharkun/solve/absint/contracts.py::_scalar_body` rejects. It rejects a call,
+    `global`/`nonlocal`, `del`, `yield`/`await`, a nested `def`/`class`/`lambda`, `with`, `try`, `import`, `is`, an
+    attribute other than `self.<candidate field>`, a non-local name, and a receiver that is used bare or rebound.
+- **Candidates:**
+  - the sign of the literal: `> 0` gives `f >= 1`, `== 0` gives `f >= 0`, `< 0` gives `f <= -1`;
+  - for a list literal, `int` elements and a length of at least `1` when it is non-empty;
+  - a `class_hints` sample `[lo, hi]` replaces a scalar candidate with a one-sided bound only: `f >= lo` when
+    `lo >= 0`, `f <= hi` when `hi < 0`, and no bound otherwise. The upper end of a non-negative range is never a
+    candidate.
+- **Obligations.** `__init__` runs from an empty receiver. Every other method runs from an arbitrary receiver that
+  satisfies the candidates; that is the receiver precondition. Each run must:
+  - end in a reachable (non-bottom) state;
+  - pass every exception check the transfer records, so a method that may raise drops the candidate;
+  - leave every candidate field definitely set and within its candidate;
+  - return a scalar: not a heap reference and not an opaque value (a pattern, an exception instance).
+
+  Any failure, `Unsupported` or `Incompatible` drops the whole contract.
+- **Use.** Only methods that mutate nothing become cached queries. Outside a `try`,
+  `src/tharkun/solve/absint/contracts.py::apply` rechecks the receiver precondition against the live abstract object at
+  every call, so outside writes and aliases are caught where the contract is used rather than assumed away.
+
+### Recipe field facts ([internal ref])
+
+`src/tharkun/solve/absint/interp.py::Analyzer.run` returns the final abstract state; existing proof callers may
+ignore it. Its optional `module_name` selects import semantics for the module's `__name__` guards.
+`::Analyzer.exact_constant` is the existing scalar equality singleton check, shared with
+`src/tharkun/avengers/flatobject.py::derived_fields` to export definite exact `InstObj` fields for a row's recipe.
+No expected policy values participate. The complete module and all constructor/setup statements must be
+supported; no facts escape an aborted analysis or bottom state. This reuses the instance heap, not the file-world
+`FactState` mechanism. Generalizing the world-object model to every object remains deferred.
+
+## Contracted operator callables ([internal ref])
+
+Module callable aliases reach `AbsintVisitor.visit_operator_function`; explicit
+visits take precedence over generic module fallback. The registry contract must
+remain tested. The visitor returns the ordinary intrinsic abstract result and
+records all seven contract raise classes, preserving every failed model check.
+Arithmetic, ordering, truth and indexing reuse existing transfers; item updates
+and in-place operations mutate the shared heap. Searches fold only finite
+builtin values accepted by `absint.native.concrete`, which excludes target
+objects and iterator cursors. Large/non-finite unsupported cases remain named
+refusals. Matrix methods reuse normal reflected/in-place dispatch; list
+repetition in place preserves aliases through the shared repetition shape.
+
+Getter/caller factories have a non-null callable abstract result. Invoking that
+opaque result still refuses explicitly; it never becomes a successful call or
+a false TypeError. See `tests/test_absint_operator_contracts.py` for programs
+that use each result, seven-class checks, stale-alias adversaries and contract
+withdrawal. Scalar facts can be intervals rather than exact point values.
+
+## Declared builtin return transfers ([internal ref])
+
+The bool class keeps its type tag and routes calls through its tested Rule;
+zero arguments produce False, otherwise the existing truth transfer produces a
+bool fact. Callable reads only the abstract type call slot, including a present
+but non-callable __call__ attribute, as CPython does; instance-only __call__
+attributes do not create a slot. It never invokes the target or its attributes.
+
+Bin/hex/oct require modeled builtin int/bool arguments. Finite small values fold
+through the Rule's native callable; other integers produce ANYSTR. Finite fold
+size is bounded, and no user conversion hook runs in the host. Unsupported
+__index__ cases refuse explicitly. The seven contract raises remain authoritative
+and model checks can only prove them for validated arguments. See
+`tests/test_absint_builtin_contracts_missing.py`.
+
+## HTML utility transfers ([internal ref])
+
+Both html Rule visitors validate positional/keyword binding and accept builtin
+str inputs with bool quote flags. Finite text up to 640 characters folds through
+Rule.native; long/nonfinite text yields ANYSTR. The bound avoids host integer
+digit-limit dependence. No target hook runs or mutates caller state on this path.
+Invalid binding records TypeError; other operand kinds refuse. Seven call-qualified
+checks, exact/type result use, aliases, withdrawal, open-hook refusals and reachable
+failures are pinned by tests/test_absint_html_contracts.py.
+
+## Builtin pow consumption ([internal ref], batch 7)
+
+Pow now reads its tested Rule through an explicit absint visitor. Argument
+binding supports base/exp/mod keywords and None modulus. Two-argument powers
+reuse the existing binary power transfer, including analyzed source hooks and
+exception checks. Three-argument builtin int/bool operands return an integer
+fact; zero modulus or a possibly noninvertible negative exponent retains an
+explicit ValueError check. User hooks in that form remain a named refusal.
+
+The old numeric-only native ReturnSpec was too narrow: power hooks can return
+arbitrary objects, including in Python 3.14 reflected modular dispatch. It now
+says object, with builtin-number results qualified in its shape; native tests
+pin direct/reflected two/three-argument returns. The frozen pow row is regenerated
+(C consumption plus the reviewed semantic/source digest change). Focused tests
+use actual return facts, preserve reachable assertions, withdraw the contract,
+and check TypeError/ZeroDivisionError/ValueError and callback boundaries on 3.14.4.
+
+## Subclass contract consumption ([internal ref], batch 8)
+
+Issubclass uses its tested Rule and supplies boolean facts for modeled builtin
+classes, user class inheritance and fixed nested classinfo tuples. It reuses
+_classinfo validation and the existing subclass walk. Joined class values are
+separate alternatives; ambiguous tuple members refuse before flattening, and
+mixed class/scalar inputs refuse before losing the invalid scalar path. Custom
+metaclass/subclass checks and fake class metadata remain unmodeled. All seven
+contract checks remain visible, and withdrawing the contract withdraws the model.
+
+The shared classinfo helper also accepts builtin dict; its paired isinstance
+receiver-kind test now recognizes dicts. Fixed native-backed tests cover all
+64 builtin class pairs, user inheritance, nested/empty tuples, dict instance
+checks, joined inputs, callback and TypeError boundaries, and reachable failures.
+The existing contract semantics/digest stay unchanged; its audit row is generated
+by the normal frozen writer on CPython 3.14.4.
+
+The nested-classinfo guard lives in _classinfo itself and also fixes an existing
+isinstance false proof: T=int-or-str; isinstance(1,(T,)) cannot always be True.
+The fixed native witness chooses str; lane1455 before/after evidence records
+that clean main 4af2f810 proved it and both corrected lines leave it unproven.
+
+## Dictionary constructor consumption ([internal ref], batch 9)
+
+The existing dict Rule now creates a real DictObj through an explicit visitor.
+Empty/keyword initialization, builtin dictionary/defaultdict copies, fixed tuple
+pairs and builtin lists of tuple pairs are modeled. Tuple order is retained;
+list summaries keep only universally present keys and conservative value facts.
+Keyword writes reuse the existing dictionary store transfer. Values retain their
+original heap references, preserving shallow aliases while the new dictionary
+has separate storage. Captured fields are borrowed before allocating, using the
+existing demotion guard. User mapping/iteration/hash/equality hooks and joined
+sources refuse. No target operand is passed to a native host constructor.
+
+Focused tests consume dictionary results and check contents, overrides, shared
+list mutation, separate storage, nonfinite values, callback/arity/error boundaries,
+withdrawal and reachable failures. The existing contract digest is unchanged;
+the standard frozen writer changes its absint audit row from refusal to consumption.
+
+## Textwrap utility transfers ([internal ref], batch 10)
+
+Explicit Rule visits serve wrap/fill/shorten/dedent/indent. They bind the canonical
+stdlib function via the existing resolve_native helper. Finite primitive operands
+reuse native.concrete/product/abstract under the shared analysis deadline, with text/numeric
+inputs up to 640. Native property errors and ValueError/OverflowError are recorded;
+only successful alternatives contribute results. No target hook runs in the host.
+
+For nonfinite strings, default wrapping/filling/shortening with builtin integer
+width retains list[str]/str facts; possible invalid widths/placeholders keep
+ValueError checks. Dedent accepts str and indent accepts str prefix with no predicate.
+Custom nonfinite options and callbacks refuse. Finite wrap results retain list
+length and element facts, while line order uses the existing list summary.
+See test_absint_textwrap_contracts.py for result uses, errors, joins and withdrawal.
+
+## Configured TextWrapper instances ([internal ref], batch 11)
+
+TextWrapperObj stores the twelve constructor settings as abstract values. The
+canonical constructor binds the real signature and stores values without invoking
+or converting them. Heap join/order/value rewrites and GC retain settings and their
+references. Field stores use strong/weak updates; bound methods use BuiltinMethod
+so aliases see later mutations and keep the receiver alive after a frame returns.
+
+Wrap/fill validate their own method call shape and tested contract, then reuse the
+utility transfer with the current receiver settings. Only canonical instances and
+known settings are modeled; private overrides, arbitrary attribute mutation and
+unsupported callback/configuration forms refuse. Class/type facts are available
+through isinstance/issubclass. Exact static class identity and attribute-expression
+None identity retain the existing domain's precision limits; binding a field first
+preserves its None fact. Tests verify class/result facts, settings, aliases, deferred
+validation, joins, loops, lifetime and cross-kind refusal boundaries.
+
+## Integer bit queries ([internal ref])
+
+`contracts/rules_int.py::IntBitLength` and `IntBitCount` describe the callback-free
+CPython descriptors, including TypeError conditions and native argument tuples.
+`visitor.py::AbsintVisitor._scalar_query` consumes their tested contracts before
+returning any fact: finite integers/bools use native results; other integers use
+nonnegative intervals, bounded above by the largest absolute endpoint's bit length
+when both endpoints are finite. Bit length is monotone in absolute magnitude;
+population count is only bounded, never assumed monotone. Negative integers use
+absolute values, not a fixed-width two's-complement representation.
+`interp.py::Analyzer.call_method`, `_attr_load_model`, `_call1` and `static_attr`
+serve direct, bound and unbound forms (including inherited bool methods). Bound
+methods snapshot receiver bounds. Unknown receivers and calls inside exception
+handlers remain refused; the transfer executes no target callbacks.
+
+## Partition tuple results ([internal ref])
+
+`visitor.py::AbsintVisitor._abstract_string` returns a fixed three-element tuple
+of strings for `str.partition` and `str.rpartition`, even when receiver or
+separator is not finite. `adapters/str_shapes.py::SIGNATURES` admits only a
+positional builtin string separator; that call runs no user hooks. Empty
+separators may still raise `ValueError('empty separator')`; calls inside a try
+remain refused by `interp.py::Analyzer.visit_rule`, so no handler is dropped.
+Finite operands keep the existing exact native tuple. Unknown components stay
+unknown strings: the transfer never assumes that the separator was found.
+
+## Integer identity and ratio queries ([internal ref])
+
+`contracts/rules_int.py::IntConjugate`, `IntIsInteger` and `IntAsIntegerRatio`
+use the same tested, callback-free descriptor contract and dispatch as the bit
+queries. `visitor.py::AbsintVisitor._scalar_query` retains the receiver's
+integer value for conjugation, returns True for is_integer, and constructs the
+exact two-slot tuple `(value, 1)` for as_integer_ratio. This works for unknown
+integers and preserves the denominator as exactly one. `interp.py::Analyzer._as_int`
+normalizes bool values to integers: neither conjugate nor a ratio numerator
+returns a bool. These are integer rules; float/complex methods keep their own
+semantics and are not admitted by the integer transfer.
+
+### Exception argument transfers ([internal ref])
+
+`ExceptionConstructor` rules have an explicit absint visitor. Canonical builtin
+instances retain the exact positional tuple in `ExceptionObj`; source exception
+subclasses retain separate `InstObj.exc_args` descriptor storage before their own
+`__init__` runs. Both participate in heap reachability, scalar freezing, recency
+rewrites, joins and ordering. `.args` reads, `type(e)` and class-name observations
+can therefore consume contract facts rather than opaque exception tags. The
+constructor's keyword `TypeError` uses its tested `ConstantArgsRaiseClaim` to route
+the exact payload to a handler. Legacy class-only checks retain opaque values.
+
+Raising an instance, raising a class with no arguments, catching it, propagating
+it through calls and a bare re-raise preserve the same modeled payload. Literal
+`raise ... from None` is accepted for class-and-args observations. Cause, context,
+traceback and suppression inspection remain refused, as do other explicit causes,
+exception formatting, `.args` assignment and custom `.args` descriptor shadows.
+No native target constructor or argument hook executes during analysis. A raise
+transfer is an abstract fact; it is not a synthesized inversion proof or replay.
+
+Primitive int/bool/float division, floor division and modulo consume typed
+`NumericDivision` rules, including reflected float dispatch for an int left
+operand and float right operand. Their visitor reuses existing interval transfers
+and bounded canonical native slot evaluation for finite primitive sets. A possible
+zero divisor routes a heap exception with its tested constant args; a definite
+zero has no successful continuation. Ordinary operator sites retain the divisor
+residual and operand binding for fact consumers. Non-property overflow in a try
+remains a named refusal where it is not ruled out, particularly huge/unbounded
+int-to-float conversion. Outside a try, the typed float division transfer
+intersects each integer operand with the binary64 conversion range before
+computing normal results. The largest convertible integer is
+`2**1024 - 2**970 - 1`; the next midpoint rounds to infinity and raises
+`OverflowError` before any zero-divisor check. An empty intersection ends the
+path; a partial intersection retains every successful conversion without
+assuming that the original integer was bounded. This removes raytrace's first
+refusal at its unbounded canvas dimensions. With the tuple and primitive-float
+changes above, the original nondeterministic task reaches the remaining
+recursion refusal at line326; no new whole-task verdict is claimed. `tests/test_absint_numeric_division_contracts.py`
+checks both signs of the conversion boundary, normal continuations, all three
+division operators and the retained handler refusals against CPython 3.14.4.
+Unsupported descriptor receivers, direct NotImplemented
+results, joined numeric kinds and bound scalar-slot reads can still refuse.
+
+At operator sites, the typed division visitor records its ZeroDivisionError
+obligation once at the existing `divide` site. Direct native-slot calls record
+that one obligation as `<qualname>:ZeroDivisionError`, preserving the seven
+named contract checks. Contract checks can identify an obligation already recorded
+or routed by the model, avoiding a second may-raise row for the same operation.
+Direct native-slot calls retain their typed contract qualname through exception
+routing. Operator sites retain their original binary-protocol source identity so
+witness consumers check the same binding and scope as the source operation.
+
+## Float identity and ratio queries ([internal ref])
+
+`contracts/rules_float.py::FloatConjugate`, `FloatIsInteger` and
+`FloatAsIntegerRatio` join the shared
+`visitor.py::AbsintVisitor._scalar_query` consumer. Only definite native float
+receivers are admitted; int/bool receivers do not acquire float descriptor
+semantics. Conjugate retains the float fact; finite integrality/ratio queries
+use native results. Nonfinite float sets retain boolean integrality results
+and two-int ratio shapes with a positive denominator on successful paths.
+NaN and infinities have no successful ratio path; their exact ValueError and
+OverflowError args are documented and tested. Calls under a try stay refused
+until those handlers can be modeled, so no exceptional continuation disappears.
+Bound methods snapshot receiver facts without a mutable variable's value term.
+
+## String alignment arguments and eager fold limits ([internal ref])
+
+`adapters/str_shapes.py::SIGNATURES` admits center/ljust/rjust with builtin int
+or bool widths and optional one-character builtin str fills.
+`visitor.py::_str_kind_ok` checks the fill length; an unknown string fill
+retains TypeError uncertainty. Thus `_abstract_string` can return a real str
+fact for unknown receivers and widths without calling any index hooks.
+The existing native finite-string path preserves exact values.
+The existing `rules_strformat.py::native_limit` continues to bound padding/tab
+width magnitudes to 4096 for eager native folds, including zfill/expandtabs.
+Larger finite widths are refused; unknown widths use abstract transfers without
+allocating strings. Exception handlers and custom index hooks retain their
+existing conservative refusal.
+
+The same one-character kind is consumed by
+`preimage/visitor.py::_kind_ok` before native forward checks.
+`contracts/safety/rules_str.py::str_method_cases` retains its exact scalar-tag
+partitions and adds a `len(fill) != 1` TypeError predicate within the string-fill
+case, so exception certificates do not confuse an empty/long string with a valid
+fill. These consumers share the shape table instead of independent signatures.
+
+## Range search queries ([internal ref])
+
+`rules_range.py::RangeCount` and `RangeIndex` distinguish the native exact
+int/bool arithmetic fast path from general comparison search, which may run
+arbitrary equality callbacks. `visitor.py::AbsintVisitor._range_query` admits
+only the arithmetic path and consumes the tested contract before returning
+any result. Exact endpoints and finite needles use CPython's constant-time
+search, including negative steps and ranges whose lengths exceed sys.maxsize.
+Other integer facts return count in [0,1] or a nonnegative index on successful
+paths. `state.py::iv_of_len` handles symbolic and frozen range endpoints.
+Missing index ValueError terminates an uncaught path; try calls remain refused.
+Direct, bound and unbound forms retain the immutable RangeObj receiver.
+General equality needles are not run natively: their count may exceed one
+and their exceptions (class and args) can propagate unchanged.
+
+### int literal raise transfers ([internal ref])
+
+The existing `Int` Rule supplies a tested lexical predicate and scoped non-property
+raise templates. Absint consumes these for finite exact string values with a
+primitive int/bool base, including keyword `base` and resolved callable aliases.
+Canonical builtin parsing yields actual integer results. An invalid base/syntax
+routes `ValueError` with the contract-formatted one-string args tuple; both
+successful alternatives and handler continuations survive. Diagnostic and grammar
+disagreement with the tested native behavior refuses analysis.
+
+Only finite strings retained by the scalar domain, up to 640 codepoints and within
+the existing Cartesian-product budget, are accepted by this transfer. This bound
+cannot exceed an enabled conversion limit. The existing AST constant reader
+coarsens string literals longer than 64 characters, so such literals can still
+refuse before this transfer; native contract tests nevertheless pin their complete
+truncated diagnostics. Unknown strings, open base coercions and process-sensitive
+long conversions remain named refusals in handlers. Ordinary integer conversions
+retain their existing transfer. The `int` contract now declares its process digit-
+limit effect, making generic Avengers stdlib admission conservatively refuse it.
+
+### Dictionary KeyError arguments ([internal ref])
+
+Native dict misses and factory-None defaultdict misses now consume their tested
+original-key argument relations and route KeyError with a GC-visible `(key,)`
+payload. Existing hash/equality refusals stay in force for open keys; callback
+errors are never relabeled as native missing-key errors. Source obligation kinds
+and bindings retain their existing identities.
+
+`collections.defaultdict.__missing__` has its own Rule and visitor for direct,
+bound and explicit unbound native calls. The supported native None/list factory
+states reuse the existing dictionary/list transfers. None stores the uninspected
+key in KeyError args, including unhashable key aliases. The native list factory
+returns a present value or inserts a fresh list for an absent scalar key, matching
+3.14.4 setdefault behavior. Arbitrary factories, unsupported key protocols and
+joined bound receivers remain named refusals. Native tests pin factory-before-hash
+ordering and callback payloads separately. No target callback runs in the model.
+
+### Native sequence bounds exception transfers (1455)
+
+List/tuple indexed reads preserve the existing `index` source obligation and
+consume the contract's native bounds/oversized-int payloads for caught
+IndexError. An integer interval spanning both scopes carries both strings;
+it cannot establish one exact message. Definitely out-of-range indexed reads
+have no normal successor. String reads reuse finite native evaluation and
+the existing unknown-string model, now routing primitive-int IndexError
+with those contract payloads rather than an opaque exception. No target
+`__index__` is executed. Slices, custom index hooks and direct list/tuple
+method-call support retain their existing limits. Raise-site metadata alone
+is not synthesized inversion proof.
+
+### string.capwords (1455)
+
+A native string helper visit validates binding and exact builtin operand kinds,
+evaluates bounded finite alternatives, and retains str for coarse text. It
+consumes the tested return contract, all seven property claims and the scoped
+empty-separator ValueError payload. Primitive str-or-None shapes route caught
+ValueError with literal args. Callback-bearing operands remain named refusals;
+the analyzer never invokes their split, truth, iteration or join hooks.
+
+### Heapq return/effect transfers (1455)
+
+The seven added native siblings and existing heapify/heappush/heappop share
+a visitor over an exact native list receiver with primitive comparable
+numeric or str elements. It consumes the tested return contract and all
+seven raise claims, returns None or the element abstraction, and applies
+length/content mutation through existing collapse/update_obj/set_len helpers.
+Pushpop on an empty heap returns the new item without inserting it. Native
+empty pop/replace routes a GC-visible IndexError with contract args; its
+normal successor is bottom. New siblings refuse open comparisons and mixed incomparable kinds; the original
+three APIs retain their established conservative generic transfer outside the
+primitive shape. Scalar element/item snapshots precede length updates, and heap
+order itself is not assumed or proved. Partial mutation through a target
+comparison exception is outside the admitted primitive transfer.
+
+### Statistics primitive queries (1455)
+
+Seventeen query functions consume their return contracts in a shared visitor
+over bounded finite primitive data/configuration. Existing native concrete/
+product/abstract helpers retain actual scalar or list results and all seven
+property checks. Dataset length is at most8, alternative products at most64,
+ints at most4096bits, text at most640codepoints, quantile output count at
+most64. Finiteness failures, hooks, nonfinite floats and native exceptional
+cases are named refusals. Unknown-list correlations can lose positional
+precision; exact tuples retain it. Qualified StatisticsError and handler
+transfers are deliberately unsupported until the exception class has its own
+consumer, and are never mislabeled as builtin ValueError.
+
+## Native divmod conditions and transfers (1455 batch21)
+
+The existing Rule now distinguishes native payload scopes from arbitrary
+__divmod__/__rdivmod__ hooks. With builtin int/bool/float operands after
+successful conversion, ZeroDivisionError occurs exactly for a zero divisor,
+including signed float zero, with args `('division by zero',)` on CPython
+3.14.4. A huge int converted for a mixed float call can instead raise
+OverflowError before that zero check. Native unsupported builtin type pairs
+and positional-only binding failures have separately tested TypeError args;
+these scopes never relabel callback-raised errors or their arbitrary args.
+
+Native ints/bools produce an int pair; a float operand produces a float pair.
+Open hooks can return any object, so the unscoped return type remains object
+and effects declare callbacks. Bounded primitive alternatives retain exact
+native results. The abstract interpreter also supports unbounded integer
+results, including the contract-derived `0 <= r < divisor` relation for a
+positive divisor. Aliased builtin calls and bool operands use this same
+transfer; shadowed user functions keep normal source analysis. Exact native
+error payloads are GC-visible and each error has one named call obligation.
+
+Sources: [Python3.14 divmod](https://docs.python.org/3.14/library/functions.html#divmod)
+and [CPython3.14 numeric dispatch](https://github.com/python/cpython/blob/3.14/Objects/abstract.c),
+with integer/float slots in longobject.c and floatobject.c on that branch.
+Native tests and proof controls run exclusively on CPython3.14.4.
+
+The stationary draw planner's value-sensitive refusal remains: divmod is not
+a class-only call. Its W41 never-TRUE mutant must stay unproven. Contract
+raise metadata is not a synthesized proof; whole-program recursion and RNG
+state can remain later blockers in bm_go_nondet.
+
+The opaque exact-byte hint used by program buffers is discarded when joined with
+an unknown or different alternative (`state.py::vjoin`); subsumption also keeps
+that hint distinct from unqualified top (`state.py::vleq`). It cannot establish an
+exact byte value after control-flow merging. Other byte consumers still refuse
+unless explicitly modelled.
+## random.seed native scopes and abstract transfer (1455 batch22)
+
+The existing seed contract now declares version comparison/truth and seed
+subclass encode/decode/iteration/hash callbacks. Their exception classes and
+args propagate unchanged. Native unsupported seed types, non-version-2
+bytearray hashing and selected positional binding failures have independently
+tested TypeError args. Version is compared to1/2 rather than restricted to
+int; 2.0 takes the version-2 path. Surrogate text can raise UnicodeEncodeError.
+
+The general effect remains conservative: None/default uses entropy/time,
+text can lazily import SHA-512 or use process-salted hashing, and open hooks
+can execute user code. Exact explicit builtin int/bool/float seeds only reset
+the generator state and cached Gaussian value. No unconditional purity or
+recipe admission is inferred.
+
+Absint validates closed scalar versions and supported primitive seed parts,
+consumes the tested None return contract, and routes unsupported list/tuple/
+dict seed errors with contract-derived args. Open versions/subclasses, bytes
+outside the current value domain and surrogate encoding are named refusals.
+Coarse text inside a try is refused because encoding errors are not routed.
+Native unsupported-type handlers have no normal successor. A withdrawn
+contract, return proof or payload relation must withdraw its corresponding
+precision. Symexec consumes the same return contract as described below.
+
+Native evidence uses CPython3.14.4:130 new boundaries plus90 existing random
+native checks. Focused absint21 and154 existing contract/absint checks pass,
+including the existing negative controls; none was weakened.
+Sources: [Python3.14 random.seed](https://docs.python.org/3.14/library/random.html#random.seed)
+and [CPython3.14 Random.seed](https://github.com/python/cpython/blob/3.14/Lib/random.py),
+[CPython3.14 native seed](https://github.com/python/cpython/blob/3.14/Modules/_randommodule.c).
+
+The symexec seed visitor now consumes the tested None return after checking
+native module/function identity, valid binding, closed scalar version and an
+explicit builtin or symbolic numeric seed. It leaves the user class heap
+intact: later modelled RNG reads already cover every generator state. It
+never executes the target's seed or changes the analyzer process's RNG.
+Default/None entropy, shadowed or replaced functions, open seed/version
+hooks, invalid binding and encoding gaps retain named refusals. Function and
+module aliases use the same identity gate. Native replay proves the class
+and instance fields remain readable and a real assertion witness survives.
+Focused symexec23 + existing module57 and class67 checks pass on CPython3.14.4.
+
+### Array numeric storage soundness (1455 batch23)
+
+Numeric joins preserve every int/bool/float alternative before conversion to
+an array's floating storage. Binary32 storage rounds both interval endpoints
+and drops unrounded symbolic terms. The stdlib pack/unpack conversion uses
+the same rounding; its overflow becomes infinity, matching native array
+storage at the rounding threshold rather than at the largest finite value.
+Known integer-to-float overflow and open instance conversion protocols are
+named refusals. Construction, append, extend and indexed stores share this
+one conversion path.
+
+Native CPython3.14.4 counterexamples cover three previous wrong TRUEs: a
+mixed int/float initializer lost the int alternative, float32 intervals kept
+unrounded bounds, and near-overflow values were prematurely set to infinity.
+The new36 storage checks and existing28 array tests pass; positive controls
+retain float types, finite ranges, point rounding, underflow and saturation.
+Constructor contract integration follows this shared conversion fix.
+
+## Array constructor contract checkpoint (1455 batch23)
+
+The constructor Rule now goes through the existing abstract array storage
+transfer and requires a tested return contract. Its scoped native TypeError
+args distinguish binding, Unicode codepoint type/length, and noniterable
+initializer cases. OtherRaiseClaim records bad-typecode, byte alignment,
+byte-range boundary and integer-to-float overflow args. Native payload scopes
+exclude audit/warning intervention; arbitrary iteration, conversion, warning
+and array.__new__ audit callback exceptions keep their original class+args.
+The general contract declares process warning/audit dependence and callbacks,
+so recipe admission remains conservative.
+
+The abstract numeric/list/tuple/array subset excludes Unicode, bytes, native
+long and open conversion protocols. The program cannot install process
+hooks through an accepted call; such calls remain unsupported. A known
+invalid one-codepoint typecode routes ValueError with the tested contract's
+literal args. Withdrawing that relation removes handler precision. Other
+constructor errors inside a try remain named refusals. Ordinary import and
+function aliases work; rebinding the import alias retains the existing
+origin refusal. Array tobytes and symexec construction remain future work.
+
+Main CPython3.14.4: native114 + focused constructor16 pass; standard tooling
+regenerated array.array.json. Shared storage36 and existing28 pass on both
+lines. This is an incomplete checkpoint: the SV contract port and expanded
+importing-file gates remain before readiness. Manager priority is to finish
+parity against the landed1470 world port first; no batch23 READY is claimed.
+Sources: [Python3.14 array](https://docs.python.org/3.14/library/array.html#array.array)
+and [CPython3.14 array implementation](https://github.com/python/cpython/blob/3.14/Modules/arraymodule.c).
+
+
+## Uninterrupted builtin-string dictionary write/read-back
+
+`Analyzer._dict_straightline_write` proves a local source relation using existing
+AST parent links and module bindings. After `d[k] = value`, an immediately
+following membership check or simple read of that same dictionary/key binding
+observes the write. Only `pass` and matching message-free positive membership
+assertions may intervene. No identity is inferred between two `ANY_STR` values.
+
+Admission requires one recent exact builtin `DictObj`, a builtin-string key,
+callback-free existing keys, and a stable named scalar/source-function value.
+The analyzer must be interpreting the unsliced, unlowered module source. Calls,
+mutation, rebinding, different key names, nested blocks, effectful current-read
+operands, opaque keys and broader values refuse the relation. Missing-key paths
+before the write retain their own checks. The stored function's whole body and
+its property goals still run through the ordinary interpreter.
+
+The helper is consumed only by `dict_load` and the dictionary-membership branch
+of `compare_split`. It adds no heap/state/abstract-value field, schema, census
+shortcut or new goal class. Mapping-display/unpack and structured-callback
+functions remain independent and unchanged. Native controls and focused
+regressions are in `tests/test_absint_dict_readback.py`.
+
+## Immediate scalar identity covers
+
+An immediate module-level assignment such as
+`c = identity(n) if sv.nondet_bool() else identity(s)` preserves the native
+object passed through either plain source function. `_scalar_identity_cover`
+proves a following `assert c is n or c is s` from that source flow; it never
+infers identity from equal integer intervals or arbitrary-string summaries.
+
+Admission requires unsliced, unlowered source, bound builtin scalar names and
+an immediate single-name assignment. Each arm is a source name or one plain
+source function with exactly one positional argument and the sole statement
+`return parameter`. The current function object, module origin and binding
+must authenticate; defaults, annotations, decorators, classes and broader
+bodies refuse. The selector is a bound builtin boolean or an authenticated
+zero-argument verifier boolean draw. The assignment cannot rebind a source,
+callee or selector name. No statement may intervene before the assertion.
+
+Only `cond`'s admitted module-assertion `or` case consumes the theorem.
+Earlier execution and every earlier/later property goal remain in the ordinary
+interpreter. No identity facts persist in abstract values, heap or state.
+Nested blocks, effectful operands, independent draws, stale bindings, floats
+and unsupported source shapes retain the existing refusal behavior. See
+`tests/test_absint_scalar_identity.py` for the boundaries.
+
+## Closed builtin dictionary removal
+
+`dict.pop(key[, default])` consumes the current tested return and raise claims
+for one recent, exact builtin dictionary and one constant int/bool/str/None key.
+All receiver keys must be builtin non-float scalars. A successful lookup removes
+the key from the current heap object and returns its original value; returned
+references remain aliases, including references back to the receiver. Existing
+loads, membership, length and live views read that updated heap. Branch joins
+retain only keys present on every path. No persistent key fact is added.
+
+Arguments still execute in Python order before lookup. A missing key returns
+the explicit default, or records `KeyError` and ends that path when no default
+was supplied. The optional default must be primitive and non-float because an
+unused temporary object can run cleanup. Open or summary dictionaries, unknown
+keys, subclass protocols, float results and calls under exception handlers stay
+refused. The empty-dict native shortcut that skips even unhashable-key hashing
+is deliberately outside this scalar-key consumer.
+
+The direct assignment `undefined_parameters = kvs.pop(catch_all_field.name)`
+from dataclasses-json is covered with a closed mapping-valued entry, mutation
+through the returned alias, key removal and native negative controls. This is
+statement consumer evidence, not a proof of the enclosing function or an
+inversion or portfolio gain. Reference `is` comparison remains conservative;
+alias effects are checked without extending comparison semantics.
+
+## Joining a closed string-key view
+
+`str.join` also consumes one builtin `dict.keys()` view whose live source is
+one exact builtin dictionary containing only string keys. The separator must
+be a definite builtin string. All argument expressions run first; the model
+then checks the current source heap, including changes through aliases or
+argument bodies. It neither reads nor converts dictionary values.
+
+The result is an arbitrary string. Abstract state joins do not preserve
+dictionary insertion order, so this consumer supplies no content, ordering or
+length facts. It requires the current tested string return contract and leaves withdrawn or
+unknown raise claims unproven. Subclass protocols, non-string keys, open
+dictionaries, other view kinds, explicit iterators and handler continuations
+retain their previous refusals. General iteration and string models are
+unchanged; no target code or view is executed or materialized by this model.
+
+The source-matched example is `', '.join(CREDIT_CARDS.keys())` in
+python-string-utils. A statement kernel uses the six original key names and
+inert values. The original regex-valued registry runs natively but its regex
+prelude still refuses before this call in absint. These checks establish this
+statement consumer only, not the enclosing validation function or an inversion
+or portfolio gain. See `tests/test_absint_str_join_keys.py`.
+
+## Plain automatic string format fields
+
+When finite native evaluation cannot determine string argument contents,
+`str.format` can still prove safety for finite literal templates containing
+only automatic replacement fields with an empty format spec and no conversion.
+Escaped braces and unused positional string arguments are allowed. Every
+template alternative must parse and have enough arguments; all arguments,
+including unused ones, must be definite builtin strings. `Formatter.parse`
+examines only template syntax and executes no target code.
+
+The consumer requires the current tested string return contract and leaves
+untested or unknown raise claims unproven. It returns an arbitrary string with
+no content or length facts. The earlier finite native path retains its exact
+outputs. Explicit field indices, names, attributes, subscripts, conversions,
+nonempty or nested specs, keyword arguments, open hooks and handler
+continuations keep their existing conservative behavior.
+
+The source-matched assignment is
+`msg = 'Expected "str", received "{}"'.format(type_name)` in python-string-utils.
+Its statement kernel declares a builtin string `type_name`; the preceding type
+name lookup and enclosing exception constructor are not proved. This is
+statement consumer evidence, not inversion, a native kill or a portfolio gain.
+See `tests/test_absint_str_auto_format.py` for native and refusal boundaries.
+
+## Complete finite statistics data and positional argument expansion
+
+`AbsintVisitor.visit_statistics_query` consumes all represented finite primitive
+data for the 17 existing statistics queries, without an eight-element data cap.
+It checks the analysis CPU deadline before tuple-pool materialization, while
+checking every primitive, after each native fold, and after result abstraction.
+Memory exhaustion refuses the transfer. Cartesian enumeration shares the analysis
+deadline; scalar size/finite-float guards, quantiles output-count bound, tested
+contract/return requirements, and qualified exception refusals still apply.
+No symbolic value receives a concrete default, and exact native float results
+do not imply a theorem about arbitrary floats. Segmented lists and tuples
+without recorded items retain the existing concrete-materialization refusals.
+
+`Analyzer.call_positional_args` expands known-length builtin tuples and lists
+incrementally under the same analysis deadline, without a 64-argument cap or a
+length-sized repeated summary pool. Every slot and every star segment is
+processed; exhaustion refuses the entire call. Tuple slots retain their values;
+list summaries retain their existing loss of positional correlation. Argument
+order, borrowed aliases and the callee's actual arity checks are preserved.
+Unknown lengths, custom iterables and starred method-lookup cases retain their
+existing refusals. Neither change supplies a new representation or proof rule.
+
+### Integer comparison partitions for primitive type paths
+
+The optional case-split retry can partition a drawn integer at literal comparison
+boundaries when its domain is not a small finite enumeration. Every literal c
+contributes boundaries c and c+1, clipped only to the already proven interval.
+The intervals cover every input, including both unbounded tails; no sampled value
+stands for an interval and no later predicate is assumed constant in one. The
+existing conditional transfer analyzes each interval normally, and the existing
+block continuation joins all outcomes. This retains primitive type correlations
+across repeated comparisons and calls without adding state fields or a type cache.
+
+Only the existing assignment/draw/loop/try/module eligibility applies. Literal
+comparisons are a source-based refinement heuristic, not a restriction on allowed
+integer values. The existing per-run split allowance bounds optional refinement;
+when it cannot cover every interval, analysis keeps the joined domain. The shared
+CPU deadline is checked during source scanning and before each outcome. Unknown
+comparison boundaries and other correlations may still remain UNKNOWN.
+
+## Nested class namespaces
+
+Class statements at module scope or inside another class reuse the same class
+construction transfer. Each body runs in its own namespace. Free names in an
+inner class body or method resolve in the defining module, not in the enclosing
+class namespace; bases and defaults evaluate in their actual enclosing scope.
+Class statements bind their resulting class into that enclosing namespace only
+after their body completes. Distinct source sites remain distinct class objects.
+There is no nesting-depth or sibling-count bound in this admission rule; the
+normal analysis deadline and allocation-site guards still apply.
+
+Classes defined inside functions remain UNKNOWN because captured lexical cells
+are not represented. Nested class bodies and methods needing implicit
+``__class__`` cells also remain UNKNOWN under compiler-authenticated closure
+guards, including an outer class cell read before it is filled. Existing multiple-inheritance,
+metaclass, decorator, unsupported-dunder and repeated-class-allocation refusals
+are retained. Tests compare native class namespaces, globals, header bases,
+nested exception identities and false assertions, including depths and sibling
+counts 0, 1, 2, 3, 9, 17 and 65.
+
+
+## Complete single-inheritance lookup
+
+Class attribute, slot and builtin-base queries traverse the complete represented
+single-inheritance chain. They never report an absent attribute, missing slot or
+absent builtin base after a fixed-depth prefix. Each step checks the real analysis
+deadline, and an unrepresentable cycle refuses the analysis. A native depth-65
+inherited attribute read with a leaf-local constructor previously dropped a
+reachable assertion after the 50-class prefix; the complete walk preserves it.
+Native controls cover depths 0, 1, 2, 3, 9, 17, 49, 50, 51, 65 and 129, ordinary
+attributes, slots, builtin exception bases and false-assertion twins. Existing
+multiple-inheritance, metaclass and unsupported-descriptor refusals still apply.
+
+
+## Finite user iterators in for loops
+
+The for-loop consumer executes represented user __iter__ and __next__ methods
+through ordinary method dispatch. Its private exception frame consumes only a
+StopIteration leaving __next__; body exceptions, break, continue, return and
+else retain their normal routing. Every continuing abstract state is consumed
+until it stops. The real deadline refuses nonterminating or expensive cases;
+no iteration count is used as an input-domain bound and no prefix is a proof.
+A for loop does not ask for a length hint. Existing builtin iterator paths are
+preserved, and other consumers still refuse user iterator results.
+
+Raising the canonical StopIteration class uses its native no-argument
+construction and the existing opaque exception tag. Explicit specialized
+constructor calls, payload reads, user StopIteration subclasses, unknown
+iterator alternatives, unsupported descriptors and unrepresented method bodies
+remain UNKNOWN. Tests compare native lengths 0, 1, 2, 3, 9, 17 and 65, primitive
+and callable elements, inherited methods, body/next errors, pending exits,
+reused/shared iterators and false assertions. No heap/state/schema is added.
+## Missing scalar methods are looked up before call arguments
+
+For a wholly represented primitive receiver, a method name absent from every
+possible scalar kind is resolved through the existing attribute-load transfer
+before positional or keyword arguments are evaluated. Native AttributeError
+therefore reaches its handler, and argument effects that Python never evaluates
+are not introduced. The guard reuses the existing builtin attribute inventory;
+it is independent of the method spelling, value magnitude and argument count.
+
+Present methods, user objects, unknown values and mixed-present scalar alternatives
+retain their existing dispatch/refusal. Known missing attributes also fail before starred/keyword-spread expressions;
+present starred method calls retain their existing lookup-order refusal. No numeric or container representation is widened: a
+program-grown integer above machine size uses the same kind/attribute decision.
+Native controls cover sizes/counts 0, 1, 2, 3, 9, 17 and 65, all five scalar kinds,
+values beyond 200 bits, handler/argument effects and false assertions.
+
+
+## Nonnegative integer power lower bounds
+
+A possible zero base has lower bound zero whenever the nonnegative exponent may
+be positive; zero to a certainly-zero exponent has lower bound one. A positive
+integer base has lower bound at least one for every nonnegative exponent size.
+The existing cheap precise bound remains the default; large bounds use these
+constant facts rather than constructing huge exact powers. No exponent or base
+size is rejected. Negative bases retain their existing sign-unknown summary,
+and exact nonlinear identities can still remain unproved.
+
+Native controls cover bool/int bases, exponent sizes 0, 1, 2, 3, 9, 17, 65 and 129,
+cheap exponents beyond 200 bits, and false assertions. The previous lower bound
+used 0**0 across a range containing positive exponents and could falsely prove
+0**nondet_bool()>0. That path now remains open.
+
+### Mixed builtin checks and starred assignment consumers
+
+The six exact builtin `check_type` hints (`int`, `bool`, `float`, `str`, `list`,
+`dict`) accept an abstract value with multiple represented kinds. Every kind
+must match for the TypeError check to be proven; `bool` also matches `int`.
+A possible match keeps the original normal-state over-approximation. Only a
+value with no matching alternative ends that path. Unknown/custom values and
+mismatching containers whose nested representation could run hooks still
+refuse. This does not infer a correlation from a prior branch or refine an
+argument binding after the check.
+
+Starred assignment over exact builtin list/tuple objects uses the existing
+sequence element and length summaries. Exact tuple positions supply the fixed
+prefix/suffix; list summaries conservatively supply every fixed destination.
+The middle becomes a fresh builtin list with all possible remaining elements
+and the remaining length interval. All values are saved before any target is
+assigned, including nested destinations and mutations through aliases. Empty
+middles, every finite source length and target arity, and too-short sources are
+handled without a size cutoff. A too-short source raises ValueError before
+assigning targets. Caught unpacking exceptions remain UNKNOWN because that
+ValueError is not routed here. Other iterable representations, custom iteration,
+and unavailable type information remain UNKNOWN rather than assuming their
+cursor or length-hint effects. The analyzer deadline bounds work, never input
+sizes. Existing integer transfers retain their default representation and widen
+according to the program's operations; unpacking adds no integer bound.
+
+Files and how they relate:
+
+- `solve/absint/interp.py::_verifier_check_type_value_kinds` and
+  `m__sv_verifier_check_type` account for every represented matching/mismatching
+  builtin kind without changing the value or state schema.
+- `Analyzer.unpack` dispatches a starred target to `_unpack_starred`, which reuses
+  `len_lin`, `all_elems`, `new_list`, and `assign` for snapshotting and assignment.
+- `tests/test_absint_mixed_type_checks.py` compares native success/error paths,
+  bool/int subtyping, formatting refusals, handlers, and false continuations.
+- `tests/test_absint_starred_unpack.py` compares native finite sizes through 65,
+  prefix/suffix arities, empty middles, alias mutation, nested targets, integer
+  growth, unrepresented iterables, and false twins.
+
+### Finite recursive call interpretation
+
+A repeated function body is not itself a reason to refuse a call. A higher-order
+function can re-enter its own body with a different callable or fewer variadic
+arguments and finish normally. `Analyzer.call_func` uses the ordinary argument
+binding, fresh activation/frame, closure-owner checks, body execution, exit
+routing and return-state transfer for every such call. Caller locals remain in
+their own frames; a re-entry never reuses its caller's local bindings.
+
+There is no fixed call-depth or input-size cutoff. The unique-call depth removal
+reuses lane 1493's qualified `abc01019` interpreter slice. Each recursive call
+checks the existing analyzer deadline. A spent deadline or host interpreter
+RecursionError returns UNKNOWN through the ordinary public proof boundary;
+no unfinished execution or prefix is a proof. This is interpretation of finite
+activations, not an inductive summary or a termination claim. Recursion that
+needs a summary can still exhaust the available resources and remain UNKNOWN.
+Inside an active try, a recursive call now has an additional possible
+RecursionError exit, routed from a copy of the caller state through the existing
+handler/finally machinery. The ordinary call is still interpreted: stack
+exhaustion is never a reason to cut its continuation or certify a prefix. This
+sound overapproximation may retain a runtime stack failure even for a shallow
+call; it makes no assumption about available stack depth. Existing reflection,
+expired closure and unsupported-operation refusals remain unchanged.
+
+Three numeric operations also retain their non-property exits inside try.
+Mixed float addition, subtraction and multiplication route possible integer
+conversion OverflowError. Numeric int conversion routes NaN ValueError and
+infinity OverflowError. Primitive min/max with two or more positional numeric
+arguments, and abs on one numeric argument, need no user hook or non-property
+raise; their existing tested contracts still gate the transfer. Numeric
+alternatives may mix bool, arbitrary integers and floats, including nonfinite
+floats. Other bindings, iterable extrema and custom protocols keep their
+existing general refusal until their raises are routed. There is no arity or
+integer-size cap. Integer-to-float interval conversion clamps both ends before
+native conversion; wholly out-of-range intervals retain OverflowError and a
+conservative saturated normal result, never a host conversion crash.
+
+Heap rewrites reuse an immutable function object when defaults, keyword defaults
+and captures are unchanged. Float-term stripping avoids constructing a float
+view when the stored value has no term. These preserve the same abstract facts;
+they neither skip a state transfer nor add a proof assumption.
+
+Files and how they relate:
+
+- `solve/absint/interp.py::Analyzer.call_func` admits repeated bodies, routes
+  possible recursive stack exits and retains all frame/binding/closure/return transfers.
+- `solve/absint/__init__.py::_prove_once` already converts resource recursion
+  failure to UNKNOWN; its behavior is unchanged.
+- `tests/test_absint_recursive_calls.py` compares native sizes 0,1,2,3,17,65,
+  variadic/keyword re-entry, represented value kinds, frame and capture lifetime,
+  200-bit operation-grown results, actual failure paths and resource controls.
+- `tests/test_absint.py` keeps a genuinely unfinished recursive program in its
+  refusal controls; finite recursion now has separate positive and false twins.
+- `tests/test_absint_recursive_try.py` checks native handler matching, finally
+  restoration, failure continuations, numeric arities through 129, wide growth,
+  nonfinite conversions and contract withdrawal. Resource exhaustion remains
+  UNKNOWN even on a finite native example.
+- `tests/test_solve_values.py` covers integer-to-float endpoint conversion through
+  20000-bit magnitudes and intervals lying wholly on either overflow side.
+
+### Exact function values at verifier type checks
+
+The builtin scalar/list/dict hint model recognizes exact Python function values
+(including lambdas, closures and generator function definitions) as
+function values, without calling their bodies. They mismatch these hints and
+terminate the normal path with TypeError. Python functions have a builtin repr
+that cannot invoke a user callback; its address-bearing text remains opaque,
+and checker calls inside try still refuse, including caught payload reads.
+Async definitions retain the existing unsupported-statement refusal. Bound methods, custom
+callable objects and mismatching nested containers retain their existing repr
+refusals. Function signatures and alternative counts have no domain limit;
+the ordinary analysis deadline still ends an exhausted run with UNKNOWN.
+
+### Exact polynomial floor division
+
+`solve/absint/polynomial.py::affine_quotient` expands pure integer `+`, `-`,
+`*` and unary signs into sparse polynomials, then uses exact integer polynomial
+long division. It returns a linear form only when the remainder is zero and
+all quotient terms are affine. No degree, input size or coefficient bound is
+imposed; the current analysis CPU deadline bounds expansion and division.
+Other syntax, noninteger values, nonexact division, a zero polynomial divisor,
+and nonaffine quotients supply no refinement.
+
+`Analyzer._int_binop` keeps linear constant division on its cheap coefficient
+path and only expands source expressions containing multiplication. A saved
+operand can have a fresh linear name after its nonlinear relationship was lost. It retains original operand evaluation and the existing
+zero-divisor check. The affine result describes normal continuations only:
+if `P = D*Q`, Python's `P//D == Q` for every nonzero integer `D`, of either
+sign. Source names are read only after rejecting calls, attributes and other
+potential effects, and every name must denote only exact integer/bool values
+with an existing linear form. Float and user protocol paths keep their models.
+No target executes, and no value-equivalence fact is promoted to identity.
+
+### Stable absolute-value factors in integer quotients
+
+After ordinary operand evaluation, primitive contracts and zero-divisor checks,
+`Analyzer._product_quotient` can cancel repeated authenticated builtin `abs`
+factors through the existing exact polynomial solver. Its source slice admits
+only stable integer/bool names, exact integer constants and pure arithmetic.
+All formal abs factors must cancel out of the affine result; none become state
+variables. Rebinding, reflection, callbacks, other kinds, surviving factors and
+nonaffine forms retain the existing result. There is no factor-count or width
+limit; the analysis deadline yields UNKNOWN when spent. Native controls and
+qualification: `docs/recon/2026-11-03/1493-product-quotient-t105.md`.
+
+### Path-sensitive module copy identity
+
+When an unresolved module `is`/`is not` comparison reads two names, the analyzer
+tracks their object identities in a separate component of the existing zone.
+Private variables denote `id` of root-module bindings as mathematical integers;
+only executed plain name copies add equality edges. They never connect to
+program numeric values or affine recipes, and no address is guessed or exposed.
+The existing join and widening conservatively combine these relations.
+
+Assignment saves the RHS identity before overwriting any chained targets. Root
+writes and deletion discard the old slot identity; ordinary calls and imports
+discard identity facts conservatively. Unknown callbacks therefore retain no
+old alias assumption. These are conditional facts of the existing closed model:
+user finalizers, weakref cleanup and generator protocols still refuse when the
+model cannot account for their effects. The native counterguards remain active.
+
+The source-preserving static copy pass remains the fast path. Only unresolved
+module name comparisons activate zone tracking; default programs and already
+proved straight copies allocate no identity variables. Function/local scopes,
+non-name copy forms and facts crossing calls can remain UNKNOWN when existing
+rules cannot prove them. There is no object-kind, size, chain or loop-trip cap.
+CPU exhaustion ends in UNKNOWN. Source facts and invariants project only actual
+source names and numeric components, never these private identity variables.
+
+### Closed ABC classes
+
+Canonical `abc.ABC` selects ABCMeta's frozen abstract-name calculation within
+the existing single-inheritance class model. `abc.abstractmethod` marks an
+exact recent source function and returns the same function; descriptor outer
+staticmethod/classmethod plus inner abstractmethod is supported. Abstract
+markers and class abstract sets are immutable heap metadata; conflicting joins
+refuse. Concrete overrides remove inherited abstract names, while an ordinary
+class using abstractmethod alone remains instantiable.
+
+Instantiation checks the abstract set after rejecting unsupported class
+machinery and before allocation, argument binding to `__init__`, or its body.
+Caller argument evaluation remains first. A missing implementation routes
+TypeError with opaque text, so observed exception messages refuse. There is no
+method-count or inheritance-depth bound; the ordinary run budget applies.
+
+Custom ABC hooks/metaclasses, virtual registration, mutation of ABC machinery,
+private-name mangling and arbitrary abstract-marker descriptors remain UNKNOWN.
+ABC's implicit attributes are an unknown MRO surface, preventing a false
+AttributeError for register or internal ABC fields. The source base hierarchy
+still proves nominal instance relationships; unsupported custom subclass hooks
+are refused before a class can be used. No native target class is created by
+the proof, and no ordinary class or numeric representation changes.
+
+Absent ABC metadata retains ordinary class-like heap behavior; MRO deadline and
+cycle guards still complete or refuse the full walk.
+
+### Closed collections.namedtuple declarations
+
+The factory's tested contract creates a `NamedTupleClassObj` with exact field
+names and defaults, and construction binds fields into a `NamedTupleObj` tuple
+payload. Field counts, constructor arities and tuple sizes have no domain cap.
+Direct method syntax honors fields shadowing tuple methods, including count
+and index. Existing tuple indexing, iteration and length transfers consume the payload;
+class metadata survives joins, frame-value rewriting and garbage collection.
+Instance and subclass checks distinguish the generated class from plain tuple.
+Tuple conversion produces a plain tuple; native materialization refuses to
+erase namedtuple identity during formatting or other concrete observations.
+
+Declarations accept a known builtin string, a fixed tuple of known strings,
+or anonymous literal string lists authenticated against their actual allocation
+site. No re-evaluation or native target class creation occurs. Nonempty aliased
+or computed lists refuse because the current list abstraction has no positions.
+Tuple defaults retain their values and references; other default iterables,
+unknown declaration strings, identifier normalization requiring a different
+constructor binding, and callback-bearing inputs remain UNKNOWN. `rename` is
+normalized only when its callback-free truth is known. Module metadata accepts
+None or a known string; unmodeled class attributes remain UNKNOWN.
+
+The generated class is sealed in this model: mutations, subclass definitions,
+replacement methods, descriptors and constructor errors inside try blocks
+refuse. Summary class identities cannot establish instance/subclass equality.
+These refusals protect the inherited tuple protocols and native exception
+payloads without claiming the rest of the generated class API is modeled.
+
+### Nullable slice bounds
+
+A missing bound or a value that is definitely None uses the native default
+endpoint. A joined None/bool or another mixed value is not definitely None:
+without a modeled normalized endpoint, retain the conservative slice-length
+bounds. The fallback never treats a possible valid bool index as the default.
+This applies at every finite list, tuple and array length; pure None and empty
+sequence behavior is unchanged.
+
+### Native ZIP output summaries
+
+`ZipObj` retains live native sources and strictness within the iterator family.
+Its dedicated State transport preserves its provenance. Reviewed consumers
+(for, list, tuple and dict) overapproximate every remaining output, preserve
+tuple columns and demote row summaries before exposing them. They infer no
+rewound cursor, fixed output count, key-presence relation or fresh-row alias.
+Strict exceptions occur at consumption; callbacks, unsupported attributes and
+unreviewed consumers stay UNKNOWN. No arity, length or width bound is added.
+See `docs/recon/2026-11-03/1493-zip-summary-t106.md`.
+
+### Native ENUMERATE output summaries
+
+`EnumerateObj` keeps a live source and immutable integer start bounds. Dedicated
+State transport and reviewed for/list/tuple/dict consumers preserve tuple field
+types, including direct composition with native ZIP. Every remaining index is
+a native int at or above the captured lower bound; no cursor, rewind or exact
+source-position correlation is inferred. Summary rows are demoted before use.
+Opaque callbacks, unsupported native representations and other consumers remain
+UNKNOWN. Sizes and signed start width have no fixed cutoff.
+See `docs/recon/2026-11-03/1493-enumerate-summary-t107.md`.
+
+### ZIP remaining counts and native ENUMERATE prefix bounds
+
+`ZipObj.fresh` is a guarantee of no consumption, not a cursor position. Every
+reviewed row consumer clears it; joins retain it only when both sides guarantee
+freshness, and heap redirects preserve it. Materializing an unconsumed zip over
+native sequences has the minimum of their current lengths. An existing input
+iterator has lower bound zero even when the zip is fresh. Consumed zips also
+keep lower bound zero. Remaining output is bounded above by each source's
+current native length. Source length anchors are captured before allocation,
+so heap reuse cannot bind an old source length to a new result. No size or arity
+limit is introduced, and exhaustion of the existing analysis deadline is UNKNOWN.
+
+On the existing guaranteed-element iteration path, enumerate indices over native
+monotone sequence cursors are below the captured start upper bound plus the
+source length. A private upper bound can constrain many rows without equating
+their index values. Materializing a possibly empty enumerate uses interval
+bounds only; it must not assume that any input element exists. Set/dict cursor
+histories are excluded from prefix bounds: mutation can change their traversal
+behavior. Unknown hooks and cursor relations retain their conservative rules.
+
+## Callback-free tuple dictionary keys
+
+Dictionary displays, writes, lookups and membership validate exact builtin tuple
+key graphs without calling target code. Every leaf must be a builtin scalar;
+unknown leaves, mutable containers, tuple subclasses and user hash/equality hooks
+remain UNKNOWN. The walk is iterative, with the analysis deadline rather than an
+arity or nesting bound. Finite constants use `native.concrete`'s shared per-run
+work budget; exhaustion loses constant precision without excluding keys.
+
+Known tuple keys use Python's builtin hashing/equality, including numeric key
+coalescing. Unknown tuple writes conservatively join values at every potentially
+equal known tuple key. No DictObj schema changes: when a constant tuple key must
+be projected back to V without a heap address, it becomes TOP, never None. Thus
+key iteration and joins may lose precision, while never inventing a scalar key.
+Tests cover native tuple sizes 0, 1, 2, 3, 17, 65 and 129, nesting through 129,
+130-bit integer leaves, bool/float/Unicode/None, aliases and weak-update negatives.
+Scalar key validation retains its direct path; only tuple graphs allocate a
+validation worklist and consult its deadline.
+
+## Range allocation summaries
+
+Repeated ranges at one allocation site already demote their immutable endpoint zone
+variables to intervals. Same-step summaries now reuse the existing interval
+join/widen/inclusion operations, rather than requiring identical endpoints. This
+covers every endpoint magnitude and cardinality; no range elements are enumerated.
+Unchanged symbolic endpoints retain the original fast path. Summary intervals do
+not become zone variable names during GC.
+
+Consumers retain their existing interval endpoint interpretation. Lost relations
+can leave checks UNKNOWN. Differing steps at one summary site still refuse because
+this representation stores one exact step; the constructor's existing unknown-step
+and user `__index__` gaps also remain UNKNOWN. Tests compare native ranges of sizes
+0, 1, 2, 3, 17, 65 and 129, both signs of step, and 130-bit endpoints/steps, including
+join/widen containment and wrong-result controls.
+
+### Alternative builtin slice receivers
+
+A builtin slice receiver may denote several possible list, tuple or supported
+numeric-array heap objects. The receiver is selected once at runtime. The
+abstract transfer forks the incoming state for each alternative, runs the same
+slice model from the same incoming allocation epoch, and joins the results. It
+unions the resulting allocation epochs before continuing the statement. This
+keeps recency and in-flight-reference guards active, while mutually exclusive
+receivers no longer look like repeated allocations on one execution. Index and
+bound expressions were already evaluated and are not repeated. Scalar receiver
+alternatives retain their existing type/error handling. The alternative count
+has no fixed cap; the analyzer deadline is checked between alternatives and
+exhaustion yields UNKNOWN.
+
+`tests/test_absint_slice_alternatives.py` compares native lengths through 129,
+forward/reverse slices, lists, tuples, integer/float arrays and mixed receivers.
+Mutation checks retain the independence of a list slice from its source, and
+false continuations remain UNKNOWN. This changes allocation handling only: it
+does not add sequence ordering, fixed-length starred-argument correlations,
+new slice-bound protocols or new array typecodes.
+
+### Primitive direct tail loops
+
+A direct tail call with an explicit nonrecursive return can be interpreted as a
+loop in the proof engine. Parameter arguments evaluate together before any
+parameter changes. Each original assertion and return remains on its original
+path; ordinary fallthrough returns None. The ordinary loop fixpoint and checked
+narrowing must prove all iterations. There is no input, arity, numeric-width or
+call-depth bound, and no termination assumption. An unfinished fixpoint or spent
+resource budget yields UNKNOWN.
+
+This interpretation is used only when all bound parameters and referenced data
+globals are exact builtin primitive kinds, the global recursive callee still
+names the same source function, and any allowed draw module is the authenticated
+_sv_verifier. The body has no local stores, closures, user calls, frame inspection,
+exception handlers/finalizers or mutable operands. An active caller try also
+keeps the ordinary calls: its handlers could observe RecursionError. Removing
+unobservable stack exits otherwise adds possible executions, a sound
+approximation for proving exception safety. It never supplies a native FALSE
+witness; coverage-guided input generation and symbolic execution still replay
+violations against the original source through the shared obligation table.
+
+Variadic/keyword-only recursive bindings, captured frames, non-tail calls,
+implicit-only base exits and other source shapes keep the existing interpreter.
+If that interpretation cannot finish, it returns UNKNOWN. Tests compare native
+original/lowered functions at sizes and arities 0,1,2,3,17,65,129; None, bool,
+arbitrary ints, finite/nonfinite floats and full Unicode strings; simultaneous
+parameter updates, failed continuations, rebound callees and source handlers.
+The deep safe Ion source gains an inductive proof; its unsafe counterpart stays
+UNKNOWN. Native failure under an artificially raised recursion limit is not a
+qualified counterexample.
+
+## Closed identity map unpacking
+
+A source-authenticated `map` of a closure/default-free single-parameter identity
+function over a literal display (list or tuple; correction: the first implementation, by an AI lane (b50538e4), was WRONG: it required `ast.List`, so the identical tuple lost the proof) of pure module names/constants can preserve each
+position for its sole unpack consumer. The result remains an `IteratorObj`;
+only its private positional snapshot uses tuple storage. The callback is never
+executed early. Mutable element references remain aliases, and scalar values
+are captured before later rebinding. Primitive `strict` truth has no effect on
+a one-source map. There is no length, arity-of-unpack or integer-width cutoff.
+
+The whole-source binding/read audit requires one module-level (possibly `if`)
+binding and one plain unpack outside loops/functions. It reuses the existing
+frozen-list cross-file/global-channel exclusions. A second read, alias, hidden
+global channel, unsupported binding or unavailable import closure refuses.
+Reference-producing callbacks need heap reference remapping; repeated consumption needs a cursor;
+effectful iterable/keyword expressions and nonliteral sources need positional
+capture during argument evaluation. These gaps stay UNKNOWN. The source audit loads lazily from `map_identity.py` only on actual map calls.
+No eager rewrite is exported, no target function executes in SOLVE, and no
+heap/state schema changes.
+
+Native controls exercise sizes 0, 1, 2, 3, 17, 65 and 129; primitive, Unicode,
+wide-integer and nested mutable/immutable payloads; scalar rebinding, shared
+objects, callback timing, strict binding, alias/second-consumer refusals and
+reachable wrong assertions.
+
+### A last `*sequence` of unknown length into a `*parameter`
+
+`f(a, b, *seq)` where `seq` is one builtin list or tuple whose length is not a single number was refused
+(`*args requires a fixed sequence length`). It is admitted when it is the LAST positional argument and
+every callee is a user function (`ob.kind == "func"`) with a `*parameter` and with no named positional
+parameter left for the tail: `len(posonlyargs + args) <= number of arguments before *seq`
+(`Analyzer.call_with_star_tail`, fed by `call_positional_args(..., tail_out=)`, bound by `bind_args(..., star_tail=)`).
+Then the arity cannot depend on the sequence's length: the named parameters are filled by the earlier
+arguments, a keyword naming one of them is the same "multiple values" `TypeError` for every length,
+and the `*parameter` is a tuple of length `(arguments beyond the named parameters) + [lo, hi]` (`hi` open
+when the list's length is) over the join of those arguments and the elements `seq` may hold. The sequence
+is snapshotted at the call (elements borrowed as in the fixed case, so an object in the tail stays aliased
+with the tuple's element). A bound method, class, builtin or scalar callee, a function without a
+`*parameter`, and a function whose named parameters the tail could fill keep the refusal: their arity or
+protocol depends on the length. A joined sequence value of several heap objects is still refused (one exact
+list or tuple is required). `tests/test_absint_starargs.py` has the native controls and the never-TRUE twins
+(a tail that would bind a named parameter, wrong-typed elements, an aliased element mutated by the callee,
+a callee without `*parameter`, a builtin or a class).
+Measured use: `type-eval-py/args_multiple` (sv-benchmarks f0624a58) dynamic-typing goes from the refusal to
+TRUE. Its assertion-safety pair and the `_unsafe` assertion pair stay UNKNOWN (`b == x + y + sum(extra)`
+equates a loop fold with a builtin sum, a relation the interval domain does not have).
+
+### Shared choices in starred calls
+
+When callee selection and a starred argument read a shared name whose abstract
+value has several possible heap receivers, the call transfer partitions the
+binding by those alternatives before evaluating the original call. Each branch
+starts from the same allocation epoch and borrowed-reference set; the results,
+states and scratch are joined afterward. The bound name is narrowed in its
+actual module, local, class or live captured scope. All operand, keyword and
+callback effects still occur in their original order. There is no receiver-count
+or arity cutoff; spent transfer time yields UNKNOWN.
+
+Fixed builtin tuple slices preserve per-position values when the bound components
+are exact int/bool/None alternatives. Arbitrary signed integer magnitudes,
+negative steps and all finite tuple lengths use native builtin slice adjustment
+on model values. A zero-step alternative has no normal continuation; active try
+contexts still keep the existing named refusal. Unknown bounds retain the full
+existing summary transfer, rather than truncating the domain. This supplies the
+callee/argument positions that a joined element summary loses.
+
+For a dynamic-typing query after such a shared-choice call, scalar integer stores
+retain interval facts without namespace-variable relations. This is a sound
+weakening, never a new assumption: all value and exception transfers still run,
+and lost relations may leave a check UNKNOWN. Other queries and programs that do
+not reach the shared-choice transfer keep the normal numeric representation.
+
+`tests/test_absint_starred_correlations.py` compares native finite arities and
+slice sizes 0,1,2,3,17,65,129, huge signed slice bounds, bool/None bounds, zero and
+negative steps, original element aliases, wrong bindings, closures and callee /
+argument mutation order. Method calls with starred arguments and opaque index
+protocols retain the existing general refusals. The Scimark frontier moves beyond
+slice allocation and starred length; its typing query next needs the suspended
+`Array2D.indexes` generator, and incomplete numerical analyses still time out.
+
+### Square-root exception routes
+
+The existing tested math.sqrt transfer now admits an active try for exact
+builtin int/bool/float operands, including their unions. Conversion of an
+unbounded integer to float has an additional possible OverflowError exit;
+negative real-domain inputs have a ValueError exit. Both use the same source
+handler/finally routing as other checked operations. The normal numeric result
+is still computed by the existing interval transfer; a bottom result has no
+normal successor. NaN and positive infinity retain their native normal paths.
+Wholly out-of-range integers use the existing conservative saturated float
+abstraction plus the overflow exit, which may lose precision but never excludes
+a native result or exception. The normal nonraising case keeps its fast path.
+
+No numeric-width or magnitude bound is introduced. Custom conversion protocols,
+non-numeric values, unsupported bindings and exact exception payloads retain
+the adapter's existing named general refusals or unknown values. Contract
+withdrawal still removes the transfer. Tests compare native scalar values,
+integer bit lengths 0,1,2,3,17,65,129 and 20000-bit growth, Unicode nonnumeric
+inputs, matching/unmatched handlers, finally effects and actual failure controls.
+
+
+## Closed scalar map callbacks
+
+`map_identity.model` also captures a plain source callback and scalar positional
+operands for a sole module-level unpack. Construction performs no callback.
+The new scalar-map branch in `Analyzer.unpack` delegates to
+`map_identity.consume`, which calls the ordinary `Analyzer.call` transfer once
+per operand, in native order, and snapshots each scalar result before any
+assignment target is stored. Callback effects, binding checks and exceptions
+therefore occur at consumption; saved callbacks and construction-time operands
+survive later rebinding. No target function executes inside SOLVE.
+
+Every finite number of int/bool/float/str/None operands and scalar results is
+supported subject to the shared run budget. Ordinary callback binding handles
+positional, keyword-default and variadic signatures, with primitive defaults.
+The identity fast path retains its original reference payload support.
+Closures or reference defaults, non-identity heap operands/results, and unknown
+results remain UNKNOWN because their lifetime/remapping needs additional state.
+Aliases, repeated consumption, effectful captures and caught unpack exceptions
+retain the existing source/continuation refusals. Non-identity source/target
+length mismatches also remain UNKNOWN: a callback's StopIteration can change
+whether native unpack succeeds. On a matched unpack outside a handler, such
+an early stop terminates via native ValueError before subsequent statements.
+
+This adds no caller-return refinement or new string/nonlinear theory. The
+original mixed string/None map still leaves its caller equality unproved;
+string concatenation length can prove even where literal-content folding
+cannot. Tests compare native values and exception order at sizes
+0, 1, 2, 3, 17, 65 and 129, cover default counts through 129, retained scalar
+results across callback effects, 63-to-64 and 130-to-131-bit growth, and preserve
+reachable wrong assertions and unsupported continuation controls.
+
+### Generator lexical scope
+
+Suspension detection examines only the current function or lambda body. A nested
+function, lambda or class body does not make its enclosing function a generator.
+Nested defaults, decorators, class bases and class keyword expressions still run
+in the enclosing scope, so a yield there keeps that enclosing function suspended.
+The root function's own header belongs to its caller and is excluded. There is no
+definition-count, arity or integer-width limit. Native compiler flags and normal
+factory executions are compared at counts 0,1,2,3,17,65,129 and across primitive
+and container arguments. Supported for consumers use the continuation transfer below. Other suspension
+forms and protocols retain named UNKNOWN refusals.
+
+### Unstarted source generator state
+
+Calling a source generator binds its arguments immediately and allocates an
+unstarted generator value. It does not run assertions, calls, handlers or yields
+in the body. Normal definition-time defaults and call-time argument effects keep
+their existing order, and bad signatures route TypeError at the call. The heap
+object retains the defining function and bound parameters. Closure metadata stays
+with the function. Mutable argument references stay live; scalar arguments retain
+the existing sound interval summaries. GC, recency demotion, joins and inclusion
+map these retained values like other heap fields. Creation pins them while an
+allocation rewrites older references. No input size, arity or integer-width cap
+is introduced.
+
+Supported for consumers can resume this value using the transfer below. Other
+consumers, element summaries, attribute reads/writes and method calls explicitly
+yield UNKNOWN. They must not pretend a real generator is noniterable or a method
+is missing, since that could hide an assertion in its deferred body. Type inspection also
+keeps its existing unsupported-kind refusal. Mutable captured cells whose owner
+frame has expired retain the existing closure refusal. This is the creation
+state prerequisite, not a continuation implementation or an exhausted-prefix
+proof. Resource exhaustion remains UNKNOWN.
+
+Tests compare native unstarted frame bindings, retained aliases and default,
+variadic and keyword-only parameters. A local function remains reachable after
+its factory returns. Definition counts, parameter arities and argument lengths
+through 129, builtin and user-object kinds, tagged module/class/function values,
+nonfinite floats and wide integer bounds have native checks. Protocol tests keep
+unsafe generator-body assertions unprovable through consuming builtins and source
+methods returning generator objects.
+
+### Source generator continuations in for loops
+
+A for consumer can resume one known recent source generator, retaining a separate
+local environment at each continuation position. Each yield evaluates in the
+producer frame, runs the caller target assignment and body in the caller frame,
+and resumes afterward. Mutable arguments and yielded objects remain live aliases.
+Scalar locals use absolute interval summaries across suspension; this weakens
+relations without narrowing the native values. A separate pin tracks the active
+generator itself. If a nested allocation moves it to summary storage, resumption
+refuses before changing a different object at the reused address. Returns and exceptions remove the
+producer frame and release consumer pins. Escaping StopIteration becomes
+RuntimeError, with an opaque exception value; consumer exceptions retain their
+original class. Exact exception payloads and context inspection remain unknown.
+
+The continuation graph covers statement yields, assignment from yield with the
+implicit None sent by iteration, conditionals, returns, break/continue, while loops and
+range-backed for loops, including else clauses and arbitrary signed range steps.
+An outer range is created once. Each inner range is created where the source
+reaches it, after intervening consumer mutations. Concrete trips retain exact
+execution. If a continuation may either yield or stop, the existing loop solver
+checks an inductive head covering every continuing iteration, then checks its
+normal and break exits. Unfinished closure or spent work yields UNKNOWN for the
+whole proof; an enumerated prefix cannot establish a verdict.
+
+Other iterator cursors, yield from, suspensions inside handlers/finalizers or
+complex expressions, summary/reentrant generator identities and expired mutable
+closure owners keep named UNKNOWN refusals. Other consumers and direct next,
+send, throw, close or introspection protocols retain their creation-stage
+refusals. Existing class-attribute-shadow and string-to-float value precision can
+also leave assertions unproved. No source-yield-count, trip-count, arity, numeric
+width or input-size cap is introduced.
+
+Tests compare native control flow and complete exhaustion, partial reuse, method
+and __iter__ generators, consumer mutation timing, producer/caller exceptions,
+late assertions and infinite-generator budget exhaustion. Native range lengths
+0,1,2,3,17,65,129, signed 129-bit steps and observable 125-bit source growth are
+checked. Unknown finite lengths use checked fixpoints, with native unsafe cases
+kept unprovable. Coverage-guided input generation, symbolic execution and the
+shared obligation table keep their existing native replay obligations.

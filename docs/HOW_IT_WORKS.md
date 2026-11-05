@@ -220,10 +220,6 @@ class Connection:
 # obj.send(data="test")  ← target method (now the guard passes)
 ```
 
-### Step 8: CrossHair Concolic Execution (Optional)
-
-When everything else fails, falls back to symbolic execution via CrossHair. Explores paths symbolically to find satisfying inputs.
-
 ### Step 9: Hypothesis Property-Based Search (Optional)
 
 Last resort: uses `hypothesis.find(strategy, predicate)` where the predicate runs the function with the tracer and checks if the target branch was hit.
@@ -440,6 +436,137 @@ sol.explanation       # str: "integer range intersection: 101 satisfies x > 100 
 sol.input_constraints # dict | None: {"x": {"type": "int", "gte": 101, "lte": 199}}
 ```
 
+**Helper calls in a guard** (`solve/condition.py::_inline_pure_helpers`). A call to a function whose body is one `return <expr>`
+(a docstring allowed), defined in the same module or imported from a sibling by a relative import (`from .validation import
+is_string, is_full_string as full`), is replaced by that expression with the arguments substituted before the guard is solved,
+so `not is_full_string(s)` is solved as `not isinstance(s, str) or s.strip() == ''` and `guard_source` shows the inlined form.
+Before this the call was a free variable and the answer (`{'s': 0, 'is_full_string': 0}`) did not satisfy the guard.
+Conditions: positional parameters only (no defaults, `*args`, decorators), exact arity with no keywords, `Name`/`Constant`
+arguments, no lambda/comprehension/walrus in the helper, no recursion, depth 4 and 400 nodes, and a callee name that the
+enclosing function rebinds is left alone; any other helper stays an opaque call. Two companions keep the answer honest:
+`name.method(literals) == "literal"` (`s.strip() == ''`) is solved by the str preimage engine instead of the type default,
+and an `or` guard keeps only the branch witnesses that satisfy the WHOLE guard when it can be evaluated and some do.
+Tests: `tests/test_condition_helper_inlining.py`.
+
+**Regex-membership guards** (`solve/condition.py::_regex_guard_witness`, `_resolve_compiled_pattern`). For a guard such as
+`is_full_string(s) and JSON_WRAPPER_RE.match(s) is not None`, the compiled pattern is read from its definition, including
+through `from .mod import PAT` / `from .mod import *` in a sibling file (AST only, one level). The witness is built by the
+regex-membership preimage (`regex_members.members`, deterministic) and, when the branch body then calls `json.loads(s)`, the
+texts the `json.loads` preimage writes for a few JSON values (`[]`, `{}`, `[0]`, ...) are tried FIRST, so the answer matches the
+pattern and parses (`'[]'` for `validation.py` 359). Every candidate is checked by evaluating the whole guard with the pattern
+bound; none that fails is returned. When the pattern is one the member generator handles and no member satisfies the guard
+(`WORD_RE.match(s) is not None and len(s) > 50`), the result is `strategy="none"` with no inputs, not a type default or a
+length-only guess. Patterns it refuses (bytes, backreferences, lookbehind) keep the previous route.
+When the body parses with `json.loads`, `satisfying_inputs` lists the parse witness first and then a second member of the
+pattern for which `json.loads` raises (`'{]'` for `validation.py` 359): it reaches the `except (TypeError, ValueError,
+OverflowError)` handler (362) and its `pass` (363). Both are guard-verified; a consumer that needs the handler arm takes the second.
+Tests: `tests/test_condition_regex_json.py`.
+
+**Loop-body guards over local aliases** (`solve/loop_guard.py::solve_loop_guard`, called from `solve/condition.py::_loop_guard_solution`
+before the ordinary route; `_loop_guard=False` is the recursion guard). A guard such as `head_char != tail_char` (`is_palindrome`,
+`validation.py` 491) names locals, not parameters. The aliases are substituted back: straight-line `name = expr` assignments before
+the loop (`string_len = len(input_string)`) and in the loop body (`head_char = input_string[index]`,
+`tail_char = input_string[string_len - index - 1]`), `if flag: name = expr` rebinds in both arms (`if ignore_case: head_char =
+head_char.lower()`), pre-loop `if C: return` guards required False, and `for k in range(bound)` entered. That leaves an
+index-affine relation `E1(P[p]) == / != E2(P[q])` over one parameter `P`, `E1`, `E2` chains of zero-argument str methods and
+`p, q` affine in `k` and `len(P)`. It is solved, not searched: z3 gives the minimal length with in-bounds, non-wrapping `p`,
+`q` (distinct positions for a mismatch; the same or distinct positions for a match), and the characters come from the
+`solve/preimage` str-method preimages of the value the other side produces (a mismatch falls back to a neighbouring character
+whose image differs when the next code point has no preimage, as under `upper`). Each witness is a full parameter dict, checked
+by evaluating the pre-loop path guards, the chosen rebinding arms, the loop entry and the aliased guard (the helper-inlined
+evaluator); a witness that fails any of them is dropped. For `validation.py`: 483 then -> `input_string='a'`; 487 then ->
+`ignore_case=True` (reaches 488/489); 491 then -> `'ab'`, `'aB'` (with `ignore_case`); 491 else -> `'a'`, `'aa'`, `'aA'` (with
+`ignore_case`). Domain: any function whose guard is in a `for k in range(<affine in len(P)>)` body with that alias shape; length
+is the optimiser's minimum for the index constraints, never a fixed size. Not solved (named): iterations after the first (a
+mismatch after matching pairs), the `if flag: P = rewrite(P)` arm (`ignore_spaces=True`: needs the inverse of the rewrite), the
+loop's empty arm, aliases through calls/slices/walrus. Anything outside the shape returns to the previous route.
+Tests: `tests/test_condition_loop_guard.py`.
+
+**Path-sensitive guards over copy-propagated assignments** (`solve/path_guard.py::solve_path_guard`, called from
+`solve/condition.py::_path_guard_solution` after the loop-guard route; `_loop_guard=False` disables both). A guard in a function
+names locals (`key = args[0]`, `m = PAT.match(key)`, `version, desc, *_ = text.split(sep="\n", maxsplit=1) + [None, None]`) and
+is reached only under its enclosing `if` arms and after the early `if C: return/raise`. The path from the entry is replayed
+symbolically: straight-line and tuple/starred assignments are substituted forward (an unpack also records the length it needs),
+a non-ancestor `if` forks the state into its two arms (an arm that returns/raises is dead), ancestor arms and the guard with the
+requested polarity become literals, in-place stores unbind the target. The conjunction (DNF over `and`/`or`/`not`) is solved
+per ENTRY term: a parameter, or `param[i]` of a list parameter whose length comes from the `len(param)` literals and the
+highest index. Literals solved: membership in / equality with a module constant (sets and `A | B` resolved by AST through
+relative imports), `len` of a str or list, `str` predicates and `in` (the `str.*` preimages), regex (non-)membership and group
+presence from `regex_members` (a group value is embedded at the group's span in a member; a non-member is a member under
+different flags that the real flags reject), `X.split(sep, k)` lengths and `(D + [None, ..])[i] is None` from the split preimage,
+`inspect.cleandoc(X)` through its fixed points. Each witness is a dict over entry parameters only, and is accepted only after
+the WHOLE path (every literal, constants resolved from the source) evaluates as required. A literal outside this list is named
+(`Unsupported`) and the ordinary route runs. Not solved (named): receiver attributes (`self.titles_re.search(text)`, built at run
+time from `self.sections`), guards inside loops (loop_guard's shape only), several entry terms in one literal (`a == b`),
+non-string element types, `any`/`all` comprehensions. Domain: any function whose path to the guard consists of these
+statements and whose literals are of these kinds, every list length and string value the literals allow (no fixed sizes).
+Tests: `tests/test_condition_path_guard.py` on the unchanged upstream package in `tests/fixtures/docstring_parser`.
+
+*Extension (dataclasses-json):* literals `x is None` / `x is not None` over a parameter, and `isinstance(x, C)` (also the try-wrapped
+`_isinstance_safe(x, C)`, recognised by its shape and resolved to `isinstance`) where `C` is a class, a tuple, a `typing` alias
+(`Collection`, `Mapping`, resolved by origin) or a `typing` constant's `__args__` (`Json.__args__` of `Json = Union[dict, list, ...]`,
+evaluated by AST). Names come from relative imports, absolute imports inside the package, and `from <stdlib> import X` for a short
+allow-list (typing, collections.abc, datetime, uuid, decimal, enum, numbers, dataclasses ...). A True `isinstance` demand is given by
+canonical instances of stdlib classes (`[]`, `{}`, `datetime`, `UUID(int=0)`, a member of a dynamic `Enum`, `Decimal(0)`, the
+builtin scalars), a False one by values outside the class; a user class is never instantiated, and a stdlib predicate such as
+`dataclasses._is_dataclass_instance(obj)` is a check-only literal (it never supplies a value). An `if` whose arms leave the same
+bindings re-joins the paths (so a chain of `if x is not None: d['k'] = x` blocks is one state, not 2^n). Not solved (named):
+`hasattr(EnumClass, name)` over a class defined in a sibling module (needs the class), type-object parameters (`cls`, `type_`),
+dict/list parameters whose elements are coupled in one literal (`k in overrides`).
+Tests: `tests/test_condition_path_guard_dcj.py` on the unchanged upstream package in `tests/fixtures/dataclasses_json`.
+
+*Extension (re.finditer loops, owner 1365):* a guard inside `for m in re.finditer(P, X, flags)` binds `m` to `next(re.finditer(..))`
+(the first iteration; `continue`/`break` arms of earlier `if`s are dead paths for later statements), so `chunk = m.group(0)` is a term
+over `X`. `not chunk` (group(0) empty) is REFUTED when the pattern's parse-tree minimum match length is >= 1
+(`regex_members.min_match_length`: an anchor or look-around counts 0, a literal/class 1, a repeat its minimum): `solve_condition`
+then returns `strategy="infeasible"` with `input_constraints["refutation"]` (the pattern, flags, minimum length) and an
+explanation, and `driver._flip_static` turns that into a sound infeasibility vote, so `drive_to_line` ends `plateau`
+"provably unreachable". The truthy arm needs a match: `X` is lifted through `Y[m.start():]` (a regex-match slice) and
+`inspect.cleandoc` to the entry (`text=':x'`). Joins of `if` arms ignore bindings nothing reads afterwards (liveness by
+name), which keeps the path count at the number of live forks. Domain: patterns whose every match has a required first
+character or a mandatory repeat (minimum length >= 1; any such pattern, no special sizes); a pattern that can match empty
+is not refuted (its arm gets a witness). Not claimed: groups other than group(0), `if chunk == ''` spellings, `while`/`for`
+over other iterables. Tests: `tests/test_continue_refutation.py`.
+
+*Interpreter-constant guards:* a guard that reads only `sys.version_info` (and `.major/.minor/...`, `[i]`), `sys.platform`,
+`sys.maxsize`, `sys.byteorder`, `os.name/sep/linesep/pathsep` and literals (`path_guard.environment_truth`; no call is made) is decided
+by the interpreter it runs on (`condition._environment_solution`): the arm it takes answers `{}` (no input constraint), the other arm is
+`infeasible` with `refutation.kind == "environment"`, and a path through a false such condition (an ancestor arm or an earlier
+`if`) is infeasible too instead of getting a made-up witness. It is sound for this interpreter only, so the equivalence proof of
+the unreachable-statement route (docs/EQUIVALENCE.md) ignores `kind == "environment"` refutations. dataclasses-json utils.py 9/35
+(`sys.version_info.minor == 6`) and mm.py 142 are this shape. Tests: `tests/test_condition_env_constant.py`.
+
+**Dead arms refuted from what the program can and cannot do** (`solve/dead_arms.py::refute_arm`, called first by `solve_condition`;
+owner 1365 style: the arm's candidate is built and refuted from a constraint, the answer is `infeasible` with
+`input_constraints["refutation"]` = {kind, constraint, candidate, ...}; `driver._flip_static` votes it, `drive_to_line` ends `plateau`
+"provably unreachable", and the equivalence unreachable-statement proof uses it). CLOSED-WORLD over the `.py` files of the source's
+directory (the package): nothing outside is assumed to write a key, mutate a table or raise a program exception.
+* `dict-key-never-written`: `if 'k' in V` (`not in`: the else arm) with `V` a local dict (`V = {..}` / `dict(..)`, or `V = D[e]` over
+  `D = defaultdict(dict)`): the key set that can reach `V` is collected from EVERY occurrence of `V`/`D` in the function and must be
+  closed (literal-key stores, literal-key reads, literal `in` tests; one binding each). Refused on any other use: a dynamic key,
+  `.update/.setdefault/.pop`, `del`, an inner dict replaced, `V`/`D` passed, aliased, returned or iterated, rebound, captured by a
+  nested scope, `global/nonlocal`. dataclasses-json core.py:80 (`'mm_field' in field_metadata`; line 64 writes `'mm_fields'`).
+* `callee-never-raises`: `if not rets` after `rets = []; for f in T.values(): try: rets.append(f(x)) except E: ...` with `T` a non-empty
+  module-level dict literal that nothing in the package mutates, passes or rebinds, whose values are package functions. `rets` is
+  empty only if every `f` raised `E`; one value whose exception-escape summary says `E` cannot escape (and every other exception leaves
+  the function before the guard) makes the arm infeasible. The summary follows every call: a bare name to the caller module's
+  module-level function (else the package's), `mod.f` to that module's `f`, `x.m` to the methods `m` of the caller's module when it
+  defines any (else every package method), a class to its `__init__/__post_init__/__new__` and bases, a package function used as a value
+  as called; `raise C` is `E` iff `C` is `E` or a package subclass, a bare/variable `raise` iff the enclosing handler covers `E`;
+  `try/except` removes what its handlers cover; builtins, stdlib module functions, builtin/`re` object methods are safe; anything
+  unresolved (a called variable, a method nothing defines, a `match`) or a package dunder/property that may raise `E` means "may
+  raise" (no refutation). docstring_parser parser.py:23-24 (`numpydoc.parse` never raises `ParseError`; `rest.parse` and
+  `google.parse` may).
+**Correction (owner 1408; the T176 summary was wrong on the first try, AI-written):** it treated every builtin, standard-library and
+builtin-method callee as unable to raise the caught class, so `rets = []; for f in PARSERS.values(): try: rets.append(f(s)) except ValueError`
+over `int`/`float` parsers was refuted although `parse_any("x")` reaches `if not rets`. Now: for an exception class the PROGRAM defines
+(docstring_parser `ParseError`) a builtin/stdlib callee can raise it only through a callback into program code, which is followed; for
+a builtin or library-defined class (ValueError, `json.JSONDecodeError`) every builtin/stdlib/builtin-method callee may raise it and a
+package function counts as unable to raise it only if it does nothing but return a name or a constant (`_trivial_function`), since any
+operation (a subscript, an operator, a call) can raise a builtin exception. parser.py:24 (`ParseError`) is re-derived under the corrected
+summary and still refutes.
+Domain: exactly those shapes and summaries; a callee whose behaviour depends on code outside the package (a user-registered section,
+a monkey-patched table) is outside the claim. Tests: `tests/test_dead_arms.py` (original sources, driver, equivalence, negative controls).
 **`explanation`** gives human-readable rationale for the chosen strategy — useful for understanding solver behavior and debugging unsolved guards.
 
 ### Serialization
@@ -496,7 +623,7 @@ This is useful for large modules where you want to start using results before th
 
 ## Deterministic Mode
 
-By default, tharkun uses CrossHair (non-deterministic symbolic execution) and Hypothesis with a random seed. Set `deterministic=True` to skip CrossHair and fix the Hypothesis seed, producing reproducible results suitable for CI:
+By default, tharkun uses Hypothesis with a random seed. Set `deterministic=True` to fix the Hypothesis seed, producing reproducible results suitable for CI:
 
 ```python
 from tharkun import solve_branch, solve_uncovered_branches, solve_branches_progressive
@@ -512,7 +639,7 @@ for sol in solve_branches_progressive("module.py", deterministic=True):
     ...
 ```
 
-**Trade-off:** Deterministic mode may slightly reduce solve rate (CrossHair occasionally finds inputs that the static solver misses), but ensures that two runs on the same file produce identical results.
+**Trade-off:** Deterministic mode may slightly reduce solve rate (a random Hypothesis seed occasionally finds inputs that a fixed one misses), but ensures that two runs on the same file produce identical results.
 
 ---
 

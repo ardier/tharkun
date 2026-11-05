@@ -151,6 +151,35 @@ def _const(node: ast.AST) -> Any:
         v = _const(node.operand)
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             return -v if isinstance(node.op, ast.USub) else v
+    if isinstance(node, ast.BinOp):
+        lv = _const(node.left)
+        rv = _const(node.right)
+        if lv is not _MISSING and rv is not _MISSING and not isinstance(lv, bool) and not isinstance(rv, bool):
+            try:
+                if isinstance(node.op, ast.Pow) and isinstance(rv, int) and 0 <= rv <= 256 and abs(lv) <= 2**64:
+                    return lv ** rv
+                if isinstance(node.op, ast.LShift) and isinstance(rv, int) and 0 <= rv <= 256:
+                    return lv << rv
+                if isinstance(node.op, ast.RShift) and isinstance(rv, int) and 0 <= rv <= 256:
+                    return lv >> rv
+                if isinstance(node.op, ast.Add):
+                    return lv + rv
+                if isinstance(node.op, ast.Sub):
+                    return lv - rv
+                if isinstance(node.op, ast.Mult):
+                    return lv * rv
+                if isinstance(node.op, ast.FloorDiv) and rv != 0:
+                    return lv // rv
+                if isinstance(node.op, ast.Mod) and rv != 0:
+                    return lv % rv
+                if isinstance(node.op, ast.BitAnd):
+                    return lv & rv
+                if isinstance(node.op, ast.BitOr):
+                    return lv | rv
+                if isinstance(node.op, ast.BitXor):
+                    return lv ^ rv
+            except Exception:
+                return _MISSING
     return _MISSING
 
 
@@ -607,6 +636,10 @@ def _compare_pair(left: ast.expr, op: str, right: ast.expr, var: str,
         return _order_atom(op, c, ctx)
     if _is_var(right, var) and not _mentions(left, var):
         c = _const(left)
+        if c is _MISSING and op in ("in", "not in") and isinstance(left, ast.Tuple):
+            items = _const_items(left)
+            if items is not None:
+                c = tuple(items)
         if c is _MISSING:
             return None
         if op in ("in", "not in"):
@@ -747,7 +780,7 @@ class Domain:
             return False
         if isinstance(v, bytes) and not self.lex[1].admits(v):
             return False
-        if _tag(v) == "other":
+        if _tag(v) in ("str", "bytes", "other"):
             try:
                 n = len(v)
             except TypeError:

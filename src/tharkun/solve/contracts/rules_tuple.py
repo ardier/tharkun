@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from tharkun.solve.contracts._helpers import dunder_propagation_claims
 from tharkun.solve.contracts.rules import Rule, register_rule
-from tharkun.solve.contracts.types import Contract, Effects, ReturnSpec
+from tharkun.solve.contracts.types import Contract, Effects, ReturnSpec, RaiseArgsCase, ScopedArgsRaiseClaim
 
 _DOCS = "https://docs.python.org/3.14/library/stdtypes.html#tuple"
 
@@ -75,19 +75,24 @@ class TupleGetitem(Rule):
     names = ("tuple.__getitem__",)
     CONTRACT = Contract(
         qualname="tuple.__getitem__",
-        raises=dunder_propagation_claims(
+        raises=tuple(ScopedArgsRaiseClaim(c.exc,c.condition,c.tested,args_cases=(
+            RaiseArgsCase('native-bounds','exact builtin receiver and exact int/bool key representable as Py_ssize_t, outside -len(self) <= key < len(self)',
+                          ('tuple index out of range',),True),
+            RaiseArgsCase('oversized-int','exact builtin receiver and exact int key outside Py_ssize_t range; conversion fails before length adjustment',
+                          ("cannot fit 'int' into an index-sized integer",),True),
+        )) if c.exc=='IndexError' else c for c in dunder_propagation_claims(
             "the key argument's __index__ (for an int key)",
             native={
                 "TypeError": "key is neither an int-like object (has __index__) nor a slice",
-                "IndexError": "key is an int-like index outside [-len(self), len(self))",
+                "IndexError": "integer conversion does not fit Py_ssize_t, or converted index is outside [-len(self), len(self)), or key.__index__ raises IndexError",
             },
             tested_native=frozenset({"TypeError", "IndexError"}),
-        ),
+        )),
         may_raise_other=True,
         returns=ReturnSpec("the element type, or tuple for a slice key", tested=True),
         effects=Effects(deterministic=True),
         notes="a slice key never raises IndexError -- out-of-range bounds are clamped, same as list.__getitem__.",
-        source=(_DOCS, "CPython Objects/tupleobject.c::tuplesubscript"),
+        source=(_DOCS, "https://github.com/python/cpython/blob/3.14/Objects/tupleobject.c", "CPython 3.14::tuplesubscript"),
         tested=True,
     )
 

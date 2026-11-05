@@ -52,8 +52,9 @@ import time
 import tokenize
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from tharkun.solve.environment import TaskEnvironment, TaskMetadataError, argv_candidates, proof_blocker
+from tharkun.solve.environment import BOX_HOME, stdin_bytes, TaskEnvironment, TaskMetadataError, argv_candidates, proof_blocker
 from tharkun.solve.extern import native_import_reason
+from tharkun.solve.static_code import proof_import_reason
 
 CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_child.py")
 
@@ -312,11 +313,17 @@ def local_import_files(program: str, limit: int = 64) -> tuple[str, ...] | None:
     return tuple(found)
 
 
-def withhold_true(v: "Verdict", shadowed) -> None:
-    """Turn a TRUE that a shadowed property name makes indefinite into UNKNOWN, removing the correctness
-    witness files this run wrote for it (``proof.finish`` records them in ``detail``)."""
+def import_state_reason(reason: str) -> str:
+    """The UNKNOWN reason for a TRUE withheld because the program observes import state ([internal ref]); no verdict words."""
+    return f"the program observes import state the model does not reproduce natively: {reason}"
+
+
+def withhold_true(v: "Verdict", shadowed, reason: str | None = None) -> None:
+    """Turn a TRUE that a shadowed property name -- or, through ``reason``, unmodelled import state -- makes indefinite
+    into UNKNOWN, removing the correctness witness files this run wrote for it (``proof.finish`` records them in
+    ``detail``)."""
     v.detail.update(withheld_component=v.component, shadowed_property_names=list(shadowed))
-    v.verdict, v.reason, v.component = "unknown", shadow_reason(shadowed), "none"
+    v.verdict, v.reason, v.component = "unknown", reason or shadow_reason(shadowed), "none"
     removed = []
     for key in ("witness_path", "obligations_path", "store_witness_path"):
         path = v.detail.pop(key, None)
@@ -729,6 +736,12 @@ class Outcome:
     ranges: list = field(default_factory=list)   # [position in draws, a, b] (float.hex, call order) of each nondet_float_range call
     #: module names ``import`` asked for that no finder had in this run (``_child.py::watch_imports``, [internal ref])
     absent_imports: list = field(default_factory=list)
+    #: the box's touch record ([internal ref], ``environment.world_record``): the undeclared paths a boxed run touched
+    #: and the answer it got, in touch order (``[]`` outside the box).
+    world: list = field(default_factory=list)
+    #: trusted native line observation requested by inputs' reach-and-return replay ([internal ref])
+    reached: bool = False
+    observations: list = field(default_factory=list)
 
     def violated(self, classes) -> str | None:
             # invalid_draw: matches eregion_sv.replay.violates() -- a run that ever drew
@@ -772,18 +785,28 @@ def _cap_memory(limit_bytes: int | None):
 
 def run_once(python: str, program: str, vector: list, *, timeout: float,
              hashseed: int = 0, memory_bytes: int | None = None, files=None,
-             observe_fields=None, minimal_env: bool = False) -> Outcome:
+             observe_fields=None, minimal_env: bool = False, box: bool = False, observe_line=None, world=None, native: bool = False,
+             observe_invariants=()) -> Outcome:
     """One run of ``program`` in a fresh interpreter, replaying ``vector``; the child's
     address space is capped at ``memory_bytes`` when given. Validator replay uses
-    only PATH and explicit Python runtime controls, without inherited user-site imports."""
+    only PATH and explicit Python runtime controls, without inherited user-site imports.
+    ``box`` ([internal ref]) requests the boxed model (``environment.install_files``): the request
+    carries it for the child, the child's HOME/XDG dirs are the fixed, absent
+    ``environment.BOX_HOME`` -- never the random scratch path -- and the run's touch record
+    comes back in :attr:`Outcome.world`. ``native`` runs without execution models and carries up to 1 MiB
+    of assertion evidence for inputs' observation confirmation; it is never used by SV verification."""
     with tempfile.TemporaryDirectory(prefix="tharkun-sv-") as tmp:
         req = os.path.join(tmp, "req.json")
         out = os.path.join(tmp, "out.json")
         try:
             with open(req, "w") as fh:
                 json.dump({"program": os.path.abspath(program), "vector": vector, "out": out,
-                           "observe_fields": observe_fields,
-                           **({"files": files} if files is not None else {})}, fh)
+                           "observe_fields": observe_fields, "observe_line": observe_line,
+                           **({"observe_invariants": observe_invariants} if observe_invariants else {}),
+                           **({"native": True} if native else {}),
+                           **({"files": files} if files is not None else {}),
+                           **({"world": world} if world is not None else {}),
+                           **({"box": True} if box else {})}, fh)
         except (OSError, ValueError):
             return Outcome("crashed", msg="cannot encode draw vector")
         env = ({"PATH": os.environ.get("PATH", os.defpath), "PYTHONNOUSERSITE": "1"}
@@ -791,13 +814,27 @@ def run_once(python: str, program: str, vector: list, *, timeout: float,
                {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONSTARTUP")})
         env["PYTHONHASHSEED"] = str(hashseed)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        if box:
+            env.update({"HOME": BOX_HOME, "XDG_CONFIG_HOME": BOX_HOME + "/.config",
+                        "XDG_DATA_HOME": BOX_HOME + "/.local/share", "XDG_CACHE_HOME": BOX_HOME + "/.cache",
+                        "XDG_STATE_HOME": BOX_HOME + "/.local/state"})
+        stdin_file = None
+        content = stdin_bytes(world) if box else None
+        if content is not None:
+            stdin_file = tempfile.TemporaryFile()
+            stdin_file.write(content)
+            stdin_file.seek(0)
         t0 = time.monotonic()
         try:
-            proc = subprocess.run([python, CHILD, req], cwd=tmp, env=env, stdin=subprocess.DEVNULL,
+            proc = subprocess.run([python, CHILD, req], cwd=tmp, env=env,
+                                  stdin=stdin_file if stdin_file is not None else subprocess.DEVNULL,
                                   capture_output=True, text=True, timeout=timeout,
                                   preexec_fn=_cap_memory(memory_bytes))
         except subprocess.TimeoutExpired:
             return Outcome("timeout", seconds=time.monotonic() - t0)
+        finally:
+            if stdin_file is not None:
+                stdin_file.close()
         secs = time.monotonic() - t0
         if proc.returncode != 0 or not os.path.exists(out):
             return Outcome("crashed", msg=(proc.stderr or "")[-500:], seconds=secs)
@@ -810,7 +847,8 @@ def run_once(python: str, program: str, vector: list, *, timeout: float,
             return Outcome("crashed", msg="unreadable run record", seconds=secs)
     return Outcome(r["status"], r.get("exc"), r.get("mro", []), r.get("msg", ""), r.get("site"),
                    r.get("draws", []), r.get("flags", []), secs, r.get("class_hints", {}),
-                   r.get("invalid_draw", False), r.get("ranges", []), absent_imports=r.get("absent_imports", []))
+                   r.get("invalid_draw", False), r.get("ranges", []), absent_imports=r.get("absent_imports", []),
+                   world=r.get("world", []), reached=r.get("reached", False), observations=r.get("observations", []))
 
 
 def _resource_exhausted(out: Outcome) -> bool:
@@ -842,10 +880,16 @@ class Verdict:
 
 
 def _witness(program: str, prop_name: str, exc: str, out: Outcome) -> dict:
-    return {"format": "sv-py-witness/1", "task": os.path.abspath(program), "property": prop_name,
+    record = {"format": "sv-py-witness/1", "task": os.path.abspath(program), "property": prop_name,
             "exception": exc, "site": out.site,
             "vector": [{k: v for k, v in d.items() if k not in ("site", "start", "step")} for d in out.draws],
             "producer": "tharkun-sv"}
+    if out.world:
+        record.update(format="tharkun-mocked-witness/1", provenance="obtained via mocking",
+                      review_required=True, world={(BOX_HOME + p[1:] if p == "~" or p.startswith("~/") else p): obj
+                                                   for p, obj in out.world if isinstance(obj, dict)},
+                      world_touches=out.world)
+    return record
 
 
 def _cpu_seconds() -> float:
@@ -970,7 +1014,10 @@ def _static_proof(program: str, classes, remaining, say, files=None, invariant_l
 
     Without a ``table`` (a unit test of one prover) the stage reads and writes nothing."""
     try:
-        blocker = proof_blocker(read_source(program), TaskEnvironment(tuple(files or [program])), filename=program)
+        source = read_source(program)
+        environment = TaskEnvironment(tuple(files or [program]),
+                                      world=table.world_store() if table is not None else None)
+        blocker = proof_blocker(source, environment, filename=program, world_reads=True)
         if blocker:
             say(f"environment: static proof open ({blocker})")
             return None
@@ -981,7 +1028,7 @@ def _static_proof(program: str, classes, remaining, say, files=None, invariant_l
         from tharkun.sv.prove import prove_static
     except (ImportError, AttributeError):
         prove_static = None
-    if prove_static is not None:
+    if prove_static is not None and not proof_blocker(source, environment, filename=program):
         try:
             v = prove_static(program, classes, remaining=remaining, log=say, files=files)
         except Exception as e:  # noqa: BLE001 -- a proof that crashes proves nothing
@@ -994,10 +1041,15 @@ def _static_proof(program: str, classes, remaining, say, files=None, invariant_l
     except (ImportError, AttributeError):
         return None
     try:
-        source = read_source(program)
+        import hashlib
+        import io
+        raw = read_source_bytes(program)
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+        source = raw.decode(encoding)
+        primary_source = dict(path=os.path.abspath(program), sha256=hashlib.sha256(raw).hexdigest())
         r = absint_prove(source, tuple(classes), filename=program,
                          time_budget=max(1.0, min(60.0, remaining() * 0.1)),
-                         environment=TaskEnvironment(tuple(files or [program])),
+                         environment=environment,
                          class_hints=table.class_hints() if table is not None else None,
                          invariant_locations=invariant_locations)
     except Exception as e:  # noqa: BLE001
@@ -1012,7 +1064,9 @@ def _static_proof(program: str, classes, remaining, say, files=None, invariant_l
         lem = f"; lemmas {', '.join(lemmas)}" if lemmas else ""
         return Verdict("true", reason=f"absint proof: {len(r.sites)} checks{lem}", component=r.component,
                        detail={"sites": r.sites, "lemmas": lemmas,
-                               "candidate_invariants": getattr(r, "invariants", [])})
+                               "candidate_invariants": getattr(r, "invariants", []),
+                               "source_closure": [primary_source, *getattr(r, 'source_closure', [])],
+                               "source_imports": getattr(r, 'source_imports', [])})
     say(f"absint: UNKNOWN ({r.reason})")
     if table is not None:
         _write_absint_candidates(table.kb, getattr(r, "invariants", None))
@@ -1027,8 +1081,15 @@ def verify(program: str, classes, *, prop_name: str = "", python: str | None = N
            early_stop_seconds: float = 60.0, stages=None, log=None, lazy_vectors: int = 4, lazy_seconds: float = 2.0,
            task: str | None = None, specification: str | None = None, witness_dir=None,
            language_version: str | None = None,
-           checker_seconds: float = 3.0, cpu_time_only: bool = False, store_witness: bool = True) -> Verdict:
+           checker_seconds: float = 3.0, cpu_time_only: bool = False,
+           wall_clock: bool = False, store_witness: bool = True,
+           seed_vectors=(), box: bool = False, world=None) -> Verdict:
     """Decide ``! uncaught(E)`` for every ``E`` in ``classes`` on ``program``.
+
+    ``seed_vectors`` ([internal ref]) are whole draw vectors a caller already knows to be interesting (``tharkun.inputs``'
+    ``reach`` rung: a run that reached a hint target): the hybrid stage starts its corpus from them and the
+    enumeration ranks their values right after each kind's head (``scheduler.py::run``).  Proposals only, like
+    every candidate: they change what is tried first, never a verdict.
 
     ``budget_seconds`` is CPU time of the verifier and its children (what BenchExec
     limits), also used as a wall-clock cap unless ``cpu_time_only`` is set; ``jobs``
@@ -1036,6 +1097,10 @@ def verify(program: str, classes, *, prop_name: str = "", python: str | None = N
     task's own ``.yml`` (declared/required files, [internal ref]'s shared I/O model) -- default
     ``None`` derives it from ``program`` (:class:`~tharkun.solve.environment.
     TaskEnvironment.from_task`).
+
+    ``box`` ([internal ref]) marks this verification as boxed (files mocked unless supplied,
+    ``environment.install_files``): it travels to the confirmation replay below and to every
+    :func:`run_once` reached through it.  The default ``False`` is the SV-COMP model, unchanged.
 
     ``cpu_time_only`` is a TEST SEAM, not a runtime option ([internal ref]): it exists so a test
     asserting a fully deterministic outcome (one concrete run, genuine CPU cost a
@@ -1059,6 +1124,8 @@ def verify(program: str, classes, *, prop_name: str = "", python: str | None = N
     environment within the whole call's remaining CPU and wall budget. A failed or
     unaffordable confirmation returns UNKNOWN without an exportable witness.
     """
+    if world is not None and not box:
+        raise ValueError("world search requires box=True")
     from tharkun.sv.scheduler import run as _run
     started, cpu_started = time.monotonic(), _cpu_seconds()
     v = _run(program, classes, prop_name=prop_name, python=python, budget_seconds=budget_seconds,
@@ -1067,7 +1134,9 @@ def verify(program: str, classes, *, prop_name: str = "", python: str | None = N
                prove=prove, canary_seconds=canary_seconds, early_stop_seconds=early_stop_seconds,
                stages=stages, log=log, lazy_vectors=lazy_vectors, lazy_seconds=lazy_seconds,
                task=task, specification=specification, witness_dir=witness_dir, language_version=language_version,
-               checker_seconds=checker_seconds, cpu_time_only=cpu_time_only, store_witness=store_witness)
+               checker_seconds=checker_seconds, cpu_time_only=cpu_time_only, wall_clock=wall_clock,
+               store_witness=store_witness, seed_vectors=seed_vectors,
+               **({"box": True} if box else {}), **({"world": world} if world is not None else {}))
     if v.verdict == "true":
         # scheduler.run already withholds these; this keeps any other route to TRUE from bypassing it
         try:
@@ -1077,15 +1146,22 @@ def verify(program: str, classes, *, prop_name: str = "", python: str | None = N
                 shadowed.update(classes)
             for module in local_modules or ():
                 shadowed.update(shadowed_property_names(read_source(module), classes))
+            source = read_source(program)
         except (OSError, UnicodeDecodeError, ValueError):
-            shadowed = set(classes)
-        if shadowed:
-            withhold_true(v, tuple(sorted(shadowed)))
+            shadowed, source = set(classes), None
+        native_reason = proof_import_reason(source, program) if source is not None else "unreadable program"
+        if shadowed or native_reason:
+            why = [r for r in (shadow_reason(tuple(sorted(shadowed))) if shadowed else None,
+                               import_state_reason(native_reason) if native_reason else None) if r]
+            withhold_true(v, tuple(sorted(shadowed)), reason="; ".join(why))
     if v.verdict != "false":
         return v
-    left = budget_seconds - (_cpu_seconds() - cpu_started)
-    if not cpu_time_only:
-        left = min(left, budget_seconds - (time.monotonic() - started))
+    if wall_clock:
+        left = budget_seconds - (time.monotonic() - started)
+    else:
+        left = budget_seconds - (_cpu_seconds() - cpu_started)
+        if not cpu_time_only:
+            left = min(left, budget_seconds - (time.monotonic() - started))
     reason = "violation witness failed validator replay"
     confirmed = False
     if left > 0 and isinstance(v.witness, dict) and v.exception:
@@ -1093,7 +1169,7 @@ def verify(program: str, classes, *, prop_name: str = "", python: str | None = N
         try:
             confirmed, _ = replay(program, v.witness, (v.exception,), python=python,
                                   timeout=min(run_timeout, left), task=task,
-                                  language_version=language_version,
+                                  language_version=language_version, box=box,
                                   memory_bytes=run_memory_bytes // (jobs or default_jobs())
                                   if run_memory_bytes else None)
         except (OSError, ValueError, TypeError, KeyError):
@@ -1101,8 +1177,11 @@ def verify(program: str, classes, *, prop_name: str = "", python: str | None = N
     elif left <= 0:
         reason = "violation witness validator replay has no remaining budget"
     v.seconds = time.monotonic() - started
-    if confirmed and (_cpu_seconds() - cpu_started >= budget_seconds
-                      or not cpu_time_only and v.seconds >= budget_seconds):
+    exceeded = (v.seconds >= budget_seconds) if wall_clock else (
+        _cpu_seconds() - cpu_started >= budget_seconds
+        or not cpu_time_only and v.seconds >= budget_seconds
+    )
+    if confirmed and exceeded:
         confirmed = False
         reason = "violation witness validator replay exhausted task budget"
     if not confirmed:
@@ -1134,7 +1213,8 @@ def _replayed(vector: list, out: Outcome) -> bool:
 
 def replay(program: str, witness: dict, classes, *, python: str | None = None,
            timeout: float = 120.0, task: str | None = None,
-           language_version: str | None = None, memory_bytes: int | None = None) -> tuple[bool, Outcome]:
+           language_version: str | None = None, memory_bytes: int | None = None,
+           box: bool = False) -> tuple[bool, Outcome]:
     """Validate a witness: does its vector make ``program`` raise a property class, AND does
     the run actually consume exactly that vector (:func:`_replayed`)? Always use a fresh
     child with PYTHONHASHSEED=0, stdin=/dev/null and a minimal environment, including for
@@ -1142,9 +1222,12 @@ def replay(program: str, witness: dict, classes, *, python: str | None = None,
     environment, reason = admit_task(program, task=task, python=python, language_version=language_version)
     if reason:
         return False, Outcome("unsupported-runtime", msg=reason)
+    if ("world" in witness or witness.get("review_required")) and not box:
+        return False, Outcome("invalid-draw", msg="mocked file content is not SV witness evidence")
     vector = witness.get("vector", [])
     if not isinstance(vector, list):
         return False, Outcome("crashed", msg="witness vector is not a list")
     out = run_once(python or sys.executable, program, vector, timeout=timeout,
-                   hashseed=0, minimal_env=True, memory_bytes=memory_bytes, files=environment.files)
+                   hashseed=0, minimal_env=True, memory_bytes=memory_bytes, files=environment.files, box=box,
+                   **({"world": witness["world"]} if box and "world" in witness else {}))
     return _replayed(vector, out) and out.violated(classes) is not None, out

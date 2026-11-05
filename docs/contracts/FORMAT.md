@@ -1,12 +1,12 @@
-# Stdlib contract format ([internal ref])
+# Stdlib contract format (#1070)
 
 ## Current entry points
 
-The current verifier consumers and trust boundaries are in the source under `src/tharkun/sv/` and
-`src/tharkun/solve/contracts/`. The registry and adapters are executable source;
+Use the [proof/contract seam map](../AGENT_REFERENCE.md#proof-and-contract-fast-entry) for the
+current verifier consumers and trust boundaries. The registry and adapters are executable source;
 `tests/contracts/frozen/<qualname>.json` records the per-callable consumer audit and digest.
 Read `python -m tests.contracts._frozen summary` or `render` to inspect that inventory without
-regenerating it. The batch-one descriptions and the contracts report (not part of this release) retain their historical
+regenerating it. The batch-one descriptions and [REPORT.md](REPORT.md) retain their historical
 scope; they do not mean that the current adapters are unwired.
 
 ## Decision
@@ -102,6 +102,41 @@ with no corresponding test as a bug in the batch, not a loophole.
 
 ## Loader API
 
+### Function-entry raising inventory
+
+**Ruled 2026-10-29:** [Static exception sites](../EXCEPTION_SITES.md) owns the
+shared ORIGINAL-source inventory and the built entry/census views.
+`adapters.exception_sites.condition_table` projects
+the existing `safety.cases` into JSON-safe typed domains, exact conditions and
+explicit projection gaps. Safe cases are retained; English claims are not
+parsed and unavailable Python projections are not weakened. The source builder
+is `solve.exception_sites`; `census.site_census` keeps its audited closed-program
+coverage boundary and `raise_sites.entry_raise_sites` is an unordered witness
+projection. Only Eregion owns evaluation DFS and call-path contexts.
+
+Conditional unknown rows use the complement of existing `safety.admission`,
+or canonical true when no machine cases exist. `unknown: true` and null
+`raises`/`condition` never denote false. The contract's other-family wildcard
+has `excluded_classes` for named claim families, each independently covered by
+exact cases, explicit unknown cases, or tested never claims. Unresolved dispatch
+has no family exclusions. See EXCEPTION_SITES.md for receiver applicability and
+the requirement to prove an unknown domain false before discharging it.
+
+`src/tharkun/solve/raise_sites.py::entry_raise_sites` projects the shared source inventory's registry-backed
+`safety.cases`, and publishes each concrete contract exception class with its
+operand expressions, source span, canonical condition and checked Python predicate. An unshadowed builtin
+catch superclass selects the contract subclasses it catches (`Exception` includes `TypeError`; `LookupError`
+includes `KeyError` and `IndexError`). This is a static may-raise inventory, never a reachability or absence proof.
+One- and two-positional-argument builtin calls retain native operand order; shadowing, starred and keyword calls
+remain unresolved dispatches.
+
+`src/tharkun/solve/contracts/safety/rules_builtins.py::classcheck_cases` supplies a scoped TypeError domain for
+`isinstance` and `issubclass`: both operands must have exact type int, bool, float or str. The second operand
+cannot be classinfo and neither operand can run a user hook. Valid classes, tuple/union classinfo and all other
+types remain outside this template. `safety.__init__._case_builders` registers these builders next to len and int;
+the inventory consumes the same condition that safety consumers use. Native parity and exclusions are pinned by
+`tests/contracts/test_safety_builtin_templates.py` and `tests/test_entry_raise_sites.py`.
+
 `src/tharkun/solve/contracts/registry.py`:
 
 ```python
@@ -126,7 +161,7 @@ overwrite.
   where a callable's behavior forks on argument shape, the contract's `condition`
   strings say so per-claim rather than the schema growing an argument-shape dimension.
 
-## `protocol.NAME` qualnames (batch 2, [internal ref])
+## `protocol.NAME` qualnames (batch 2, #1070)
 
 Batch 1's `qualname`s all name a concrete callable (`"len"`, `"list.pop"`,
 `"math.sqrt"`). Batch 2 adds contracts for the DISPATCH MECHANISMS behind Python's
@@ -227,7 +262,7 @@ consumption (a `for`, `list()`) owns that half (`protocol.iteration`). The const
 `list`/`tuple`/`set` consume at the call, so their `mutates_args` names the iterator argument
 that is advanced.
 
-## Shape contracts ([internal ref])
+## Shape contracts (#1082)
 
 A contract is the union over a callable's call shapes. When one SHAPE has a much stronger, still exact
 contract than the union, it is registered under its own qualname instead of weakening the union or
@@ -281,11 +316,11 @@ table (through `adapters/absint.py` and `adapters/concolic.py`), so the two engi
 the same way and can exchange facts. Every entry is pinned against CPython by a test, and an entry is
 usable only while the registry holds a TESTED contract for the name.
 
-## Rules and visitors (`rules.py`, [internal ref]): the shape of the whole registry
+## Rules and visitors (`rules.py`, #1126): the shape of the whole registry
 
 A contract is data; which engine understands which callable used to be scattered across per-engine adapters and
 hand tables. `src/tharkun/solve/contracts/rules.py` gives the registry one structure, for ALL contracts (owner:
-"all contracts or none"; the existing 234 migrate onto it as one effort, [internal ref]):
+"all contracts or none"; the existing 234 migrate onto it as one effort, #1133):
 
 * a **`Rule`** is ONE callable's rule (or one member of a parametrized family: `str.split`/`str.rsplit`, the `math`
   functions; `names` lists the qualnames the class covers and `register_rule` makes one instance per qualname). It
@@ -335,11 +370,11 @@ Ruled, so that consumers read rule-keyed facts from the run's store instead of c
   wants a fact to count nominates an `invariant_candidate` (`sv/eregion_bridge.py::publish_fact`) whose parents are its
   `rule_fact` keys, and the independent checker certifies it. What a fact stands on is the contract claim it applied --
   justified by the claim-level `tested` flag and the CPython 3.14.4 tests, recorded in `assumes` -- never by an engine's say-so.
-* **Order of work.** First the behaviour-preserving refactor ([internal ref]: the registry onto `Rule`, each engine adapter becoming
+* **Order of work.** First the behaviour-preserving refactor (#1133: the registry onto `Rule`, each engine adapter becoming
   the body of a `visit_<kind>`, byte-identical verdicts on Real-world 80, Solve-only 65, the toys and the fixtures, no new
   semantics); only then the publication, kind by kind, each with its own gate.
 
-### Migration status ([internal ref])
+### Migration status (#1133)
 
 The existing contracts moved onto rules in behaviour-preserving steps: the `Contract` objects are byte-identical
 (`tests/contracts/test_registry_digest.py` compares a canonical, hash-seed independent SHA-256 of every contract with
@@ -363,24 +398,25 @@ The engine visits are `solve/absint/visitor.py::AbsintVisitor`,
 `sv/symexec_visitor.py::SymexecVisitor`, and
 `solve/contracts/visitors.py::CensusVisitor`, `solve/contracts/visitors.py::StationaryVisitor`,
 `solve/contracts/visitors.py::AvengersVisitor`, `solve/contracts/visitors.py::DrawsVisitor`,
-`solve/contracts/visitors.py::ProductVisitor` and `solve/contracts/visitors.py::EregionVisitor`.
-The last two explicitly refuse all contracted calls. Existing adapter import paths
-remain stable for SET ([internal ref]) and CTF ([internal ref]); transfer functions and tested gates are unchanged.
+`solve/contracts/visitors.py::ProductVisitor`, `solve/contracts/visitors.py::EregionVisitor` and
+`solve/preimage/visitor.py::PreimageVisitor` (the backward engine, below). ProductVisitor and EregionVisitor
+explicitly refuse all contracted calls. Existing adapter import paths
+remain stable for SET (#1135) and CTF (#1134); transfer functions and tested gates are unchanged.
 `tests/contracts/_engine_audit.py::measure` starts with `rules.py::Visitor.cell` and refines it with runtime probes:
 C with consumption stays C; C never consumed is X; runtime refusal stays R/G;
 R handled by an existing hand model is M. A runtime C without a visit fails the audit.
 Samples and wrong-arity twins live on each rule through `rules.py::Rule.sample` and `rules.py::Rule.twin`.
 
-The original [internal ref] migration pinned the canonical registry with SHA-256 `23aa2f868ef54381b48589ef49200f55aa5e1eb7c70119e487e2444000a22462`.
+The original #1133 migration pinned the canonical registry with SHA-256 `23aa2f868ef54381b48589ef49200f55aa5e1eb7c70119e487e2444000a22462`.
 
-SET ([internal ref]) removed the temporary `solve/contracts/set_.py` view (and `rules_set.py::CONTRACTS`) and added the 24 set rules to
+SET (#1135) removed the temporary `solve/contracts/set_.py` view (and `rules_set.py::CONTRACTS`) and added the 24 set rules to
 `solve/contracts/rules_set.py`; absint consumes them through `solve/absint/visitor.py` (`visit_set_*`). The registry checkpoint
 `test_full_registry_sha256_matches_string_family_plus_set_family_checkpoint` pins SHA-256 `ebf8de2321ddb5938a6b4d0adad6a582ddcd3516c73798f2b1e9d0834e2ea87c`: the string-family
 registry plus those 24 rules (every earlier digest is unchanged).
-CTF ([internal ref]) keeps `sv/_symexec.py` in use and may need an ordinary merge there;
+CTF (#1134) keeps `sv/_symexec.py` in use and may need an ordinary merge there;
 `sv/symexec_visitor.py::CallCtx` is its stable contract visit context.
 
-## Whole string, formatting and regex family ([internal ref])
+## Whole string, formatting and regex family (#1126)
 
 `src/tharkun/solve/contracts/rules_str.py` contains all 47 public string methods,
 plus string containment, indexing and `__format__`. Percent formatting belongs to
@@ -389,9 +425,12 @@ plus string containment, indexing and `__format__`. Percent formatting belongs t
 functions and every public `Pattern`/`Match` method belong to `rules_re.py`.
 Each has its own Rule class and visitor kind, with the existing registry API.
 
-`solve/absint/visitor.py::AbsintVisitor._native_string` enumerates at most 64 combinations of finite,
-callback-free builtin operands using `absint/native.py::concrete` and `product`.
-`native.py::abstract` keeps exact string contents (and therefore exact lengths),
+`solve/absint/visitor.py::AbsintVisitor._native_string` enumerates finite combinations of
+callback-free builtin operands using `absint/native.py::concrete` and `product`, sharing the
+analysis deadline and one per-analysis optional expansion-work allowance.
+Work exhaustion discards the whole concrete result and delegates to the existing abstract
+transfer; CPU or memory exhaustion refuses. No prefix can establish a property.
+`native.py::abstract` joins string contents (widening to arbitrary strings when needed),
 integer results, tuple identity and capture objects. Dict key sets must agree;
 unsupported bytes results and unknown heap/object values receive named refusals.
 A `finditer` result is an `IteratorObj`, not a list; consumption remains the
@@ -407,7 +446,14 @@ and substring membership have exact constraints with Python start/end normalizat
 negative bounds and empty prefixes. Empty-spec formatting of symbolic strings and
 integers is exact; integer paths respect `sys.get_int_max_str_digits`. CPython 3.14.4 applies !s/!r/!a before evaluating nested specs; both AST executors visit the conversion rule before the spec, then FormattedValue with the already converted value. JoinedStr
 concatenates only already formatted strings. Other symbolic formats and regexes
-have a refusal naming the rule and the missing exact encoding.
+have no exact encoding. Since #1170 PR4 (#1189) a `_Runner` CONCRETIZES them
+(`sv/symexec_visitor.py::SymexecVisitor._concretize`). Each symbolic str/int operand takes its value in a model of the
+current path, the path is restricted to that value, and the call folds natively. The run is then an
+under-approximation: a `sat` is a candidate replayed like any other, a site it misses is `unknown` (never
+`unsat`/`unreached`, `sv/_symexec.py::solve_targets`), and `run_exact` refuses it as inexact, so no proof leans on
+a dropped path. Operands that are not symbolic str/int terms (a list of symbolic parts for `join`) keep the refusal
+naming the rule. Choosing the concrete value from the preimage of the site's demand, instead of the path's model, is
+ruled, not built. Compiled `re.Pattern` module globals are exact constants of the run.
 `sv/_symexec.py::_Exec.ev_Call` checks module/builtin identities and admits native
 import aliases and unbound str calls; `sv/_symexec.py::_Runner._contract_call` defers these calls
 so each visitor receives evaluated operands. Target callback objects are never
@@ -485,18 +531,531 @@ RegexFlag constants retain readonly enum alternatives alongside their integer vi
 
 Fixed flag checks also pin arithmetic/pattern entry points, aliases and NOFLAG truth testing in `tests/contracts/test_string_rules.py::test_fixed_regexflag_arithmetic_and_pattern_entrypoints` and `tests/contracts/test_string_rules.py::test_fixed_regexflag_alias_and_zero_never_prove_wrong_assertions`.
 
-The RegexFlag preservation is also the legacy main soundness fix [internal ref]: native `~re.IGNORECASE` is 509, while plain sv_2027 proved the false `== -3` assertion TRUE. The corrected numeric/enum overapproximation leaves it unproven. Exact main/head controls and loaded-module provenance are committed in `docs/contracts/evidence/1126/flag1143-main.json` and `flag1143-head.json`; the prior code fix is `79af6a2`, followed by a [internal ref] evidence/provenance commit without rewriting pushed history.
+The RegexFlag preservation is also the legacy main soundness fix #1143: native `~re.IGNORECASE` is 509, while plain sv_2027 proved the false `== -3` assertion TRUE. The corrected numeric/enum overapproximation leaves it unproven. Exact main/head controls and loaded-module provenance are committed in `docs/contracts/evidence/1126/flag1143-main.json` and `flag1143-head.json`; the prior code fix is `79af6a2`, followed by a #1143 evidence/provenance commit without rewriting pushed history.
 
-[internal ref] also preserves readonly enum module constants in `sv/_symexec.py::_Exec.ev_Attribute`. `sv/_symexec.py::_num` projects a RegexFlag only when a numeric operation needs an int, matching unary plus through aliases/parameters. `_Exec.ev_BinOp` refuses a symbolic enum-producing bitwise result before discarding its identity. Direct authored-AST/native controls in `tests/contracts/test_string_rules.py::test_symbolic_regexflag_module_constants_keep_enum_identity`, `test_symbolic_unary_plus_removes_regexflag_enum_identity` and `test_symbolic_regexflag_bitwise_result_refuses_without_enum_encoding` cover these sibling paths.
+#1143 also preserves readonly enum module constants in `sv/_symexec.py::_Exec.ev_Attribute`. `sv/_symexec.py::_num` projects a RegexFlag only when a numeric operation needs an int, matching unary plus through aliases/parameters. `_Exec.ev_BinOp` refuses a symbolic enum-producing bitwise result before discarding its identity. Direct authored-AST/native controls in `tests/contracts/test_string_rules.py::test_symbolic_regexflag_module_constants_keep_enum_identity`, `test_symbolic_unary_plus_removes_regexflag_enum_identity` and `test_symbolic_regexflag_bitwise_result_refuses_without_enum_encoding` cover these sibling paths.
 
-MG #147 follow-ups (carried by [internal ref]): `adapters/draws.py::range_kwargs` consumes only `adapters/common.py::closed_range_return`, so unrelated draws visits cannot leak boolean support facts as numeric ranges. `sv/_symexec.py::_Exec.ev_Attribute` consumes only math constants; `ev_Call` consumes only math functions and explicitly refuses constant calls as native TypeError. Function-valued attributes remain named Unsupported. `rules_builtins.py::Open` and seven `rules_random.py` classes retain fixed native TypeError arity twins. Contracts and digests are unchanged.
+MG #147 follow-ups (carried by #1126): `adapters/draws.py::range_kwargs` consumes only `adapters/common.py::closed_range_return`, so unrelated draws visits cannot leak boolean support facts as numeric ranges. `sv/_symexec.py::_Exec.ev_Attribute` consumes only math constants; `ev_Call` consumes only math functions and explicitly refuses constant calls as native TypeError. Function-valued attributes remain named Unsupported. `rules_builtins.py::Open` and seven `rules_random.py` classes retain fixed native TypeError arity twins. Contracts and digests are unchanged.
 
-[internal ref] / MG #151: `solve/absint/visitor.py::AbsintVisitor._percent_safe` proves tuple operand shape only for exactly one tuple reference with every other value component bottom. Joining a scalar or static alternative never inherits the tuple's arity facts. `solve/absint/interp.py::Analyzer.static_attr` admits bare native/abstract regex method reads only when that owner-qualified Rule exists; readonly native fields must actually exist on that closed native object and be representable. Other reads refuse by name. Declared methods take precedence over field names, so Match.groups aliases stay callable while Pattern.groups is numeric data. Native flag/slice, str-type and method-tag secondary attribute paths also refuse unmodelled names; list/array paths already whitelist methods and builtin scalar reads refuse. Fixed native TypeError/AttributeError controls and valid aliases in test_string_rules.py; no new random program/native executor.
+#1153 / MG #151: `solve/absint/visitor.py::AbsintVisitor._percent_safe` proves tuple operand shape only for exactly one tuple reference with every other value component bottom. Joining a scalar or static alternative never inherits the tuple's arity facts. `solve/absint/interp.py::Analyzer.static_attr` admits bare native/abstract regex method reads only when that owner-qualified Rule exists; readonly native fields must actually exist on that closed native object and be representable. Other reads refuse by name. Declared methods take precedence over field names, so Match.groups aliases stay callable while Pattern.groups is numeric data. Native flag/slice, str-type and method-tag secondary attribute paths also refuse unmodelled names; list/array paths already whitelist methods and builtin scalar reads refuse. Fixed native TypeError/AttributeError controls and valid aliases in test_string_rules.py; no new random program/native executor.
 
-[internal ref] stack boundaries: `solve/absint/interp.py::Analyzer.subscript_load` translates an unhashable closed native slice tag into named refusal; representable bounds retain their native error obligations. `sv/symexec_visitor.py::SymexecVisitor._native_string` reuses `sv/_symexec.py::Ref._refuse` for direct modelled user-object operands, preserving the existing object-specific reason without invoking target conversions or formatting hooks. Fixed list/dict/nested-list slice bounds and conversion/format visitor siblings are checked in test_string_rules.py. Only the measured absint re.Match.groups audit cell changes R→C; native replay and contract withdrawal stay mandatory.
+#1153 stack boundaries: `solve/absint/interp.py::Analyzer.subscript_load` translates an unhashable closed native slice tag into named refusal; representable bounds retain their native error obligations. `sv/symexec_visitor.py::SymexecVisitor._native_string` reuses `sv/_symexec.py::Ref._refuse` for direct modelled user-object operands, preserving the existing object-specific reason without invoking target conversions or formatting hooks. Fixed list/dict/nested-list slice bounds and conversion/format visitor siblings are checked in test_string_rules.py. Only the measured absint re.Match.groups audit cell changes R→C; native replay and contract withdrawal stay mandatory.
 
-[internal ref] Ref admission uses exact `type(value) is Ref`, since isinstance can consult a target operand's __class__. The fixed hostile __getattribute__ check in test_string_rules.py proves the visitor refuses without any target lookup. Raw before failure and incomplete c21 validation cancellation are retained in the evidence directory.
+#1153 Ref admission uses exact `type(value) is Ref`, since isinstance can consult a target operand's __class__. The fixed hostile __getattribute__ check in test_string_rules.py proves the visitor refuses without any target lookup. Raw before failure and incomplete c21 validation cancellation are retained in the evidence directory.
 
 The same no-target-lookup boundary applies to symbolic string/integer admission in SymexecVisitor._native_string: exact Z3 SeqRef/ArithRef/IntNumRef identities are admitted; unrelated objects refuse without the general isinstance-based _is_sym predicate. Fixed contains/prefix/suffix/bounds/str/format siblings retain this check.
 
 Closed native type admission also uses identity comparisons, preserving refusal without target metaclass hash/equality/lookup. The hostile-metaclass fixed boundary check is retained in test_string_rules.py.
+
+## Preimages (#1170): the backward engine over the same rules
+
+An anchored (`through`) `driver.preimage_candidates` query also proposes boundary members for a regex demand on
+`left + separator + right`. It collects adjacent lengths from source `len(name)`
+comparisons, then asks the existing regex segment generator for those lengths.
+The separator must be one literal character; at most sixteen segment combinations
+are tried, within the existing 4096-character native-check bound. These values
+are candidates, never a narrowed domain or an absence proof. Source guards and
+fresh-process replay still decide each row, and ordinary short members remain
+available. The candidate walk interleaves ordinary and boundary proposals, with
+the ordinary proposal first, so finite row budgets retain the short witnesses. Unanchored queries keep their existing shortest-first behavior. This carries a guard's boundary through split/concatenation rather
+than sampling only the regex's shortest local and domain parts.
+
+`solve/preimage/visitor.py::PreimageVisitor` (engine `"preimage"`) is the ONE backward-propagation capability for the
+str family. For one call whose operands are all known builtin values except one, it answers which values of that
+unknown operand make the result satisfy a demand. A demand (a `Want`) is a small closed vocabulary in
+`solve/preimage/want.py`: `Eq`, `OneOf`, `Truth`, `IsNone`, `Compare`, `Length`, `Prefix`/`Suffix`/`Contains`, regex
+`Member`, `Items` (a list/tuple result), the nominal type atoms `IsInstance` / `IsSubclass` (#1386), and `All`/`AnyOf`/`Not`. It is keyed by the rule's qualname like every other
+visitor (`get_rule(qualname).accept(PreimageVisitor(), ctx)`).
+
+It visits every `rules_str.py` method, `str.__getitem__`/`__contains__`/`__mod__`, the `rules_strformat.py`
+conversions, `len`/`ord`/`chr`/`set`/`str`/`repr`/`ascii`/`format`, str `+`/`*` (`protocol.binary_operator`), the list
+and tuple index rules a split result is read through, and every `rules_re.py` rule.
+`tests/contracts/test_preimage_audit.py` pins that the whole family is `C` and everything else a named refusal.
+
+A visit returns a `Preimage` with two parts:
+* `transfer`: the exact demand on the unknown operand, when the vocabulary can state it. For example, `x.startswith(p)`
+  wanted true is `Prefix(p)`, and `len(x) > 320` is `Length(321, None)`;
+* the candidates: lazy, program literals first, then simplest first, then by length.
+
+A visit can also return a named `Refused`. This happens when an operand is not of a builtin kind
+(`adapters/str_shapes.py` kinds for the str methods; `type(x) is ...` everywhere else), when the unknown is in a
+position the kind does not invert, or for a Match receiver, a callable replacement, or a format spec.
+
+Every candidate is FORWARD-CHECKED before it is yielded: `want.holds(Rule.native(*operands))`, i.e. CPython's own
+semantics on builtin values. The check is bounded by `rules_strformat.py::native_limit`; for regex calls it is bounded
+by `solve/preimage/regex_members.py::check_cost` (no backreference, a work estimate under `WORK_LIMIT`; a nested unbounded repeat is
+charged `2**n` per nesting level and is refused outright above `_NESTED_MAX_LEN` characters). That estimate is a worst
+case over all strings of the length, so a FINITE estimate over `WORK_LIMIT` is not a size cap: `regex_members.py::admitted`
+admits the check when the very same call finishes inside `PROBE_SECONDS` in a forked child killed at the deadline
+(`_probe`; the result is discarded and the parent then makes the call), so python-string-utils `HTML_RE.sub('', s)` is
+checked at 65 and 257 characters (estimate ~1e9 at 33). An infinite estimate (backreference, nested unbounded repeat past
+`_NESTED_MAX_LEN`), a missing `fork`, a failed fork and a probe timeout are refusals (`UNCHECKED`/`None`): the check is not
+made, never made wrongly. `driver.py`'s own `check_cost` guards (the callback-template path) are unchanged. So no target code, no user hook and no catastrophic backtrack runs. A candidate is a witness the caller
+verifies by execution; an empty answer or a refusal is never infeasibility.
+
+`re.sub`/`subn` (module and `re.Pattern`) with a plain-str replacement reverses EVERY replaced occurrence
+(`visitor.py::_regex_sub`): for each pattern member `m` it proposes the observation with all occurrences of the
+replacement text turned into `m`, then first-only and last-only, then single insertions. An observation with several
+replacements (`'top-10-reasons'` from `'top 10 reasons'`, python-string-utils `slugify`) therefore has a preimage that
+restores every separator. Each proposal is still FORWARD-CHECKED natively, so a proposal that does not reproduce the
+observation is dropped; mixed per-occurrence members and a replacement text that also occurs unreplaced are not
+searched (the all-occurrences text is one preimage, not the set of them).
+`zlib.compress`/`zlib.decompress` and `base64.b64encode`/`b64decode`/`urlsafe_b64encode`/`urlsafe_b64decode` have
+standard-library inverse-pair preimages (`visitor.py::_codec`, `_base64_pair`; owner 864: supplied inverses over core
+stdlib facts). The forward check is the stdlib call itself (these modules are not in the contract table's native modules,
+so `Rule.native` is not used): `Eq(stream)` on `compress(HOLE, level, wbits)` proposes `decompress(stream)` bounded to 16 MiB
+(`_inflate`, a decompression bomb gives nothing) and keeps it only if `compress(candidate, level, wbits)` reproduces the
+stream, so a stream made at another level or wbits has NO preimage rather than a wrong one (compress is deterministic, so
+`decompress(stream)` is the only possible preimage). The level and wbits must be known (a refusal otherwise); when the
+LEVEL is the unknown and the data known, every level (-1..9) is tried against the observation. `decompress(HOLE)` proposes
+the data compressed at each level (9 first) and keeps those that decompress back. `b64encode(HOLE)` proposes the strict
+decode (`validate=True`; a non-canonical text such as `b"YR=="` has no preimage); `b64decode(HOLE)` proposes the canonical
+encoding as bytes and as the ASCII str (the text variants that the non-validating decoder would also accept, such as
+embedded non-alphabet bytes, are not enumerated). `altchars` must be known. `bytes.decode` / `str.encode` around them are
+separate steps (both have preimages). Tests: `tests/contracts/test_preimage_zlib_base64.py`.
+`bytes.decode(HOLE, encoding, errors)` (`visitor.py::visit_bytes_decode`; only the receiver may be unknown) proposes
+`str.encode` of each observation seed with the same codec, kept only if it DECODES BACK to the observation with the very same
+`errors`. Codecs are the builtin utf-8/ascii/latin-1/utf-16/utf-32 family and handlers strict/ignore/replace/
+backslashreplace/surrogateescape/surrogatepass; a registered codec or handler is user code and a named refusal, as is an
+unknown or non-str `encoding`/`errors`. Under `strict` the re-encoding is the only preimage. Under `ignore`/`replace`/... it
+is ONE preimage, not all of them: the invalid bytes the handler dropped or replaced are not recoverable from the text and are
+not enumerated; text the codec cannot encode (`'é'` for ascii, a lone surrogate for strict utf-8) has none.
+Tests: `tests/contracts/test_preimage_bytes_decode.py`.
+`unicodedata.normalize(form, HOLE)` (`visitor.py::visit_unicodedata_normalize`; the form must be a literal NFC/NFD/NFKC/NFKD and
+only the text may be unknown) proposes the observation, its full (compatibility) decomposition and, wherever a 1-3 character
+piece of it is the normalization of other code points (`'fi'` of U+FB01, `'A'` of U+FF21, `'\u00e9'` of `'e\u0301'`; the
+table is one cached scan of all code points per form, `_normalization_sources`), that source at one place and at every
+place. Each proposal is FORWARD-CHECKED with `unicodedata.normalize`. normalize is idempotent, so an observation that is not
+itself in the form has NO preimage and the answer is empty. The enumeration is sound, not exhaustive (the remaining
+combinations of sources per position are not generated), so an empty answer for an observation already in the form never
+occurs but a missing source is not a proof it does not exist. Tests: `tests/contracts/test_preimage_unicodedata_normalize.py`.
+`json.loads(HOLE)` and `json.dumps(HOLE, **options)` (`visitor.py::visit_json_loads`, `visit_json_dumps`). `loads`: only the
+text may be unknown and NO keyword is admitted (`cls`, `object_hook`, `parse_*`, `object_pairs_hook` are user code or change the
+result types); it proposes `json.dumps` of each observation seed in the default, compact (`separators=(',', ':')`),
+`ensure_ascii=False` and `indent=2` spellings, each also padded with insignificant whitespace, and keeps a text only if
+`json.loads` returns a value of EXACTLY the seed's types, recursively (`1` vs `1.0` vs `True`, `list` vs `tuple`, int vs str
+keys; `visitor.py::_same_json`), so `Eq(1)` is never answered with `'1.0'`, and tuples, int-keyed dicts, sets, bytes and NaN
+(`nan != nan`) have no preimage; `Infinity` is the extension spelling of `inf`. `dumps`: only the object may be unknown and the
+options `skipkeys`, `ensure_ascii`, `check_circular`, `allow_nan`, `indent`, `separators`, `sort_keys` must be literals;
+`default` and `cls` must be absent or `None` and any other keyword is a named refusal. It proposes `json.loads` of the text and
+keeps it only if dumping with the SAME options reproduces the text, so a text spaced differently from what the options write has
+no preimage. One preimage, the JSON-native value: tuples, int-keyed dicts and subclasses that write the same text are not
+enumerated. `want.py::is_builtin_value` now admits an exact `dict` of builtin keys and values (depth and size bounded), which
+`json.loads` results need; a dict with a subclass key or non-builtin value is still not one. Tests:
+`tests/contracts/test_preimage_json.py`.
+`isinstance(HOLE, T)` (`visitor.py::visit_isinstance`; only the object may be unknown) with `Truth`/`Eq` of a bool demanded.
+`T` is a literal builtin class, a (nested) tuple of them or an `X | Y` union, drawn from `object, bool, int, float, str, bytes,
+list, tuple, dict, NoneType`. The proposals are the program's own pool literals first, then a small canonical set of exact
+builtin values per class (`visitor.py::_ISINSTANCE_CANONICAL`, simplest first); each is FORWARD-CHECKED with `isinstance` itself,
+so `True` is an instance of `int` and is never offered as a non-int. They are canonical values, not every instance, and
+`Truth(False)` for `object` is empty. Any other class (an ABC, a user class, `set`, `complex`, `type`, an exception) is a named
+refusal: building an instance runs `__init__` / `__instancecheck__` / `__subclasshook__`, which is user code. A class defined
+in the same module and constructible without arguments is NOT built here; `solve/condition.py` solves such a guard at the source
+level. Tests: `tests/contracts/test_preimage_isinstance.py`.
+`str.encode(HOLE, codec, errors)` under a LOSSY handler (`visitor.py::visit_str_encode`, `_lossy_encode_sources`). Besides the
+strict decoding of the observation, which is always proposed first, `ignore` also proposes the observation with one character
+the codec cannot encode INSERTED (start, end, then the middle positions up to 32; the canonical set is `_UNENCODABLE`: a CJK and a
+Cyrillic letter, `ss`, an accented letter, `EUR`, a lone surrogate, an emoji, filtered to those the codec really cannot encode, so
+`latin-1` never gets an accented letter and `utf-8` only the lone surrogate); `replace` turns occurrences of the codec's marker
+(`?`) into such a character (all, then each); `xmlcharrefreplace` / `backslashreplace` decode their escapes back to characters.
+Every proposal is FORWARD-CHECKED by `str.encode` itself, which is what keeps this sound; the bytes do not say which characters
+were dropped, so these are SOME preimages (one dropped character), not all, and a chain that needs several, or a particular one, is
+not solved here. `rules_strformat.py::native_limit` now also admits the builtin handlers `xmlcharrefreplace` and `backslashreplace`
+(registered or unknown handler names still give no candidate). Tests: `tests/contracts/test_preimage_str_encode_lossy.py`.
+For `re.escape` with an `Eq` demand on a builtin `str` or `bytes` result, the visitor
+walks the actual stdlib escape table and derives one canonical preimage. Escaped
+newlines, all byte values, Unicode and arbitrary lengths use the same linear
+walk. The one builtin forward check has no regex expansion or format-size window.
+Bytearray, memoryview and inherited string inputs have canonical builtin witnesses;
+custom `translate` results remain a named refusal. The candidate is not an exact
+input-domain transfer, and an empty iterator is not an absence proof.
+
+`solve/preimage/regex_members.py` is a deterministic member generator over `re._parser` trees. It has three modes:
+* shortest first, with every branch keeping its simplest member;
+* exact total length, or exact segment lengths between a literal (`split="@", segments=(64, 255)`);
+* flag-differential members, built to exercise the one node a DOTALL/IGNORECASE/MULTILINE/ASCII difference changes.
+
+It refuses backreferences, conditional groups, lookbehind and `re.LOCALE` by name, and it masks `re.DEBUG` (never
+compiled with). It does not use Hypothesis' random `from_regex`; the #1170 Phase A record shows that a random sample's
+length decided the K5 kills.
+
+`solve/preimage/__init__.py::chain_preimages` composes visits backward along a straight-line chain, for example
+`head.startswith('"')` ← `replace('\\ ', '')` ← `[0]` ← `split('@')`. It uses the transfers while they exist and the
+candidates after that, and re-checks every yielded entry value forward through the whole chain.
+
+Consumers:
+* the driver's flipper for guards over derived locals (`driver.py::_flip_preimage`: built, #1170 PR2;
+  docs/DESIGN.md §8);
+* `_symexec` concretization (sat only, never unsat/unreached): built with the path's model value (#1170 PR4, #1189);
+  the preimage-guided choice of the value is ruled, not built;
+* hybrid whole-draw-vector seeds and deterministic regex members (built, #1188; docs/SV.md `sv/hybrid.py`);
+* `tharkun.inputs`' `preimage` rung (built, #1170 PR6; docs/INPUTS.md "The ladder"):
+  `driver.py::preimage_candidates` walks the paths to each `return` back to the parameters, and every row is
+  replayed in a fresh child;
+* facts as the candidates' prior filter (#1170 PR5): `solve/preimage/facts.py::prior_from_fact` states absint's value
+  facts (`solve/values.py` `StrFact`/`IntFact`) and the fact carrier (`solve/fact_env.py::VarFacts`) as demands every
+  value of the fact satisfies (a superset: a filter, never a claim). The live consumer is the drive: its own pins and
+  bounds (`context_facts`, `param_bounds`) filter `_flip_preimage`'s proposals. absint's site facts reach no preimage
+  hole yet: ruled, not built.
+* rule-keyed hints (#1170 PR5): a committed preimage flip publishes one `rule_fact` per rule its walk went through,
+  into the drive's `KnowledgeBase` (`driver.py::_publish_preimage_hints`, `solve/preimage/facts.py::rule_fact`). The
+  key is `<qualname>@<file>:<line>#preimage`, it is never certified, and it has no reader yet. Registering the kind in
+  `sv/contracts.py::KINDS` waits for an SV component that writes it.
+
+### Files and how they relate
+
+- `src/tharkun/solve/preimage/__init__.py`: facade (`preimages`, `chain_preimages`, `Step`). It imports
+  `solve/preimage/want.py` eagerly, and `solve/preimage/visitor.py` and `solve/contracts/rules.py` lazily.
+- `src/tharkun/solve/preimage/want.py`: the demand vocabulary. `Member.holds`/`Member.seeds` and `All.seeds` import
+  `solve/preimage/regex_members.py` lazily.
+- `src/tharkun/solve/preimage/regex_members.py`: regex members and the bounded native check. It imports only stdlib
+  (`re`, `re._parser`, `re._constants`).
+- `src/tharkun/solve/preimage/facts.py`: priors from facts (`prior_from_fact`, `prior_from_pin`, `prior_from_bounds`)
+  and the `rule_fact` hint record. It imports `solve/preimage/want.py`, and lazily `solve/fact_env.py`,
+  `solve/values.py` and `solve/contracts/rules.py`.
+- `src/tharkun/solve/preimage/visitor.py`: `PreimageVisitor`, `PreimageCtx`, `Preimage`. It imports
+  `solve/contracts/rules.py`, `solve/preimage/want.py`, `solve/preimage/regex_members.py`, and lazily
+  `solve/contracts/adapters/str_shapes.py` and `solve/contracts/rules_strformat.py`.
+- Tests: `tests/contracts/test_preimage_rules.py` (soundness, exact transfers, refusals, chains),
+  `tests/contracts/test_preimage_audit.py`, `tests/contracts/test_preimage_facts.py`, `tests/test_regex_members.py`.
+
+
+## Callable builtins (#1443, CPython 3.14.4)
+
+`rules_builtins_missing.py` fills the callable-name gap for 26 builtins with ordinary
+`Rule`/`Contract` entries. `tests/contracts/test_builtins_missing.py` checks their
+native returns, call arities, validation boundaries, all seven property exceptions,
+non-property hook exceptions, lazy consumption and effects on **CPython 3.14.4**.
+Sources cite Python 3.14 documentation and the CPython `v3.14.4` source (3.14 branch).
+`map(strict=...)` is new in 3.14; complex-valued real/imag constructor arguments are
+deprecated in 3.14. These claims do not assert older-interpreter behavior.
+
+The contract describes the CALL. `map`/`filter` acquire iterators now, while their
+functions and next steps run later. `anext` invokes `__anext__` now; without a default
+it returns that hook's result without checking awaitability. `classmethod`,
+`staticmethod` and `property` may read arbitrary metadata descriptors now, even
+though they do not invoke the wrapped function. Their metadata `AttributeError`
+is suppressed, as is an attribute lookup `AttributeError` in `hasattr`.
+
+`next`/`anext` may advance their receiver, and `memoryview` exports/aliases a buffer
+(which can inhibit resizing). These effects are explicit. Recipe admission follows
+`adapters/avengers.py::stdlib_admission`'s existing native-dispatch effect policy;
+it does not turn `may_execute_callback=True` into a whole-operation purity proof.
+`hash` depends on the process hash seed and potentially object identity; `id` on
+allocation addresses (and invokes an audit hook); `super`'s zero-argument form reads
+caller frames. All three declare `clock_or_env=True`, `deterministic=False`, and
+remain refused as recipe callables. `super` is intentionally contracted as the
+union of its forms, without a new shape-specific admission exception.
+
+The other 18 requested names remain uncontracted with individual reasons in
+`rules_builtins_missing.py`'s module docstring. They execute code, expose caller
+namespaces, mutate arbitrary attributes, perform interactive I/O, or depend on
+site/process configuration. Refusal tests pin every one of these names. No new
+abstract-interpreter or SV transfer functions accompany this inventory: new rule
+kinds retain the existing named refusal when a visitor has no implementation.
+
+Truth conversion is itself a callback boundary: `bool` can invoke `__index__` on
+an object returned by `__len__`; `issubclass` truth-tests a custom `__subclasscheck__`
+result. Missing `__bases__` metadata is suppressed and becomes a native TypeError,
+while an unsuppressed class-metadata exception escapes. Native tests cover these
+indirect hook paths as well as exceptions raised directly by the primary hook.
+
+On main, recipe references reach these bare-name contracts through the separately
+landed #1442 `builtins.X` resolution fix (PR #62). #1443 extends that safety test
+with every new admissible callable and every intentional refusal; it does not
+copy or reimplement the main-line lookup fix.
+
+## Protocols and module callable aliases (#1455)
+
+A shared protocol contract does not automatically give operator.sub or another
+module callable a registry entry. Each callable name needs its own contract; a
+parametrized Rule family can retain the shared dispatch structure. Keep
+comparisons' arbitrary return values, iterator consumption and in-place mutation
+explicit. Identity predicates are callback-free, while methodcaller is a factory
+whose result performs lookup/call later. See `rules_operator_more.py` and its
+native CPython 3.14.4 tests.
+
+## HTML utilities (#1455, CPython 3.14.4)
+
+rules_html.py gives both public html callables their own contracts. Sources are
+the Python 3.14 html documentation and CPython 3.14 Lib/html/__init__.py; native
+tests run on 3.14.4. Open hooks require object returns and unknown raises. See
+REPORT.md for native effects and ../ABSINT.md for the admitted return transfer.
+
+## Textwrap utility contracts (#1455, CPython 3.14.4)
+
+The five utility functions in rules_textwrap.py have separate callable names,
+unknown seven-class raises and explicit callback effects. Wrap's open return is
+list[object], since custom indentation addition can return arbitrary line values;
+the four outer-join helpers return str. Configured TextWrapper instances and their two public methods now have their
+own contracts and a mutable receiver model (batch 11). Python 3.14
+documentation and the 3.14 source branch are cited; native tests use 3.14.4.
+
+### Exception class and arguments (#1455)
+
+`ConstantArgsRaiseClaim` extends `RaiseClaim` with an exact tuple of literal string
+`args`. Its `tested` flag covers both the condition and the payload; `never` and
+`unknown` cannot carry this claim. Existing `RaiseClaim` records remain class-only
+and do not acquire an argument claim. The seven property classes are unchanged.
+Because this is a claim subtype, unchanged contracts keep their canonical frozen
+serialization and digests; only a contract using the new field gains that field.
+
+The plain exception constructor rules cover canonical `BaseException`, `Exception`
+and the eleven simple builtin subclasses listed in
+`solve/contracts/rules_exceptions.py::PLAIN_EXCEPTION_NAMES`. Their ReturnSpec
+states that `.args` is the positional tuple, retaining the original references;
+construction does not format or otherwise inspect those arguments. Any keyword
+raises `TypeError` with `(ClassName + '() takes no keyword arguments',)`. Source
+subclass initialization can execute arbitrary code and is analyzed separately.
+These claims cite the [Python 3.14 exception documentation](https://docs.python.org/3.14/library/exceptions.html#BaseException)
+and [CPython's 3.14 exception implementation](https://github.com/python/cpython/blob/3.14/Objects/exceptions.c),
+with boundary and adversarial tests executed on CPython 3.14.4.
+
+The twelve `NumericDivision` rules specify the builtin int/float normal and
+reflected `/`, `//` and `%` slots. `ZeroDivisionError` carries the tested literal
+`('division by zero',)` on CPython 3.14.4, for every one of these slots. The zero
+condition applies only after valid native receiver binding and supported numeric
+operand conversion; huge int-to-float conversion can instead raise OverflowError.
+A native slot with an unsupported other type returns NotImplemented. Numeric
+subclass overrides are not called by an explicit builtin slot descriptor; ordinary
+operator dispatch can call them and remains governed by protocol rules. See the
+[Python 3.14 numeric types documentation](https://docs.python.org/3.14/library/stdtypes.html#numeric-types-int-float-complex)
+and CPython's 3.14 [integer](https://github.com/python/cpython/blob/3.14/Objects/longobject.c)
+and [float](https://github.com/python/cpython/blob/3.14/Objects/floatobject.c) implementations.
+
+### Scoped non-property raises (#1455)
+
+`Contract.other_raises` supplements the fixed seven property-class `raises` with
+`OtherRaiseClaim(exc, condition, args_template, tested, case)` entries. These are
+scoped known cases, not a closed list of every possible callback exception;
+`may_raise_other` remains the open-world flag. Argument templates are tuples of
+Python format strings. A tested contract requires its known cases to be tested.
+The canonical frozen encoding omits an empty `other_raises` extension, preserving
+all legacy contract bytes; nonempty cases participate fully in the digest.
+
+`int` records exact-str cases for an invalid primitive base, invalid lexical
+syntax and the process integer digit limit. `Int.literal_valid` describes the
+syntax independently of that process limit: Unicode decimal digits normalize to
+ASCII, non-ASCII Unicode whitespace normalizes to spaces, the six ASCII whitespace
+characters may surround the number, one ASCII sign is optional, underscores occur
+between digits or once after an accepted base prefix, and base zero disallows a
+nonzero leading-zero decimal number. ASCII separators U+001C–U+001F and Unicode
+non-decimal numeric symbols are invalid. Explicit base is zero or 2–36.
+
+The invalid-literal args use the requested numeric base and the first 200 codepoints
+of `repr(original_s)`, even if this truncates its closing quote. Invalid-base args
+are the single literal `int() base must be >= 2 and <= 36, or 0`. A valid non-power-
+of-two conversion whose digit count exceeds the enabled limit uses the tested
+limit/count diagnostic template. Main `int` effects declare that process setting;
+short finite primitive-string transfers can establish that no enabled limit is
+observed. Input/base coercions and arbitrary callback raises remain open.
+Sources: [Python 3.14 int](https://docs.python.org/3.14/library/functions.html#int),
+[integer conversion limits](https://docs.python.org/3.14/library/stdtypes.html#integer-string-conversion-length-limitation),
+and [CPython 3.14 longobject.c](https://github.com/python/cpython/blob/3.14/Objects/longobject.c).
+All boundary evidence is native CPython 3.14.4.
+
+### Scoped property-exception payloads (#1455)
+
+`ScopedArgsRaiseClaim` keeps the ordinary property-class condition and adds tested
+`RaiseArgsCase` payload relations for explicit native subsets. A case's tuple
+contains literal strings or `ArgumentRef(position)` values, with receiver at
+position zero. The reference preserves the original argument, including its type
+and object identity; it is not formatted. Other callback payloads stay unspecified.
+These are fields of the same seven property claims, not another contract registry.
+
+Dictionary native misses carry `(key,)` after successful hashing/equality.
+A dict subclass can override `__missing__`, and key hooks or a defaultdict factory
+can raise KeyError with different args; those paths are outside the native payload
+scope. Factory-None defaultdict lookup has the same key-miss payload. The distinct
+native `defaultdict.__missing__` hook, when its factory is None, raises KeyError(key)
+without hashing or testing membership, even for a present or unhashable key.
+
+CPython 3.14.4's non-None-factory missing hook calls the factory and uses native
+setdefault-style insertion: a present or reentrantly inserted value wins and is
+returned. Native insertion bypasses a subclass `__setitem__`. These boundaries are
+pinned natively, not inferred from another interpreter. See the
+[Python 3.14 mapping documentation](https://docs.python.org/3.14/library/stdtypes.html#dict),
+[defaultdict documentation](https://docs.python.org/3.14/library/collections.html#collections.defaultdict.__missing__),
+and CPython's 3.14 [dict](https://github.com/python/cpython/blob/3.14/Objects/dictobject.c)
+and [collections](https://github.com/python/cpython/blob/3.14/Modules/_collectionsmodule.c) implementations.
+
+## Sequence IndexError payload scopes (1455)
+
+list/tuple/str `__getitem__` now use tested `ScopedArgsRaiseClaim` cases. For
+exact builtin receivers and primitive int/bool keys, the native `native-bounds`
+case requires a Py_ssize_t-representable index outside `-len <= i < len` and
+stores one string: `list index out of range`, `tuple index out of range`, or
+`string index out of range`. Negative indices down to `-len` are valid. The
+`oversized-int` case requires an exact int outside Py_ssize_t range and stores
+`cannot fit 'int' into an index-sized integer`, before length adjustment.
+Slices clamp their bounds and do not take these cases. A key's `__index__`
+may raise arbitrary payloads; overflowing custom index types use their own
+type name, so neither belongs to the exact-int payload scope.
+
+Sources: [Python 3.14 sequence operations](https://docs.python.org/3.14/library/stdtypes.html#common-sequence-operations)
+and the rules' explicit CPython 3.14 source-branch links. Native tests run on
+CPython 3.14.4, including ssize limits, Unicode codepoint lengths and callbacks.
+
+## string.capwords (1455)
+
+The word helper has a Rule, native3.14.4 tests and an actual absint visitor.
+Exact builtin str text and str-or-None separators have a str result. Open
+split/iteration/sep truth/join callbacks are declared, and a truthy custom
+separator may return any object from join. Native join attribute lookup occurs
+before split argument evaluation: truthy sep1 has AttributeError; falsy sep0
+reaches builtin split and has TypeError. All seven callback property classes
+retain their arbitrary args. An exact empty-str separator has a tested scoped
+ValueError case with args `('empty separator',)`. Formatter and Template
+receiver APIs remain documented omissions for a later batch.
+
+Sources: [Python 3.14 string helper](https://docs.python.org/3.14/library/string.html#string.capwords)
+and [CPython 3.14 string package](https://github.com/python/cpython/blob/3.14/Lib/string/__init__.py).
+
+## Heapq native sibling family (1455)
+
+Seven missing callables now have individual contracts via one Rule family:
+heapify_max/heappush_max/heappop_max, heappushpop/heappushpop_max and
+heapreplace/heapreplace_max. Each declares receiver mutation and open
+comparison/truth callbacks, including possible partial mutation on failure.
+Bindings are positional-only native list calls. Needed incompatible builtin
+element comparisons may raise TypeError; arbitrary comparison callbacks can
+raise every property class with arbitrary args. Native empty pop/replace
+(IndexError) scopes store `('index out of range',)`; callback payloads remain
+open. Existing heappop gets the same scoped empty-list payload. Pop/pushpop/
+replace return original items, with an extreme-item guarantee conditional on
+the input already satisfying heap order. merge remains omitted because its
+lazy consumption needs separate iterator state.
+
+Native controls use CPython3.14.4; sources are [Python3.14 heapq](https://docs.python.org/3.14/library/heapq.html)
+and [CPython3.14 native heap implementation](https://github.com/python/cpython/blob/3.14/Modules/_heapqmodule.c).
+
+The heap Rule family stores one immutable Contract per qualname, preserving
+registry object identity. The existing heapify/heappush/heappop generic adapter
+remains the fallback for unsupported call shapes or element abstractions; its
+applicability and havoc checks are retained. Primitive integer comparisons
+prove absence of callback exceptions; a native hostile __lt__ control retains
+the older per-class Unknown-vs-safe distinction.
+
+## Statistics numeric query family (1455)
+
+Seventeen missing summary/relation functions have one shared Rule family with
+one immutable Contract per qualname: mean/fmean/geometric_mean/harmonic_mean;
+median/median_low/median_high/median_grouped; mode/multimode/quantiles;
+pstdev/pvariance/stdev/variance; covariance/correlation. Native3.14.4 tests
+cover each result, empty-data exception class+args, arbitrary iteration-hook
+args, weighted calls, tie order and a real Decimal context dependency.
+
+All open-operand property raises remain explicitly unknown; the overall
+contract's tested flag covers return evidence, not an invented never claim.
+Whole-family effects conservatively declare callbacks/context dependence, so
+recipe admission remains clock-or-env-refused. The absint primitive transfer
+proves its own context-independent finite alternatives. NormalDist,
+LinearRegression/linear_regression and kde/kde_random await receiver, result
+field or callable state models. StatisticsError construction/qualified raise
+transfers remain named refusals; no builtin ValueError object is substituted.
+
+Sources: [Python3.14 statistics](https://docs.python.org/3.14/library/statistics.html)
+and [CPython3.14 implementation](https://github.com/python/cpython/blob/3.14/Lib/statistics.py).
+
+## Native divmod conditions and transfers (1455 batch21)
+
+The existing Rule now distinguishes native payload scopes from arbitrary
+__divmod__/__rdivmod__ hooks. With builtin int/bool/float operands after
+successful conversion, ZeroDivisionError occurs exactly for a zero divisor,
+including signed float zero, with args `('division by zero',)` on CPython
+3.14.4. A huge int converted for a mixed float call can instead raise
+OverflowError before that zero check. Native unsupported builtin type pairs
+and positional-only binding failures have separately tested TypeError args;
+these scopes never relabel callback-raised errors or their arbitrary args.
+
+Native ints/bools produce an int pair; a float operand produces a float pair.
+Open hooks can return any object, so the unscoped return type remains object
+and effects declare callbacks. Bounded primitive alternatives retain exact
+native results. The abstract interpreter also supports unbounded integer
+results, including the contract-derived `0 <= r < divisor` relation for a
+positive divisor. Aliased builtin calls and bool operands use this same
+transfer; shadowed user functions keep normal source analysis. Exact native
+error payloads are GC-visible and each error has one named call obligation.
+
+Sources: [Python3.14 divmod](https://docs.python.org/3.14/library/functions.html#divmod)
+and [CPython3.14 numeric dispatch](https://github.com/python/cpython/blob/3.14/Objects/abstract.c),
+with integer/float slots in longobject.c and floatobject.c on that branch.
+Native tests and proof controls run exclusively on CPython3.14.4.
+
+The stationary draw planner's value-sensitive refusal remains: divmod is not
+a class-only call. Its W41 never-TRUE mutant must stay unproven. Contract
+raise metadata is not a synthesized proof; whole-program recursion and RNG
+state can remain later blockers in bm_go_nondet.
+
+## random.seed native scopes and abstract transfer (1455 batch22)
+
+The existing seed contract now declares version comparison/truth and seed
+subclass encode/decode/iteration/hash callbacks. Their exception classes and
+args propagate unchanged. Native unsupported seed types, non-version-2
+bytearray hashing and selected positional binding failures have independently
+tested TypeError args. Version is compared to1/2 rather than restricted to
+int; 2.0 takes the version-2 path. Surrogate text can raise UnicodeEncodeError.
+
+The general effect remains conservative: None/default uses entropy/time,
+text can lazily import SHA-512 or use process-salted hashing, and open hooks
+can execute user code. Exact explicit builtin int/bool/float seeds only reset
+the generator state and cached Gaussian value. No unconditional purity or
+recipe admission is inferred.
+
+Absint validates closed scalar versions and supported primitive seed parts,
+consumes the tested None return contract, and routes unsupported list/tuple/
+dict seed errors with contract-derived args. Open versions/subclasses, bytes
+outside the current value domain and surrogate encoding are named refusals.
+Coarse text inside a try is refused because encoding errors are not routed.
+Native unsupported-type handlers have no normal successor. A withdrawn
+contract, return proof or payload relation must withdraw its corresponding
+precision. Symexec consumes the same return contract as described below.
+
+Native evidence uses CPython3.14.4:130 new boundaries plus90 existing random
+native checks. Focused absint21 and154 existing contract/absint checks pass,
+including the existing negative controls; none was weakened.
+Sources: [Python3.14 random.seed](https://docs.python.org/3.14/library/random.html#random.seed)
+and [CPython3.14 Random.seed](https://github.com/python/cpython/blob/3.14/Lib/random.py),
+[CPython3.14 native seed](https://github.com/python/cpython/blob/3.14/Modules/_randommodule.c).
+
+The symexec seed visitor now consumes the tested None return after checking
+native module/function identity, valid binding, closed scalar version and an
+explicit builtin or symbolic numeric seed. It leaves the user class heap
+intact: later modelled RNG reads already cover every generator state. It
+never executes the target's seed or changes the analyzer process's RNG.
+Default/None entropy, shadowed or replaced functions, open seed/version
+hooks, invalid binding and encoding gaps retain named refusals. Function and
+module aliases use the same identity gate. Native replay proves the class
+and instance fields remain readable and a real assertion witness survives.
+Focused symexec23 + existing module57 and class67 checks pass on CPython3.14.4.
+
+## Array constructor and typed storage (1455 batch23)
+
+The constructor Rule now goes through the existing abstract array storage
+transfer and requires a tested return contract. Its scoped native TypeError
+args distinguish binding, Unicode codepoint type/length, and noniterable
+initializer cases. OtherRaiseClaim records bad-typecode, byte alignment,
+byte-range boundary and integer-to-float overflow args. Native payload scopes
+exclude audit/warning intervention; arbitrary iteration, conversion, warning
+and array.__new__ audit callback exceptions keep their original class+args.
+The general contract declares process warning/audit dependence and callbacks,
+so recipe admission remains conservative.
+
+The abstract numeric/list/tuple/array subset excludes Unicode, bytes, native
+long and open conversion protocols. The program cannot install process
+hooks through an accepted call; such calls remain unsupported. A known
+invalid one-codepoint typecode routes ValueError with the tested contract's
+literal args. Withdrawing that relation removes handler precision. Other
+constructor errors inside a try remain named refusals. Ordinary import and
+function aliases work; rebinding the import alias retains the existing
+origin refusal. Array tobytes and symexec construction remain future work.
+
+Both lines on CPython3.14.4: native114, focused constructor16, shared
+storage36 and existing28 pass; standard tooling generated array.array.json.
+The shared conversion fixes mixed numeric joins, rounds float32 interval
+bounds and preserves finite rounding immediately below the native overflow
+threshold. Constructor and shared storage are this batch; byte values and
+symbolic construction are separate follow-up work. Expanded importer checks
+cover the combined candidate before readiness.
+Sources: [Python3.14 array](https://docs.python.org/3.14/library/array.html#array.array)
+and [CPython3.14 array implementation](https://github.com/python/cpython/blob/3.14/Modules/arraymodule.c).

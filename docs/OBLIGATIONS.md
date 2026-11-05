@@ -114,6 +114,9 @@ property text, source statement coordinates and the CPython 3.14 binary64
 profile. It reconstructs coverage and checks every supplied assertion and
 source operation; omitted sites and tautological witnesses do not excuse an
 unsafe program. Census/resolver models are an explicit shared trust boundary.
+The census admits `heapq`, `bisect`, `collections` and `itertools` per attribute (`solve/census.py::_has_contract_rule`): only
+an attribute with a tested contract rule is admitted; any other (`heapq.merge`, `itertools.accumulate`) refuses with
+`module X: no contract for Y`. `tests/test_census_modules.py` checks each admitted function against CPython.
 The checker never calls absint or accepts its status, prose or type premises.
 Absint exports candidate exact scalar types and intervals at obligation sites;
 these must follow independently from the source before they are accepted.

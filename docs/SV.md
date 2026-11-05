@@ -1,5 +1,22 @@
 # tharkun as an SV-COMP Python verifier (`tharkun.sv`)
 
+## Program stream state ([internal ref])
+
+`sv/_symexec_streams.py::ProgramStreams` models program-created text/binary
+buffers through the same native `solve/world.py::StreamObject` as absint.
+Symbolic text writes, printing of builtin strings/integers/bools, cursor reads,
+and seeks use Z3 strings and integer positions. Hidden stream fields follow
+branches and inlined calls; unsupported calls poison dependent search results.
+Binary streams currently require concrete bytes/cursors; symbolic non-default
+newline translation and user formatting/buffer protocols refuse explicitly.
+`run_exact` can accept fully modelled stream operations without inventing a draw.
+
+`sv/_probe.py::snapshot` canonicalizes exact native StringIO and BytesIO states,
+including buffer, cursor, newline configuration, closed state and attributes.
+Fresh stream instances with equal state can therefore be stationary; different
+contents, cursor positions or attributes cannot collapse to equal snapshots.
+
+
 `python -m tharkun.sv` decides one property of the SV-Benchmarks Python track (SV-COMP 2027) for one
 program: `CHECK( init(main()), ! uncaught(E))` for each exception class `E` in a `.prp` file. It prints
 the verdict as its last line: `TRUE`, `FALSE(E)` or `UNKNOWN(reason)`. The eregion umbrella runs it as a
@@ -12,6 +29,53 @@ python -m tharkun.sv PROGRAM.py|TASK.yml --property P.prp [--python PY] [--cpu-l
 python -m tharkun.sv PROGRAM.py --property P.prp --replay W.json      # CONFIRMED / NOT CONFIRMED
 ```
 
+### SV-COMP 2027 benchmark-set transition
+
+Category selection belongs to BenchExec and `bench-defs`, before Tharkun receives
+one program/task YAML and one property. Tharkun has no benchmark-set names or
+benchmark revision pin in its verifier, so it accepts both aggregate and split
+layouts through the same CLI. Keep the existing benchmark checkout and definition
+revision paired until the replacement is available; do not change a running
+grader's inventory, categories or cached task list.
+
+The local adapter also needs to expand nested meta categories and normalize
+scores recursively. The compatibility check below includes an **offline proposed
+patch**, shared metadata helper and private-copy tests for inventory, summary
+scores and notification scores. Applying that proposal to a live grader requires
+a separate manager-owned adoption; it is not a verifier-engine update.
+
+[SV-Benchmarks !1843](https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks/-/merge_requests/1843)
+replaces `SoftwareSystems.set` with `SoftwareSystems-Boto3.set`,
+`SoftwareSystems-Chromium-Dashboard.set`, `SoftwareSystems-Pyperformance.set` and
+`SoftwareSystems-Vllm.set`.
+[bench-defs !709](https://gitlab.com/sosy-lab/sv-comp/bench-defs/-/merge_requests/709)
+already updates Tharkun's four property definitions to those sets, separates
+`Type-specific.set`, and adds `Semantics.set`. The Semantics addition is separate
+from the software partition: report its tasks and results separately when
+comparing with the preceding competition configuration.
+
+Merge !1843 first, then update !709's benchmark submodule to the actual merged
+revision and validate its XML/category structure before adopting the two together.
+An MR source head or synthetic pipeline merge is a review input, not a deployed
+benchmark pin. Existing local graders may instead use the older `Real-world.set`
+and may already include Semantics; their totals are a different cohort.
+
+The [2026-11-03 compatibility check](recon/2026-11-03/1520-sv1843-compatibility.md)
+records exact reviewed revisions, expanded counts, isolated smoke results and
+remaining dependencies. It does not change the official submission or live grader.
+
+`sv/concolic.py::solve` also serves search-only file worlds ([internal ref], owner
+2026-10-25: "if allowed, we can use concolic stuff in this mode too"). Its explicit
+`world` snapshot opts the existing worker into symbolic text-file reads and
+per-site materialization (`sv/_symexec_world.py::WorldReads`). Results retain
+`obtained via mocking` / `review_required`; `inputs.py::_Run._world_symbolic`
+confirms them against the real entry in a fresh boxed child. A world-only harness
+can have no draw parameters (`sites.py::build_harness`, explicit `world=True`).
+The ordinary verifier and exact proof executor never enable this mode. A mocked
+candidate is not an SV FALSE, and an exhausted world search cannot close sites
+or certify TRUE: the 2026-09-28 file-content ruling and absint proof model remain
+unchanged. `docs/SV_IO_MODEL.md` describes the supported subset and refusals.
+
 
 ### Target execution confinement
 
@@ -21,21 +85,75 @@ fresh confirmations receive the same declared files. Trusted worker launches rem
 parent phases. Disposable replay, probe, Avengers and Pynguin workers retain confinement through shutdown;
 Pynguin's SV path disables subprocess execution.
 
+The generated flat-observation helper import declares its metadata preparation. The fresh child recognizes
+the top-level `from tharkun.avengers.flatting import flat_observation` AST import, then calls Avengers' fixed
+`preload_infrastructure()` before target import roots or execution models: `sysconfig`, its lazy config variables,
+and `platform`. Interpreter metadata probes finish before target execution. Ordinary SV programs and comments
+keep their existing preparation. Direct target probes of undeclared paths still set `file_unmodelled`;
+`tests/test_environment_preload.py` checks all cases through `run_once`.
+
+Since [internal ref] the metadata primitives follow `os.stat`'s model: `solve/environment.py::stat_like` (installed as
+`model_lstat`, `model_readlink`, `model_access` and `model_statvfs`) records `file_unmodelled` before the host call
+for any undeclared, non-infrastructure path, and `solve/environment.py::model_os_open` is installed on `posix.open`
+too (the import machinery's own `.pyc` write exempted, `solve/environment.py::_import_machinery_read`). The harness's
+own `posixpath.realpath` resolution answers for real, unflagged (`solve/environment.py::_resolution_probe`);
+`solve/extern.py::native_import_reason` refuses `import posix` / `import nt`, whose raw primitives bypass the model.
+
+The box ([internal ref], the hybrid search's mocked world) makes an undeclared path a mocked object: stat/lstat/readlink/
+access/statvfs/listdir/scandir and `os.open` answer "absent" without a host call and without `file_unmodelled`
+(`solve/environment.py::stat_like`, `box_enumerate`), the import roots and their resolution chain answer for real,
+a write still never leaves the scratch, the touches are recorded (`solve/environment.py::WorldRecord`), and a boxed
+child gets the fixed, absent `solve/environment.py::BOX_HOME` (`sv/engine.py::run_once`,
+`sv/_hybrid_worker.py::_install_environment`). `box=False` is today's model, unchanged.
+
+The native import admission (`solve/extern.py::native_import_reason`) refuses a `getattr` in a file that imports `sys` unless its attribute
+name is a static string that is none of the cache and reflective names (`_REFLECTIVE_ATTRS`) and its object is not the `sys` name
+([internal ref]: `getattr(type_, '__origin__', type_)` is introspection, not import state; `tests/test_native_imports.py`).
+
 Reversible exploration conservatively refuses deferred finalizers/callbacks, dynamic code and type/cache
 reflection, including reachable local helpers. `nondet_harness.drive` sends such a program to the existing
 confined fresh child with a 30-second cap instead. It retains the observed outcome and draws, adds
-`import_state_unmodelled` and `stack_unmodelled`, and never claims a target line was reached. Other reversible
-routes abstain. These restrictions do not change ordinary fresh-replay admission or independent static proofs.
+`import_state_unmodelled` and `stack_unmodelled`, and never claims a target line was reached. The concolic worker
+(`sv/_concolic_worker.py::_run_request`) seals its own disposable process once instead, when only the reversible tier
+refuses: `environment.py::install_files` and `refuse_threads` for its whole life, a no-op confine, `confine=None` to
+`driver.py::drive_to_line` (which then skips its admission; the reach targets are declared files so the driver can read
+them) and its own record written through the real `io.FileIO`. That is sound because nothing in the worker proves: the
+reach facts are published `certified: False` (`inputs.py`, producer `reach`) and every proposal is replayed in a fresh
+child ([internal ref] C4). Other reversible routes abstain, and a STATIC-tier refusal still names itself (`drive_refused`,
+[internal ref]). These restrictions do not change ordinary fresh-replay admission or independent static proofs.
 Concolic execution flags survive obligation-table publication; candidate vectors still require original-source
 fresh replay. Trusted harness generation binds the exact generated text to the original unsliced source and
 its path. The worker and driver reject changed harness bytes before execution and apply reversible admission
 to that original source and its import graph, without treating the generated helper prelude as target code.
+A worker refusal is named, never silent: `concolic.py::solve` keeps the worker's reason in `Solved.refusal`
+and logs `concolic: refused before running: <reason>` ([internal ref]; it used to show only "0 solver rounds").
 Original references or bindings to the prelude's injected globals are refused before target execution.
 Pynguin collects generated tests from a separate scratch subdirectory so staged inputs are never artifacts.
 The native witness oracle shares the disposable child boot and checks builtin identities after its guards
 are installed. Its parent owns each scratch directory and removes it only after child termination, so
 confinement remains installed through target cleanup and interpreter shutdown.
 This is the existing execution model, not a general Python security sandbox.
+
+The inputs door's `want.through` ([internal ref], [INPUTS.md](INPUTS.md) "Want") asks `engine.run_once` for a trusted
+`observe_line` record during fresh replay. The child observes the ORIGINAL imported entry's call from the replay
+harness through `sys.monitoring`, excludes import-time calls, and reports `Outcome.reached`. A later call resets the
+observation; a replaced monitoring callback invalidates it. The native admission already refuses target access to
+`sys.monitoring`. This changes neither the target source nor the return-value assertion. Search uses a marked
+entry copy with its globals imported from the real module, and no proof from that copy establishes absence for the
+original. Ordinary SV requests install no additional line observer.
+
+## Fuzzer and solver talk (lane 1524)
+
+`sv/hybrid.py::search` closes the loop between coverage-guided input generation and symbolic execution through the
+run's store (`draw_vector` evidence). The Atheris worker (`sv/_hybrid_worker.py`) keeps the deepest input it ran (most
+distinct target lines) in `frontier.json`. On a plateau `search` publishes it (producer `hybrid:frontier`) and calls
+`concolic.solve(seed_vector=)`: `_concolic_worker.py::_frontier_inputs` re-runs the harness on it, finds the guard that
+blocked it and solves that guard with the reached prefix fixed concretely (`_symexec.solve_site`). Solved and partial
+vectors are published (producer `concolic:feedback`), written into the corpus (`hybrid.py::_add_vectors`) and fuzzed
+again, at most `FEEDBACK_ROUNDS` times, inside the stage's budget; `deepen` seeds its corpus with them too. Everything
+stays a proposal: only the fresh native replay yields FALSE. Task: `tests/fixtures/sv_feedback/two_stage.py`
+(`hash(token) == hash(MAGIC)` is reached by the fuzzer's literal corpus, the sparse modular equality on `y` only by the
+solver) and its unsatisfiable twin `safe_twin.py`. Not done: a frontier handoff inside `deepen` rounds.
 
 ## How it decides
 
@@ -56,8 +174,9 @@ program's module frame sits at native depth 1: `f(996)` reaches the `assert Fals
 frames; (2) a THREAD: the recursion limit the child raises is the main thread's, and a thread starts its own stack at depth
 0, so a program that counts recursion depth in a thread gets ~10 more frames than natively. So
 `solve/environment.py::stack_reason` (a static, over-approximate scan like `references_stdin`) flags such a program
-`stack_unmodelled`: one that reads frames however the name is spelled (an attribute or import, a string or a folded
-`"_get" + "frame"`, `vars(sys)`, `sys.__dict__`, `exec`/`eval`/`__import__` of anything the scan cannot read, a computed
+`stack_unmodelled`: one whose CODE reads frames however it spells the name (an attribute or import, a string it runs or
+uses as a name -- `environment.py::_live_strings`: `getattr(sys, "_get" + "frame")`, an `exec` literal scanned as code,
+never a comment or the data `'no _getframe here'` (2026-10-29 audit, A1) -- `vars(sys)`, `sys.__dict__`, `exec`/`eval`/`__import__` of anything the scan cannot read, a computed
 `getattr` next to an import of `sys`/`inspect`/`traceback`) or imports a module that runs code on another stack
 (`threading`, `_thread`, `concurrent`, `multiprocessing`, `asyncio`, `socketserver`) or reads frames for a living (`pdb`,
 `bdb`, `trace`, `cProfile`, `profile`, `faulthandler`, `tracemalloc`, `code`). Its run is never a witness
@@ -70,13 +189,49 @@ moment ANY thread starts, whoever starts it (a helper module of the task, `exec(
 imported under an alias by a computed name, `concurrent.futures`, a `Timer`). `drive` runs in the verifier's own process and
 undoes the patch after each run.
 The bootstrap import cache also differs from native execution: the model has already imported `json`, `random`,
-`string`, `traceback`, `types`, `time`, and `math`. `solve/extern.py::native_import_reason` refuses reads of `sys.modules`,
-dynamic imports, and stdlib names shadowed by task files or packages in the script directory or explicit import roots.
-It reads local imports recursively, including package initializers; dynamic code and unmodelled path changes also
-refuse. Known `_sv_verifier` draw lookups through its cache entry, globals, literal import or getter stay supported.
-Proof engines and the scheduler return a named
-`UNKNOWN`; child replay, stationary probes and in-process drive set `import_state_unmodelled`, which cannot certify a
-TRUE or a FALSE witness. Cache eviction would disturb the model's own imported objects, so these cases stay unsupported.
+`string`, `traceback`, `types`, `time`, and `math`. `solve/extern.py::native_import_reason` reads source only and has two
+tiers. The static tier (`runtime=False`, the whole refusal before [internal ref]) refuses every observable cache read: `sys.modules`
+(any form), `__import__`/`vars`/`globals`/`locals`, a dynamic import, `exec`/`eval`/`compile`, `importlib.import_module`,
+`reload`, `__globals__`/`__getattribute__`/`__subclasses__`, `sys.path` changes, `sys.monitoring`, a `sys` escape, heap
+reflection, and stdlib names shadowed by task files or packages in the script directory or explicit import roots; it reads
+local imports recursively, including package initializers. The runtime tier (`runtime=True`) returns only what re-importing
+evicted modules cannot repair (`sv/_child.py`): an enumerated or mutated `sys.modules`, a stdlib or dynamic key (only
+`X.__module__`, `X.__name__`, the program's own `__name__` and a non-stdlib constant read one native entry), `reload`,
+uninspected `exec`/`eval`/`compile`, a `sys` escape, `sys.monitoring`, `__subclasses__`, heap reflection (`gc.get_referents`) and
+`import posix`/`nt`; the other static-tier forms are what a native-equivalent child executes.
+Direct `exec`/`eval` of finite inspected `str`/`bytes` alternatives may run for search when the child checks the actual
+builtin and argument before each call. The same applies to default-option `compile(source, filename, mode)` with literal
+filename/mode: executing its result additionally requires native code equality, including constants and source/frame
+metadata recursively through nested code. Expected compilations are prepared before target hooks can observe them.
+Uninspected sources, compiler options, AST/buffer inputs, custom namespaces and reflective bodies remain `UNKNOWN`;
+this runtime admission never permits a static TRUE. Separately, proof analysis can expand a finite
+default-namespace module `eval` expressions and assignment-only bare `exec` sources using
+`solve/static_code.py` and `solve/lowering/eval_source.py`
+([LOWERING.md](LOWERING.md), "Finite module code sources"). Original runtime guards remain active;
+unexpanded calls still prevent TRUE, and independent witness checking keeps its own syntax boundary.
+`solve/extern.py`'s tiers are made real by the child: `sv/_child.py::evict_import_cache` snapshots `sys.modules` at its
+first statement and, when the static scan says the program observes import state, drops every pure-Python module that is
+not in the native startup set or model-held (an owner of `environment._patched_attributes`, `random`, `_sv_verifier`,
+`_posixsubprocess`) just before `run_as_main`, so the target's own `import` executes the source again;
+`sv/_forkserver.py` measures that startup set once per child, after `site.main()`, from the server's own `-S` startup set
+(no probe interpreter may run this venv's site hooks). `sv/scheduler.py::run` therefore refuses only a runtime-tier
+reason; a static-tier-only program with no exact proof-source expansion runs the stages with `prove=False` and every TRUE is withheld in `done`
+(`engine.py::import_state_reason`), while its FALSE is a real one the child reproduced. Known `_sv_verifier` draw
+lookups through its cache entry, globals, literal import or getter stay supported in both tiers. A `__dict__` read is
+import state only when its base is a module-bound name or `sys` (`extern.py::NARROW_DICT_FOR_STATIC`, R1): a class's or
+an instance's mapping is not. A comprehension target shadowing an import stays refused for static proofs, but is
+admitted at the runtime tier with its source position recorded. The child's existing resource observer checks each
+such `LOAD_ATTR` receiver immediately before execution: a module (including a module subclass), missing receiver or
+unknown instruction shape sets `import_state_unmodelled`. Missing/tampered observation remains `resource_unobserved`.
+Every child run audits code-object rewriting (`types.CodeType` and `code.replace` raise `code.__new__`, `f.__code__ = ...`
+raises `object.__setattr__`; owner, 2026-10-29 audit): it is unmodelled, so that run sets `import_state_unmodelled`, and
+modified code metadata cannot hide these receiver checks. `function.__new__` (raised by dataclasses and typing) wraps an
+unchanged code object and is not flagged. The same observer checks the `vars(name)` / `getattr(name, ...)` calls
+`environment.py::orig_argv_reason` records (see SV_IO_MODEL.md, `sys.orig_argv`), at their `CALL`, by object. Filename aliases, including relative imports through symlinked packages, are bound
+before execution (at most 64 aliases per source); missing column metadata refuses a witness.
+The first iterable uses the enclosing binding, and a lambda body gets no exemption from an outer comprehension ([internal ref]).
+A runtime-tier reason is a named `UNKNOWN`; child replay, stationary probes and in-process
+drive set `import_state_unmodelled`, which cannot certify a TRUE or a FALSE witness.
 The file names of frames below the module frame (`warnings.warn(..., stacklevel=n)` for a large `n`) still differ.
 **A property class is the BUILTIN** ([internal ref]): the child records the names of the MRO classes that
 are the builtin objects (`_child.py::exception_mro`), so a program's own `class IndexError(Exception)` is no `IndexError`
@@ -86,7 +241,7 @@ settled, so a program that binds a property exception name itself (any scope, im
 in the program, its declared files or the local modules it imports; unparsable source counts as binding every name;
 `engine.py::shadowed_property_names`, `local_import_files`) gets no TRUE: `scheduler.run`'s `done` withholds it before any
 witness is written, `engine.verify` re-checks, and the answer is `UNKNOWN` (owner 2026-10-18). FALSE is unaffected (a
-built-in instance escaped). **Our model never answers for an exception CPython would not raise** ([internal ref], [internal ref]): the
+built-in instance escaped). **Model-originated failures marked `model_error` cannot produce a verdict** ([internal ref], [internal ref]): the
 random model counts a range arithmetically (`random.randint(0, 2**100)` works), and a run in which the model itself raised
 (`model_error`) or that touched the module-level `random.setstate`, or `getstate` after a random draw
 (`random_state_unmodelled`; the draws are not a generator state) is never a witness (`engine.py::NEVER_A_WITNESS_FLAGS`); a `getstate` before any random draw reads the OS-seeded state exactly as natively, so that flagged execution cannot certify TRUE (`random_state_read`; MT's first word `st[1][0] == 2147483648` fails natively every time, a witness replays).
@@ -244,6 +399,18 @@ Enumeration is CAPPED when it can only confirm what is already known:
   early"). That answer is never TRUE: the symbolic model is bounded, and the sites are only the ones
   the harness knows.
 
+`sv/_concolic_worker.py::_run_request` prepares the solver before entering target confinement
+([internal ref]): `solve/environment.py::preload_infrastructure` finishes sysconfig's lazy initialization,
+and importing `_symexec` loads Z3's native library. Their host-path probes must not become target
+`file_unmodelled` flags that suppress `concolic.py::Solved.closed`. The target still runs under
+the same file model: its own undeclared metadata probes remain flagged and cannot close a site.
+
+`sv/forkserver.py::ForkServer.close` cancels an active advisory request before waiting for
+the server to exit ([internal ref]). `sv/_forkserver.py::_execute` routes that termination through
+its existing descendant kill/reap path; SIGTERM is blocked across fork and handler setup,
+and the target retains the original signal dispositions. A failed request write must not
+kill the subreaper while a long-budget target and its detached descendants are still alive.
+
 **The solving portfolio ([internal ref], `src/tharkun/sv/stages.py`).** Before any enumeration the
 engine runs the stages of `stages.py::REGISTRY`, cheapest first, each with its own attribution name.
 A **seed stage** returns candidate values per draw kind, which `engine.py::Candidates` ranks right after
@@ -281,6 +448,12 @@ for draws that reach a violation site:
      `user_function` (nothing rebinds it; no fact at all is a refusal too, since nothing says what `main`
      is). The draws in a function `main` calls are not lifted (they stay with a stub, below); when those are
      the only draws the reason says so;
+   - **a draw helper** is the draw: a module-level def that only forwards to a verifier draw
+     (`def _draw(*a): return _svv.nondet_int(*a)`, or `def f(lo, hi): return nondet_float_range(lo, hi)`), the one binding of its
+     name, undecorated, no defaults or keywords, parameters forwarded unchanged and in order, is lifted wherever the program calls it
+     (`sites.py::_draw_helpers`). Any other helper that draws keeps its draw with the stub. The guard `"__main__" == __name__` is a
+     main guard like `__name__ == "__main__"`. Not done (still refused by name): statements after the entry call, because an
+     entry body's `return` and locals cannot be inlined ahead of them exactly;
    - **module-level draws** (`SIZE = 1 + abs(nondet_int())`, bm_go_nondet): a parameter is only read when the
      harness runs, so every module-level statement that is not a definition (`import`, `def`, `class` stay at
      module level, in order) moves into the harness, in order, and the names it assigns are declared `global`
@@ -301,7 +474,13 @@ for draws that reach a violation site:
 
    The sites:
    - `sites.py::violation_sites` lists the explicit ones: `raise X` with `X` a property class or a
-     builtin subclass of one, and `assert` for `AssertionError`, each with its enclosing guards;
+     builtin subclass of one, and `assert` for `AssertionError`, each with its enclosing guards.
+   - In the HARNESS, an explicit `assert T` (not caught by an enclosing `try`) gets the marker
+     `if not (T): __sv_site(n)` before it, like an implicit site ([internal ref], `sites.py::_Instrument.stmts`). Its
+     site record is that marker line, kind `assert`. So the per-site drive targets a line inside the guard that
+     fails the assert; before, it answered "line N is not inside any if-guard". `_symexec`'s goal for the site
+     is unchanged (the path and `not T`). The marker re-evaluates `T`, as every marker re-evaluates its
+     condition: the harness only proposes, and the unmodified program decides.
    - `sites.py::implicit_checks` finds the implicit ones: `c[k]` that can miss (`IndexError`,
      `KeyError`) and `a / b`, `a // b`, `a % b` with `b == 0`. Only side-effect-free operands count,
      and the arms of a conditional expression carry its test. The harness gets
@@ -351,14 +530,29 @@ for draws that reach a violation site:
      search early with an UNKNOWN verdict (`scheduler.py`: `symbolic.closed`), never a TRUE. Only
      `obligation_table.py::discharge` writes a certified row.
      A value whose TYPE depends on the path is a `Union` of typed members, which is what the typing
-     sites ask about. Dicts with constant keys, `in`, `.get`, `.append` and Python's floor `%` / `//`
+     sites ask about. A comparison with one goes member by member (`_Runner._cmp_union`: `==`/`!=` of two
+     types that are not both numbers is `False`/`True`, an ordering of them raises `TypeError` and ends those
+     paths, a membership or identity test other than `is None` is `unsupported`), and so does its truth
+     (`_truth`); before [internal ref] the Union OBJECT itself was compared (`==` by identity, always false) and
+     truth-tested (always true), so `x == 7` on an `Optional[int]` (`x if nondet_bool() else None`) was a
+     wrong "no modelled run fires it". Dicts with constant keys, `in`, `.get`, `.append` and Python's floor `%` / `//`
      by a draw are modelled. The path condition carries everything a later site depends on: branch
      guards, the arms that did not die (raise or return), asserts that passed, operand types that did
      not raise. A pure builtin called on exact builtin values (`ord`, `chr`, `tuple`, `list`, `zip`,
      `enumerate`, `reversed`; `solve/contracts/adapters/concolic.py::concrete_fold`, [internal ref] batch 4) is
      evaluated natively, gated on its tested contract; `zip`/`enumerate`/`reversed` come back as a one-shot
-     iterator (`_symexec.py::_LazyIter`) that only an immediate consumer (a `for`, a comprehension, `list`,
-     `tuple`, `sorted`, `sum`) unwraps, and `type(x)` maps the value to its class
+     iterator (`_symexec.py::_LazyIter`) whose cursor is shared by aliases and iterator compositions.
+     Complete consumers (`for`, comprehensions, `list`, `tuple`, `sorted`, `sum`) unwrap it;
+     `any`/`all` over concrete truth values retain the native unconsumed suffix.
+     Later complete consumptions see an empty iterator.
+     Exact bytes and ranges join list/tuple/str/dict operands in these finite folds;
+     constructor and itertools materialization checks the shared invocation deadline,
+     without an item-count ceiling. Expiry refuses the whole result, never a prefix.
+     Individual next/send calls, keyword variants, generator short-circuit evaluation and
+     cursor-dependent symbolic truth remain refused. Borrowed mutable sources use the existing
+     alias guard until consumption releases them; target iterator/truth hooks, mutable buffers
+     and unordered set iteration have no corresponding exact sequence model.
+     `type(x)` maps the value to its class
      (`_symexec.py::_Exec._kind_of`). `set` is not folded: its iteration order depends on the hash seed. The builtins
      the executor evaluates itself (`len`, `abs`, `min`, `max`, `any`, `all`, `isinstance`, `sum`, `range`, `sorted`,
      `int`, `float`, `divmod`, `pow`, `print`) are read through their rules ([internal ref] step 2): `_symexec.py::_Exec._through_rule`
@@ -393,6 +587,29 @@ for draws that reach a violation site:
      reason otherwise (`_symexec_math.py::REFUSED`: a transcendental or irrational function of a
      symbolic value has no exact encoding in the rational model); the callee is resolved by identity in the
      harness module's globals (`_symexec.py::_Exec._math_function`) and the constants by `ev_Attribute`. A
+     A program function held as a VALUE (`_symexec.py::_FuncVal`: `f = g` for a top-level
+     `def`; a lambda expression whose body reads only its parameters and module-level names --
+     every capture over a non-global name, a default, `*args` or `**kwargs` shape is a
+     refusal) is inlined at each call, exactly like the direct name call
+     (`_Runner.ev_Name` / `ev_Lambda`, `_Exec._ev_call`); a lambda body evaluates as a single
+     `Return` (`tests/test_symexec_funcvals.py`).
+     A merge whose two path values differ in TYPE joins the same `Union` members
+     machinery the Optional-parameter merges already use (`_ite` -> `_typed_ite`, including the
+     legacy per-site executor's `If`-store merge and `IfExp`; `tests/test_symexec_union.py`):
+     `p >= k` with a str member ends that path as the TypeError member it is, and never claims
+     The direct `_ite` merge itself keeps its decline when a str-like member meets a
+     non-str-like one (`merging a string with a non-string`, the negative control in
+     `tests/test_sv_concolic.py`): the typed merges stay where a later member-wise use
+     is in the executor's model (the `If`-store merge, `IfExp`, the `_Runner`'s
+     conditional merges), not in every value merge (`_symexec.py::_ite`).
+     a number for both arms.
+     Sequence and starred assignment unpacking (`_symexec.py::_Exec.assign`: `ast.Tuple`,
+     `ast.List`, with or without an `ast.Starred` element) unpacks concrete tuples and lists,
+     pairing prefix elements, binding the middle slice as a list to the starred target,
+     and suffix elements; length mismatch raises `_Dead` (runtime `ValueError`). Function values
+     accessed via subscript (`_Runner._ev_call`: `funcs[0]()`) are inlined per call; identity
+     comparisons with symbolic terms (`_Exec._cmp`: `ast.Is`, `ast.IsNot`) evaluate object identity,
+     and symbolic list/tuple equality comparisons evaluate elementwise (`tests/test_symexec_unpacking.py`).
      statement outside the modelled subset is skipped and the names it writes are
      poisoned, so reading one later is unsupported. Each site comes back `sat` (the draws), `unsat` /
      `unreached` (no modelled run fires it), `unsupported` (a statement on its way was not modelled)
@@ -424,6 +641,8 @@ before the verdict line (`Verdict.component`, with `Verdict.detail`):
 
 - `deterministic`: no draws; one execution decided it.
 - `finite_tree`: every draw finite, and the tree was enumerated.
+- `proof:finite_domain` (T178, `sv/finite_domain.py`, run by `scheduler.py` as stage 3b, after the static proofs and before the
+  portfolio, under a deadline share of what is left): the program's own early-return guards bound its integer draws. See "Finite domain" below.
 - `proof:<domain>`: a proof that survived its canary (`proof:no-site`, `proof:interval`,
   `proof:shape`, `proof:stationary`, ...).
 - `concolic:symexec` (the symbolic run or the site's slice, solved by z3), `concolic:guard_solve`,
@@ -470,6 +689,135 @@ Fork-server startup consumes the same share before the target's deadline is assi
 
 ## Static proofs before the search ([internal ref] group C)
 
+The exact product subset also admits immediate tuple unpacking of a single synchronous
+integer generator over builtin `range(start, start + N)`, where `start` is a name and
+literal `N` matches the distinct name targets, including empty and singleton tuples.
+Generated-node work must fit the existing `MAX_NODES=20000` resource budget.
+`exact_unroll.py::_expand_symbolic_range_unpack` uses a tuple-returning helper so
+every RHS element finishes before any target is stored, and the generator variable
+stays local. Elements contain only integer constants, the generator variable and
+audited scalar arithmetic; captures, filters, steps, nested generators and escaping
+generators stay refused. Whole-module admission still rejects builtin rebinding and
+helper-name collisions. `exact_subset.py::_Audit._expr` separately admits integer
+powers with a literal integer exponent `0..8` (`exact_unroll.EXACT_POW_MAX`, the range `_symexec` expands exactly), using the existing exact integer executor;
+float, symbolic, negative and larger exponents stay refused. (Correction: the first implementation, an AI lane's 9952424a, admitted only the exponent `2` and the range
+spelling `start + <count>`: it keyed on the spelling, not the meaning. The range's trip count is now decided by linear arithmetic over the same names, with an optional
+constant step.) This changes neither the global
+operator allowlist nor the AssertionError-only product-proof goal gate.
+
+Plain top-level classes also enter the exact product proof through
+`exact_classes.py`. The source is checked before normalization: classes have no
+base except `object`, no decorators or metaclass, scalar constant class fields,
+and plain positional methods; only `__init__` may be a protocol method. Every
+method body passes the scalar audit, including uncalled methods. Declarations
+precede executable statements, and class names cannot be rebound or shadowed.
+Nested classes, loops, containers, descriptors and other protocols remain UNKNOWN.
+
+The class table is built from source without importing or executing the target.
+Empty engine-owned class tokens identify classes; the existing symbolic execution
+heap holds instance fields and class overlays. Constructors and methods inline
+their complete bodies, preserving aliases, separate instances, class fallback and
+per-path writes. Heap merges use the proof runner's type-preserving value merge.
+`None` fields and `is None` are exact; integer fields remain unbounded, and strings
+use whole code-point sequences, including empty strings and lone surrogates.
+Code-point `len` counts sequence elements. Class and primitive `check_type` calls
+retain success obligations; an unsupported or failing obligation cannot silently
+become a proof. Field counts and positional arities have no semantic ceiling;
+resource exhaustion uses the existing shared per-run deadline and yields UNKNOWN.
+Optional plain-object field reads split guarded members; a `None` receiver ends
+only its AttributeError path. The separate AssertionError-only retry may end an
+authenticated int/bool-hint mismatch on exact int/bool/string values after all
+argument goals are evaluated. String and plain-class hints retain strict success
+obligations in every attempt; their failures cannot become unreachable paths.
+Method locals that shadow module variables use the same alpha-renaming as free
+functions. Guarded method dispatch, scalar identity other than `is None`, string
+methods, containers and opaque Python protocols remain explicit gaps in this
+class model. The frozen `protocol.attribute_access` product audit cell is
+`M` (the heap models it directly, without consuming a contract visitor).
+FALSE still requires native replay of the original source;
+coverage-guided input generation and the shared obligation table keep their
+existing trust rules.
+
+Plain-class scalar identity uses `exact_identity.py` only when the source
+observes scalar `is`/`is not` beyond existing None/type observations. Copies carry
+an origin through variables, parameters, fields and full method returns. Guards
+merge origins alongside values; field presence is tracked, so an absent field
+ends only its AttributeError path. The immutable scalar union model may therefore
+store int/string alternatives without losing aliases. Checked `int | bool | str`
+and plain-class type unions remain strict success obligations in every attempt;
+only the existing single int/bool hint mismatch route may cut a path.
+
+Unknown allocation and interning produce unconstrained origins, never an identity
+inferred from equal numeric/string values. This relation deliberately includes
+extra identity choices: UNSAT proves every native execution, while a SAT origin
+choice is only a candidate and still needs native replay. Bool/None singletons,
+plain object handles and fixed class tokens retain their known identities.
+Constructors retain the new object's identity rather than __init__'s None return.
+Branch returns carry value and origin together. The origin bookkeeping is private
+state, not a model of Python addresses, and reflection stays outside the audit.
+Unmodelled bindings/stores and per-run resource exhaustion refuse the whole proof.
+
+Proof-only code-point strings also support `startswith` and `endswith` through
+`exact_strings.edge`. The model uses whole finite sequences, not character
+samples or a length prefix. Optional positional start/end bounds follow Python's
+negative-index adjustment and clamping; a positive start beyond the original
+length remains a failure even for an empty prefix. Bounds retain unbounded integer
+terms. Tuple prefixes/suffixes are checked in order and stop at the first match;
+a bad entry ends only the TypeError paths that actually reach it. Tuple construction
+and all call arguments finish before matching begins. The auditor consumes the
+tested bool-return contracts through `ProductVisitor`; removing either contract,
+its tested return, or its visitor withdraws the proof model. The existing strict
+string/class checker success obligations remain in every attempt.
+
+Presence of an edge call selects code-point literal encoding for the whole run;
+other programs keep their existing representation. `len` of code-point strings
+uses sequence length, including parameters. Tuples are admitted only as immediate
+edge arguments in the plain-class audit. Opaque index protocols, keyword bindings,
+path-dependent prefix kinds and None/int mixed bound values refuse; user hooks
+are never approximated. Supported tuple arities, string lengths and integer
+magnitudes have no semantic cutoff. Every tuple step checks the same per-run work
+budget, and exhaustion yields UNKNOWN. The search executor's string representation
+and coverage-guided input generation remain separate from these whole-program
+proof terms; the shared obligation table keeps its existing trust rules.
+
+Existing abstract interpretation remains first: shape and element summaries can prove
+length and scalar goals without materializing every value. The exact fallback is for
+relations those summaries lose, such as a sorted list's ranks or equality to expressions
+over the original unbounded integer inputs. `_Audit._finite_list_expr` admits the existing
+finite int/bool list representations: literals, known-constant repetition, read-only list
+parameters and fresh sorted lists. It imposes no semantic length ceiling. Aliasing,
+escaping lists, unsupported kinds and unaudited keyword/callback protocols remain refused.
+
+`sum`, iterable `min`/`max`, `any`/`all`, `len`, equality and membership reuse existing
+folds and sequence models. `_Exec._model_sorted` uses one stable insertion-sort algorithm
+for represented finite int/bool sequences: strict comparisons leave ties in input order,
+and existing value merges preserve type observations. Its symbolic construction costs
+O(length²); no integer-value enumeration or per-length case is used. Concrete sorting
+keeps native semantics. Symbolic keyword/key sorting, type-observed extrema and numeric
+folds that cannot consume a type-dependent union remain explicit refusals. An empty
+extremum raises native ValueError, ending its path under the unchanged AssertionError-only
+goal gate. Boolean singleton identity remains limited to authenticated `any`/`all` results.
+
+Known structural length differs from an unknown symbolic finite length: a `SymList` with
+only length and no represented elements cannot support exact sorting or content folds.
+The abstract interpreter may still prove its shape/element-summary goals. No new
+element representation is introduced. Materialization/solver/resource failure yields
+UNKNOWN, never a proof over a prefix. A private per-invocation deadline is shared by
+`product_proof.prove`, `run_exact`, inline callees, list growth, comparison/selection and
+fold loops, then the remaining solver time. It uses the existing timeout, checks before
+incremental allocation and never resets in a callee or proof retry; invocations share no
+budget state. Union-member copies, typed sequence merges and Cartesian comparisons
+check that same deadline inside their loops, including closed-callable runners; no
+partial member set or comparison prefix becomes a proof. Normalization checks actual expanded-node work before materializing ranges
+or copies, rather than the old 64-trip or 256-element limits. Static constant-expression folding and supported
+constructor syntax remain separate admission requirements; a non-foldable count stays
+UNKNOWN. All emitted sites remain the original source sites.
+
+Membership involving a path-dependent `Union` needle or list/tuple cell is refused:
+the executor must not compare the internal Union wrapper by native object identity.
+The whole-program backend likewise refuses Union dictionary keys, while dictionary
+values do not affect membership. Guarded scalar/list equality remains modelled.
+
 FIRST, before anything runs, `engine.py::verify` calls `engine.py::_static_proof`. It imports the
 provers lazily, so each is used as soon as it is merged, and a missing or crashing prover is skipped:
 `tharkun.sv.prove.prove_static` (the census proofs, [internal ref]), then `tharkun.solve.absint.prove`
@@ -508,12 +856,44 @@ The reason also distinguishes early cuts from completed runs on the proof's retu
 
 ## `proof:no-site` ([internal ref])
 
-The first static stage (`prove.py::prove_static`, called by `engine.py::_static_proof` before absint): `solve/census.py::site_census` finds no
-construct the program can run that can raise a property class with any values. It counts every operator
+**Exception exits v1, ruled 2026-10-29, built:** this stage proves that
+no exceptional exit of a property class reaches the module/main exit. A catch
+may remove an exit only when its class match and route are certain; unknown
+dispatch and deferred constructs remain open. The [inventory facts](EXCEPTION_SITES.md)
+include direct scope exit rows, own-input bindings, path facts and conservative
+unknowns, source-signature argument translation and fixed local source-object
+dispatch facts. Dynamic unpacking, mutable/captured defaults, unresolved descriptors,
+callable lifetime, replacement finalizers and callee state/coverage gaps remain named. Identity/handler relations
+distinguish builtin and source classes and retain maybe-caught cases.
+`site_census` first retains the audited whole-program empty-site certificate;
+when sites remain, an independently complete module-exit summary can discharge
+them. Each retained exit must exclude every requested class family. Unknown
+dispatch/conditions/identities and deferred/state gaps block that second route;
+partial routes are never stitched together. Both views share one physical
+discovery pass. Every gained TRUE requires its own complete route argument,
+native checks and review against the full SV receipt set before it is approved.
+
+**Ruled 2026-10-29:** the [static exception inventory](EXCEPTION_SITES.md)
+builder/view refactor preserves this stage's resolver boundary and visible
+override coverage. `solve/exception_sites.py` owns the physical-node pass and
+audited class projection; `site_census` is its proof view. All 232 static receipts
+across the complete tracked Python set at SV33972db5 (24 tasks, 80 declared
+task/property pairs) match baseline Tharkun21070767, with no TRUE gained or lost
+and no reason/site/resolver delta. Raw wildcard and unused-method records remain
+in the rich inventory; they do not reintroduce the contract-name widening below.
+This is static no-site parity, not a full portfolio run.
+
+The first static stage (`prove.py::prove_static`, called by `engine.py::_static_proof` before absint)
+uses `solve/census.py::site_census` to exclude uncaught property exits. Its preserved
+audited empty-site route counts every operator
 that can (`/ // % **` unless the right operand is a safe literal; for data-lookup every subscript and
 every `%` that may be formatting with a mapping), every library call in its tables (`divmod`, `pow`,
 `math.log` with a base, the dividing `random` functions; `pop`, `popitem`, `remove`, `format`,
-`re.sub`, `random.choice`, ...), every `assert`, every `raise` it cannot show is of another class, and
+`re.sub`, `random.choice`, ...), every `assert`, every `raise` it cannot show is of another class (a
+class's bases show it only when constructing it runs no program code: a `__new__`, a metaclass or a class
+decorator makes `raise B()` raise whatever they return -- svaudit 2026-10-29,
+`exception_sites.py::_CensusProjection.raises_property`;
+0.2.1 proved `raise Boom()` with `Boom.__new__` returning `ZeroDivisionError()` safe), and
 generator `throw`; such a callable used as a value counts too. It is sound only as an ALLOWLIST: the
 program must resolve (`solve/pyresolve.py::Resolver`), so anything reflective -- a dunder attribute such
 as `__getattribute__` or `__dict__`, `getattr` with a computed name, `vars`, `eval` -- refuses, as do
@@ -606,6 +986,13 @@ the loop in the state trip count `m` leaves it in. Trip counts `c .. m`, trip 0 
 probe run that raises a property exception is replayed on the plain child and, if confirmed, returned as
 FALSE with its witness. A stationary TRUE faces the same canary as a static one.
 
+Finite index and residue domains are represented by ranges without a separate
+size cutoff. Their complete draw tree, including Cartesian products, must fit
+the existing probe-run budget and finish before the shared deadline. Pending
+alternatives are counted before allocation; an oversized domain or unfinished
+tree returns UNKNOWN, never a proof of a sampled prefix. The default 400 probe
+runs and two hash seeds permit at most 200 single-draw values.
+
 Measured ([host], 15 min / 15 GB, 4 jobs): `bm_spectral_norm_nondet`, `bm_unpack_sequence_nondet` and
 `bm_regex_v8_nondet` are TRUE (3 properties each, 6 probe runs). `bm_hexiom_nondet` is refused: it turns
 `done[id][0]`, whose type the census cannot see, into text that its output comparison reads. `bm_nbody_nondet`
@@ -687,6 +1074,12 @@ soundness review of the first `output_only` cut, [internal ref]):
   `seen` set) so mutual recursion terminates too. `prove.py`'s `str`-kind domain collapses
   the draw to `["", "x"]` -- BOTH the empty and non-empty case, explicitly, never a single
   stand-in value (the owner's [internal ref] lesson: truthiness is itself value-dependent).
+   The callee table answers additionally (the symexec-funcvals construct, mirrored):
+   a proven user class's constructor (`_Planner._str_ctor`, the trip side's own `_ctor`
+   with the `call_target` fact: `Canvas(nondet_str())`), and a def REFERENCE bound exactly
+   once (`_Planner._def_reference_callee`: `f = func; f(nondet_str())`); a draw already in
+   the call-argument position (`Canvas(nondet_str())`) follows inside the callee's matching
+   parameter when the callee resolves.
 
   This gets `bm_raytrace_nondet.py`'s own `args_filename` (-> `bench_raytrace`'s `filename`
   parameter -> `Canvas.write_ppm`'s own `filename` parameter -> `open()`) all the way
@@ -756,6 +1149,25 @@ literal-path, an unconditional-insert, a shadowing-root, an imported-code-runs-t
 package-semantics probe, plus a real-crash negative control) live in
 `tests/test_import_boundary.py`.
 
+### What a source module may be as a value in `determinism_census` (lane 1493, 2026-10-31)
+
+The certificate used to refuse every use of a name of a task-bundled source module except a direct call of an undecorated function (and a
+from-imported function name chosen or stored). It now admits more, because the module is program code (censused with every other file) and
+what it exports reaches the main file as a value of UNKNOWN provenance: a text conversion, set order, `id` / `hash` or text use of it refuses
+on its own, exactly as for any unknown value. Admitted, and only these (`determinism.py::_source_export_kind`):
+
+* a **function** or **class** bound once, undecorated (a module attribute used as a value, `saved = mod.f`; an imported class `from m import K`);
+* a **literal constant** bound once at the top level (`provenance.py::module_constant`: no other binding, `global`, `del`, or attribute store
+  spelled like it in any scanned file): its scalar type is known, so `d[k]` / `str(k)` stay certifiable;
+* an **alias** of one of these (`func = to_import2.func`), and a **submodule** (`m = pkg if c else pkg.sub`: `Resolver(_value_reflection=True)`,
+  determinism only; a stdlib module used as a value stays refused);
+* the **reads** `C.__bases__` / `C.__mro__` (`pyresolve.CLASS_REFLECTION`, loads only: a store, `getattr(C, "__mro__")`, `__subclasses__`,
+  `__dict__` stay refused): a tuple of classes in a fixed order, the same on every run.
+
+Still refused: a name rebound to a builtin or library object (`func = print` would print any argument's address), a decorated def or class,
+a computed export. `census.py` / `absint` keep refusing a module as a value (the flag is not passed to them).
+Tests: `tests/test_determinism_source_values.py`, `tests/test_imported_function_values.py`.
+
 ## os / os.path ([internal ref]): a three-way split, not a blanket refusal
 
 `import os` used to make `pyresolve.py::Resolver._imports` raise `Top` unconditionally (`os`
@@ -774,7 +1186,11 @@ HAVOC even for an absolute literal, MG's PR 106 review), HAVOC (`getenv`/`getcwd
 refuses, but its argument TYPE is still checked (a definitely-wrong type, e.g.
 `os.getenv(5)`, is a checked TypeError, not a silent havoc RESULT -- also MG's PR 106
 review) and `determinism.py::check_os` refuses the DETERMINISM claim unconditionally, the
-same stance already taken for `os.urandom`/unseeded `random`), and REFUSED (`os.environ`
+same stance already taken for `os.urandom`/unseeded `random`; svaudit 2026-10-29 found the
+census still listing `abspath` and `realpath` as pure, so 0.2.1 certified a program whose run
+read the child's scratch cwd -- the census now refuses `realpath` always and `abspath` unless
+its one argument is an absolute literal or an unbound `__file__`, the cases absint also computes
+exactly), and REFUSED (`os.environ`
 used bare, `system`, `remove`, `chdir`, `mkdir`, `fork`, `kill`, `exec*`, `putenv`,
 `os.open`, ...).
 
@@ -854,7 +1270,8 @@ tokens and the patterns' literal runs (64 entries at most, guards first: libFuzz
 entry that does not matter dilutes the ones that do -- on the m131 target the 6 guard tokens found the kill in
 seconds, a 180-token dictionary of every literal and class member did not in 60 s); and the corpus holds the
 program's and the called code's string literals, a few SHORTEST strings each of its regexes accepts
-(`_regex_samples`, through `solve/condition.py::_generate_from_regex`), and `_composed_seeds`: those samples
+(`_regex_samples`, enumerated deterministically by `solve/preimage/regex_members.py` since [internal ref] PR3: Hypothesis'
+random samples made the m131 kill depend on drawing a short one), and `_composed_seeds`: those samples
 with the guards' tokens wrapped round the leading segment (`"a"@bc.de`), round the whole sample, and inserted at
 every boundary. A regex sample satisfies the pattern but no guard, a guard token satisfies one guard and breaks
 the pattern; a corpus entry that has both is zero mutations from a kill that needs both (a quoted local part in
@@ -864,12 +1281,132 @@ candidate is replayed in a fresh child before it can mean anything. `tests/test_
 the call graph, the tokens and patterns, the composed seeds, and the end-to-end kill of a product over a shipped
 library.
 
+## A caller above SV: `tharkun.inputs` ([internal ref])
+
+`src/tharkun/inputs.py` (TOOLS, [INPUTS.md](INPUTS.md)) is the one door that callers outside tharkun use
+to search at run time. It turns a plain-JSON question about one entry function into an SV program:
+typed parameters drawn through `_sv_verifier`, fixed values as literals, and ONE `assert` that fails
+exactly when the wanted observation holds. It decides that program with `engine.py::verify`, the scheduler
+and stages above, unchanged. It then replays every row it returns with `engine.py::run_once` in a fresh
+child, with the row as literals.
+
+Nothing in SV changed for it. SV-COMP semantics are untouched, and in particular `nondet_str` stays
+printable. A full-domain `str` parameter is an encoding in the generated harness: the printable
+`nondet_str()` arm, or a length draw plus one payload draw read as code points.
+
+It relies on four existing properties of this subsystem:
+
+* the child's raise site is the innermost frame in the program's directory (`_child.py::run`). So a
+  target's own `AssertionError` is told apart from the harness's by its line;
+* `harvest_constants` reads the harness's own literals. So the harness carries the callee's literals as a
+  constant pool from `reach.py::called`;
+* the hybrid stage's obligations come from `assert` statements when the census has none
+  (`hybrid.py::_assert_fallback`). So the want is a bare `assert`, never a `raise`;
+* the enumeration's cost is quadratic in a run's draw count (`scheduler.py::run`'s `expand`). So the
+  harness bounds a run's draws (`inputs.py::MAX_DRAWS`).
+
+## Per-check composition
+
+`sv/combined_proof.py` can complete assertion safety when a complete abstract
+interpretation proves some original checks and exact symbolic execution proves
+all checks in a sound scalar projection. The shared obligation table supplies
+eligibility hints and retains source-bound coverage evidence; published statuses
+alone never discharge a check. Coverage uses original source hashes and AST paths,
+including distinct assertions on the same line.
+
+`solve/product_slice.py` admits closed, single-assignment scalar modules with
+plain, effect-free helpers. It deletes independent float computations and only
+those float assertions freshly proved safe by abstract interpretation. Uncaught
+non-property exits may disappear, which adds paths. Every retained helper body
+stays intact, transitively; the existing product allowlist audits the entire
+projection and proves every assertion left there. Projected SAT is UNKNOWN and
+never enters native FALSE replay. Coverage-guided input generation and ordinary
+symbolic execution retain their existing original-program replay requirements.
+
+The independent witness checker can rebuild this cover for a tautological
+original-location witness. It receives no producer decisions or recorded safe
+statuses. Floats retain binary64 abstract semantics; integers use the existing
+unbounded exact model and strings the audited code-point sequence model, without
+length or arity bounds. Unknown effects, mutation, handlers, classes, reflection,
+rebindings and unsupported control flow refuse this projection. Its per-run
+budget expires to UNKNOWN. Tests: `tests/test_product_slice.py` and
+`tests/test_sv_combined_proof.py`.
+
+## Order-only small model (lane 1519)
+
+A bounded list program whose drawn element values reach only order and equality operations behaves identically on
+order-isomorphic inputs, so finitely many rank patterns cover EVERY input. `sv/order_only.py` decides when that holds and
+runs the patterns; the scheduler's stage 3a' (`sv/scheduler.py::run`, inner `order_only_stage`, before the finite-domain sweep (`sv/finite_domain.py`) and the solving
+portfolio) turns the outcome into a verdict: TRUE (component `order_only`) when every pattern
+ran without a violation and `_engine._certify_determinism` certifies the runs (the same certificate `finite_tree` needs),
+FALSE (component `order_only`) when a pattern violates AND the same vector replays in a fresh child through `run` (the usual
+`found` path), otherwise nothing (the search goes on). Components are ordered abstract interpretation, then the exact
+symbolic product proof, then concolic path exhaustion, then this rule (owner, 2026-11-05: rank-pattern enumeration is the last
+fallback; ruled, the first three are 1518's and the abstract-interpretation lane's).
+
+**Fragment (what `order_only.analyze` accepts).** The draws are the first statements of one body (the module or a
+parameterless function called once): `nondet_list(nondet_int)`, scalar `nondet_int()`, `nondet_bool()`. Directly after them
+only pure statements may stand (linear aliases such as `n = len(arr)`, and `if <test>: return` whose test is a comparison /
+and / or / not over linear integer expressions of `len(list)`, constants and index scalars: it cannot raise) -- their
+necessary atoms give every list an upper length bound and every INDEX scalar a finite range (`0 <= k < len(arr)`).
+A scalar is a VALUE (compared with elements: `find_first_in_sorted`'s `x`) or an INDEX (used in arithmetic, as an index, in a
+`range`: `kth`'s `k`); the analysis tries value first, then index (at most three scalars), and an index scalar without a
+finite range is a refusal. Index scalars and bool draws are enumerated concretely; list elements and value scalars as the weak
+orderings of at most `MAX_VALUES` (7) ranks; a plan over `MAX_RUNS` (80 000) runs, or an index domain over 64 values, is refused.
+
+**Soundness argument.** `order_only._Analyzer` is a unification-based taint analysis over the WHOLE module (callees, comprehensions,
+globals, loops), not a name list. Every expression gets a type node: `val` (a drawn element), `seq` (a list/tuple with an element
+node), `clean` (holds no drawn value) or unbound. Unifying `val` with `clean`, or a `seq` of `val` with `clean`, is a refusal:
+a value that meets a constant, a length, a counter, an index, a dict key... has left the fragment. Unification is
+bidirectional, so aliasing (`b = a`, arguments, returns, `append`) cannot hide a value in something the analysis thinks is clean.
+Operations that read a value as a number are requirements checked after the fixpoint (flow-insensitivity only refuses more): arithmetic
+and bit operations, `abs`/`round`/`divmod`/`int`/`str`/`format`/`repr`/`hash`/`id`/`isinstance`/`type`, a value as index, slice bound,
+`range` argument, repeat count, dict or set key or element, truthiness (`if v`, `not v`, `and`/`or`), `is` on a value, an f-string, an
+unknown or library call with a value argument, a method called on a value. Shape-polymorphic operations (`+`, `*`, subscripts,
+methods) are resolved to a fixpoint on the final types (an unbound base is clean). Anything unmodelled -- classes, lambdas,
+`global`/`nonlocal`, `with`, `del`, generators, star arguments, a call through a variable or of a computed callee, imports outside a
+small allow-list, `eval`/`getattr`/`globals`/`open`..., a draw outside the prelude -- is a refusal anywhere in the module. What remains
+can only branch on, copy, sort, compare (`< <= > >= == !=`, `in` over a list or tuple), `min`/`max`/`sorted` (no key), store in
+lists and return values; two vectors that are order-isomorphic (same weak ordering, same index scalars, same lengths) therefore take the same
+path and raise the same exception class. Each run is native (`sv/_order_child.py`: a fresh `__main__` module per vector under one
+fork each, the vector consumed exactly or the run is an anomaly) and TRUE additionally needs the determinism certificate;
+a program that is not certified stays UNKNOWN. Boundary: elements are `nondet_int` only (no floats, strings, bools as elements); a
+value compared with a constant is refused (constants are not yet placed in the ordering: ruled out, not built); lists
+unbounded by a guard, joint length constraints (`len(a)+len(b) <= 6`) and guards after other code are refused.
+
+**Files and how they relate.** `sv/order_only.py` (analysis `analyze`, plan `Plan`, enumeration `WeakOrderings` behind the
+`OrderEnumerator` protocol, `run_plan`) is imported lazily by `sv/scheduler.py`; it launches `sv/_order_child.py` as a script
+(`python _order_child.py request.json`, nothing imported from tharkun); `sv/contracts.py::COMPONENTS` carries the contract row;
+`tests/test_order_only.py` holds the adversarial probes (a value reaching arithmetic, indexing, a set, hashing, `str()`, a
+truthiness test, an alias... each must be refused). The enumerator seam exists so the finite-domain enumeration of lane 1518 (T178) can
+replace `WeakOrderings` without touching the analysis.
+
 ## Files and how they relate
 
 Measured from the committed source in this branch by `scripts/doc_import_map.py::compute_ast_imports`, including lazy imports.
 
-### Subsystem: `tharkun.sv` (40 files)
+### Subsystem: `tharkun.sv` (55 files)
 
+- `src/tharkun/sv/order_only.py`
+  - **Role**: The order-only small model (lane 1519): a whole-module taint analysis of when drawn list elements reach only order and equality operations, the early-return-guard length bounds, the weak-ordering enumeration (behind `OrderEnumerator`) and the batch runner.
+  - **Imports (tharkun.sv)**: none
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/scheduler.py`
+- `src/tharkun/sv/_order_child.py`
+  - **Role**: Batch child of the order-only model: one interpreter, one fork per draw vector, a minimal `_sv_verifier` that replays the vector; imports nothing from tharkun.
+  - **Imports (tharkun.sv)**: none
+  - **Is imported by (tharkun.sv)**: none
+- `src/tharkun/sv/_invariant_observer.py`
+  - **Role**: Optional stdlib-only monitoring helper in disposable native children; copies exact builtin scalar values and materialized lengths as untrusted observations.
+  - **Imports (tharkun.sv)**: none
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_child.py`
+- `src/tharkun/sv/observed_invariants.py`
+  - **Role**: Plans original assertion/while observation points and proposes all-sample-pruned range, affine, length and type candidates; independent source checking alone certifies them.
+  - **Imports (tharkun.sv)**: none
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/fact_producers.py`, `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/scheduler.py`
+- `src/tharkun/sv/combined_proof.py`
+  - **Role**: Fresh source-bound coverage of every original assertion by complete absint and exact symbolic execution of a sound scalar projection.
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`, `src/tharkun/sv/product_proof.py`, `src/tharkun/sv/store_witness.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/scheduler.py`, `src/tharkun/sv/validate.py`
 - `src/tharkun/sv/__init__.py`
   - **Role**: Package root for `tharkun.sv` (DRIVE layer; docs/LAYERS.md).
   - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`, `src/tharkun/sv/spec.py`
@@ -880,19 +1417,23 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
   - **Is imported by (tharkun.sv)**: none
 - `src/tharkun/sv/_child.py`
   - **Role**: Child-process execution model for `_sv_verifier` draws, random interposition, run classification, isolation, and replay. Imports no `tharkun` module (`tests/test_layering.py::test_the_sv_child_imports_no_tharkun`).
-  - **Imports (tharkun.sv)**: none
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/_invariant_observer.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_concolic_worker.py`, `src/tharkun/sv/_forkserver.py`, `src/tharkun/sv/_hybrid_worker.py`, `src/tharkun/sv/_probe.py`, `src/tharkun/sv/engine.py`, `src/tharkun/sv/nondet_harness.py`
 - `src/tharkun/sv/_concolic_worker.py`
-  - **Role**: Helper process for concolic solving: executes harness and drives to target sites; the one `sv/*` file that imports another Tharkun layer (`tharkun.driver`), running in its own capped process.
+  - **Role**: Helper process for concolic solving: executes harness and drives to target sites; the one `sv/*` file that imports another Tharkun layer (`tharkun.driver`, and `tharkun.knowledge` for the reach mode's store), running in its own capped process. `"mode": "reach"` ([internal ref], `_reach`): the same admission and confinement, one `driver.py::drive_to_line` per hint target from a generated drive entry, no draw harness; reports reached inputs as `repr` text and the drive store's facts.
   - **Imports (tharkun.sv)**: `src/tharkun/sv/_child.py`, `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/sites.py`
   - **Is imported by (tharkun.sv)**: none
 - `src/tharkun/sv/_forkserver.py`
   - **Role**: Preloaded child forkserver: pre-initializes Python state and forks fast replay children, importing sibling `_child.py`.
   - **Imports (tharkun.sv)**: `src/tharkun/sv/_child.py`
   - **Is imported by (tharkun.sv)**: none
+- `src/tharkun/sv/_hybrid_draws.py`
+  - **Role**: The byte layout of the hybrid worker's draws and its inverse ([internal ref], [internal ref] PR3). A `nondet_str` takes every input byte the program's LATER known draws (`kinds`, from its first run) do not need, up to `STR_DRAW_MAX` = 4096 characters; before, it was a 64-byte field that also starved a later `nondet_bool`. A str drawn OFF that known sequence (`on_script`: the run's draws so far are not the first run's, or the first run drew no str there -- an element of a collection that was empty in the first run, [internal ref]) is length-prefixed instead (`consume_str`: one byte `L`, then at most `L` bytes), so it never starves the draws after it. `encode`/`encode_checked`/`decode` write a whole draw vector as the exact bytes that decode back to it, with the real `atheris.FuzzedDataProvider` as the check. Measured layout on atheris 3.1.0: `ConsumeBytes`/`ConsumeInt`/`ConsumeBool` read from the front, `ConsumeIntInRange` from the back (`tests/test_sv_hybrid_draws.py`). Imports no `tharkun` module.
+  - **Imports (tharkun.sv)**: none
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_hybrid_worker.py`, `src/tharkun/sv/hybrid.py`
 - `src/tharkun/sv/_hybrid_worker.py`
-  - **Role**: Subprocess fuzzer worker for Atheris/libFuzzer-driven obligation search. Installs the engine child's environment model (`src/tharkun/solve/environment.py::install_files`, imported by bare name with self-cleaning `sys.path` insert) with stdin `/dev/null` (`tests/test_sv_hybrid_sandbox.py`). Imports no `tharkun` module.
-  - **Imports (tharkun.sv)**: `src/tharkun/sv/_child.py`
+  - **Role**: Subprocess fuzzer worker for Atheris/libFuzzer-driven obligation search. Installs the engine child's environment model (`src/tharkun/solve/environment.py::install_files`, imported by bare name with self-cleaning `sys.path` insert) with stdin `/dev/null` (`tests/test_sv_hybrid_sandbox.py`). Decodes draws through `src/tharkun/sv/_hybrid_draws.py` (loaded by bare name like `_child.py`), with the program's draw `kinds` from `request.json`. Imports no `tharkun` module.
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/_child.py`, `src/tharkun/sv/_hybrid_draws.py`
   - **Is imported by (tharkun.sv)**: none
 - `src/tharkun/sv/_probe.py`
   - **Role**: Observation child process for stationarity proofs: imports sibling `_child.py` for the same draw model, adding the loop wrapper, snapshot, quotient moduli, and output-file model (`_OutputFile`, `_output_open`) enabled through `prove.py::run_probe`. Imports no `tharkun` module (`tests/test_layering.py::test_the_sv_child_imports_no_tharkun`).
@@ -900,14 +1441,22 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
   - **Is imported by (tharkun.sv)**: none
 - `src/tharkun/sv/_symexec.py`
   - **Role**: Z3-based symbolic execution engine the concolic worker calls: `solve_targets` (whole-harness run) and `solve_site` (one site's backward slice); also provides `run_exact` for product proofs.
-  - **Imports (tharkun.sv)**: `src/tharkun/sv/_symexec_objects.py`, `src/tharkun/sv/symexec_visitor.py`
-  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_concolic_worker.py`, `src/tharkun/sv/_symexec_math.py`, `src/tharkun/sv/_symexec_objects.py`, `src/tharkun/sv/product_proof.py`, `src/tharkun/sv/string_regex.py`, `src/tharkun/sv/symexec_visitor.py`
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/_symexec_objects.py`, `src/tharkun/sv/_symexec_streams.py`, `src/tharkun/sv/_symexec_world.py`, `src/tharkun/sv/exact_callables.py`, `src/tharkun/sv/exact_classes.py`, `src/tharkun/sv/exact_identity.py`, `src/tharkun/sv/exact_strings.py`, `src/tharkun/sv/exact_subset.py`, `src/tharkun/sv/exact_unroll.py`, `src/tharkun/sv/symexec_visitor.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_concolic_worker.py`, `src/tharkun/sv/_symexec_math.py`, `src/tharkun/sv/_symexec_objects.py`, `src/tharkun/sv/_symexec_streams.py`, `src/tharkun/sv/_symexec_world.py`, `src/tharkun/sv/exact_classes.py`, `src/tharkun/sv/exact_identity.py`, `src/tharkun/sv/product_proof.py`, `src/tharkun/sv/string_regex.py`, `src/tharkun/sv/symexec_visitor.py`
 - `src/tharkun/sv/_symexec_math.py`
   - **Role**: Consumer of `math` contracts through `symexec_visitor.py::SymexecVisitor.visit_math_function`, which lazily calls `_symexec_math.py::call`; constants use `visit_math_constant`. Reads the concolic math adapters; covered by `tests/contracts/test_adapters_concolic_math.py`.
   - **Imports (tharkun.sv)**: `src/tharkun/sv/_symexec.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/symexec_visitor.py`
 - `src/tharkun/sv/_symexec_objects.py`
   - **Role**: Model of program classes (heap, live classes, named refusals) for `_symexec.py::_Runner` ([internal ref]); relates to `src/tharkun/solve/call_targets.py` via the `call_target` fact.
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/_symexec.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/exact_classes.py`
+- `src/tharkun/sv/_symexec_streams.py`
+  - **Role**: Program-owned native and symbolic buffer/cursor projections, distinct from mocked input worlds.
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/_symexec.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_symexec.py`
+- `src/tharkun/sv/_symexec_world.py`
+  - **Role**: Search-only symbolic text-file handles, path predicate projection and transactional world snapshots. Reuses `solve/world.py::WorldObject.add` and its producers; the exact proof executor does not enable world reads.
   - **Imports (tharkun.sv)**: `src/tharkun/sv/_symexec.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_symexec.py`
 - `src/tharkun/sv/_vendored_py_method_lift.py`
@@ -919,7 +1468,7 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
   - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/stages.py`
 - `src/tharkun/sv/concolic.py`
-  - **Role**: Concolic solving driver (`solve`, `Solved`). Writes the draw-parameterized harness through `sites.py::build_harness` and starts `_concolic_worker.py` in a subprocess. Called through `scheduler.py::run` and `stages.py::_concolic`; reports named harness refusals.
+  - **Role**: Concolic solving driver (`solve`, `Solved`). Writes the draw-parameterized harness through `sites.py::build_harness` and starts `_concolic_worker.py` in a subprocess (`_run_worker`, shared with `reach`). Called through `scheduler.py::run` and `stages.py::_concolic`; reports named harness refusals and the worker's admission refusal (`Solved.refusal`, [internal ref]). `reach`/`Reached` ([internal ref]): the same worker in reach mode, called by `src/tharkun/inputs.py`'s `reach` rung (a TOOLS caller, not a stage).
   - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`, `src/tharkun/sv/sites.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/hybrid.py`, `src/tharkun/sv/scheduler.py`, `src/tharkun/sv/stages.py`
 - `src/tharkun/sv/contracts.py`
@@ -927,28 +1476,52 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
   - **Imports (tharkun.sv)**: none
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/obligation_table.py`
 - `src/tharkun/sv/engine.py`
-  - **Role**: Verification entry point and shared verdict/replay types (`verify`, `run_once`, `Outcome`, `Verdict`, `Candidates`). `verify` delegates to `scheduler.py::run`; `run_once` starts `_child.py` in a subprocess.
+  - **Role**: Verification entry point and shared verdict/replay types (`verify`, `run_once`, `Outcome`, `Verdict`, `Candidates`). `verify` delegates to `scheduler.py::run`; `run_once` starts `_child.py` in a subprocess. `verify(seed_vectors=)` ([internal ref]): a caller's whole draw vectors, proposals only.
   - **Imports (tharkun.sv)**: `src/tharkun/sv/_child.py`, `src/tharkun/sv/prove.py`, `src/tharkun/sv/scheduler.py`
-  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/__init__.py`, `src/tharkun/sv/__main__.py`, `src/tharkun/sv/avengers_seed.py`, `src/tharkun/sv/concolic.py`, `src/tharkun/sv/eregion_bridge.py`, `src/tharkun/sv/fact_producers.py`, `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/forkserver.py`, `src/tharkun/sv/guard_values.py`, `src/tharkun/sv/ledger.py`, `src/tharkun/sv/nondet_harness.py`, `src/tharkun/sv/product_proof.py`, `src/tharkun/sv/proof.py`, `src/tharkun/sv/prove.py`, `src/tharkun/sv/reach.py`, `src/tharkun/sv/scheduler.py`, `src/tharkun/sv/solver_seeds.py`, `src/tharkun/sv/stages.py`, `src/tharkun/sv/store_witness.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/__init__.py`, `src/tharkun/sv/__main__.py`, `src/tharkun/sv/avengers_seed.py`, `src/tharkun/sv/combined_proof.py`, `src/tharkun/sv/concolic.py`, `src/tharkun/sv/eregion_bridge.py`, `src/tharkun/sv/fact_producers.py`, `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/forkserver.py`, `src/tharkun/sv/guard_values.py`, `src/tharkun/sv/ledger.py`, `src/tharkun/sv/nondet_harness.py`, `src/tharkun/sv/product_proof.py`, `src/tharkun/sv/proof.py`, `src/tharkun/sv/prove.py`, `src/tharkun/sv/reach.py`, `src/tharkun/sv/scheduler.py`, `src/tharkun/sv/solver_seeds.py`, `src/tharkun/sv/stages.py`, `src/tharkun/sv/store_witness.py`
 - `src/tharkun/sv/eregion_bridge.py`
   - **Role**: Candidate fact ingestion (`publish_fact`, `publish_certified`) into Tharkun's `knowledge.py::KnowledgeBase`; reads `solve/obligations.py::Invariant`. External producers communicate through the separate process/JSON seam.
   - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`
-  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/stages.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/hybrid.py`, `src/tharkun/sv/stages.py`
+- `src/tharkun/sv/exact_callables.py`
+  - **Role**: Static closed source-def flow and exact positional/keyword binding for scalar product proofs; lifts closed callback lambdas and once-bound named lambdas (module level, function scope, a never-mutated dict of lambdas: `lift_named_lambdas`) to defs; never executes source.
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/exact_unroll.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/exact_subset.py`, `src/tharkun/sv/product_proof.py`
+- `src/tharkun/sv/exact_classes.py`
+  - **Role**: Source-only audited plain classes for product proofs; reuses the symbolic object heap and inlines whole methods.
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/_symexec_objects.py`, `src/tharkun/sv/exact_identity.py`, `src/tharkun/sv/exact_subset.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/exact_subset.py`, `src/tharkun/sv/product_proof.py`
+- `src/tharkun/sv/exact_closures.py`
+  - **Role**: Authenticate the existing returned additive scalar capture and make its creation-time snapshot explicit; ordinary whole-source audit remains mandatory.
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/exact_decorators.py`, `src/tharkun/sv/exact_unroll.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/product_proof.py`
+- `src/tharkun/sv/exact_decorators.py`
+  - **Role**: Authenticate closed source-owned forwarding decorators without dropping callee effects or bypassing the name audit.
+  - **Imports (tharkun.sv)**: none
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/exact_closures.py`, `src/tharkun/sv/product_proof.py`
+- `src/tharkun/sv/exact_identity.py`
+  - **Role**: Guarded scalar alias origins for plain-class identity proofs, with unconstrained allocation/interning and native replay for SAT.
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/exact_subset.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/exact_classes.py`
+- `src/tharkun/sv/exact_strings.py`
+  - **Role**: Proof-only builtin string equality, concatenation and emptiness using literal code-point sequences; string SAT remains with native search.
+  - **Imports (tharkun.sv)**: none
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/product_proof.py`
 - `src/tharkun/sv/exact_subset.py`
   - **Role**: Exact AST subset validator (`audit`) admitting only modeled product-proof constructs. Reads `exact_unroll.py`, contract rules (`Refused`, `get_rule`), and `ProductVisitor` for proof admission.
-  - **Imports (tharkun.sv)**: `src/tharkun/sv/exact_unroll.py`
-  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/product_proof.py`
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/exact_callables.py`, `src/tharkun/sv/exact_classes.py`, `src/tharkun/sv/exact_unroll.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/exact_classes.py`, `src/tharkun/sv/exact_identity.py`, `src/tharkun/sv/product_proof.py`
 - `src/tharkun/sv/exact_unroll.py`
   - **Role**: Static, bounded exact loop unrolling for the product prover: literal tuples, ranges, alias-free lists, and counter loops; named refusal when the exact subset cannot be preserved.
   - **Imports (tharkun.sv)**: none
-  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/exact_subset.py`, `src/tharkun/sv/product_proof.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/exact_callables.py`, `src/tharkun/sv/exact_closures.py`, `src/tharkun/sv/exact_subset.py`, `src/tharkun/sv/product_proof.py`, `src/tharkun/sv/sites.py`
 - `src/tharkun/sv/fact_producers.py`
   - **Role**: Fact producer discovery and process isolation driver; runs external invariant producers and collects candidate facts; imports `engine.py::_cap_memory` lazily.
-  - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`, `src/tharkun/sv/observed_invariants.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/fact_proof.py`
 - `src/tharkun/sv/fact_proof.py`
   - **Role**: Stage 3b fact-based proof consumer (`prove_from_facts`). Coordinates discovery via `fact_producers.py`, store ingestion via `eregion_bridge.py`, and independent validation via `validate.py::check_candidates_individually`.
-  - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`, `src/tharkun/sv/eregion_bridge.py`, `src/tharkun/sv/fact_producers.py`, `src/tharkun/sv/obligation_table.py`, `src/tharkun/sv/proof.py`, `src/tharkun/sv/store_witness.py`, `src/tharkun/sv/validate.py`
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`, `src/tharkun/sv/eregion_bridge.py`, `src/tharkun/sv/fact_producers.py`, `src/tharkun/sv/obligation_table.py`, `src/tharkun/sv/observed_invariants.py`, `src/tharkun/sv/proof.py`, `src/tharkun/sv/store_witness.py`, `src/tharkun/sv/validate.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/scheduler.py`
 - `src/tharkun/sv/forkserver.py`
   - **Role**: Process lifecycle manager (`ForkServer`) managing persistent preloaded forkservers (`_forkserver.py`) across threads.
@@ -959,8 +1532,8 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
   - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/solver_seeds.py`, `src/tharkun/sv/stages.py`
 - `src/tharkun/sv/hybrid.py`
-  - **Role**: Portfolio search stage (`search`, `deepen`). Starts `src/tharkun/sv/_hybrid_worker.py` as a subprocess through `tharkun.hybrid.backend::AtherisBackend`, in the stage's own temporary directory (`cwd=`), with `-artifact_prefix` inside it (`artifact_dir=`): libFuzzer writes its `crash-*`, `leak-*`, `timeout-*`, `oom-*` and `slow-unit-*` files to the prefix, which defaults to the subprocess's current directory -- before [internal ref] they landed in whatever directory `tharkun.sv` was launched from. The backend always passes a prefix (its own private temporary directory when the caller names none, removed at `stop()`); `tests/hybrid/test_backend_artifacts.py` holds that. The worker runs the program for real, so it installs the engine child's environment model (`src/tharkun/solve/environment.py::install_files`, imported by bare name with the same self-cleaning `sys.path` insert as `src/tharkun/sv/_child.py`; declared files arrive as `Context.files` through `request.json`'s `files`), and its stdin is `/dev/null`: a program that opens, truncates or writes a file it does not own gets the same refusal there as in a replay (before this, a verify with a few seconds of budget truncated such a file on the host); `tests/test_sv_hybrid_sandbox.py` holds that. Imports `src/tharkun/sv/reach.py`, `tharkun.hybrid.backend::AtherisBackend`, and lazily `src/tharkun/solve/census.py::obligation_census`.
-  - **Imports (tharkun.sv)**: `src/tharkun/sv/concolic.py`, `src/tharkun/sv/reach.py`, `src/tharkun/sv/stages.py`
+  - **Role**: Portfolio search stage (`search`, `deepen`). `_seed_corpus` writes `Context.seed_vectors` first, as `encode_checked` bytes, when their kinds are the first run's ([internal ref]). Starts `src/tharkun/sv/_hybrid_worker.py` as a subprocess through `tharkun.hybrid.backend::AtherisBackend`, in the stage's own temporary directory (`cwd=`), with `-artifact_prefix` inside it (`artifact_dir=`): libFuzzer writes its `crash-*`, `leak-*`, `timeout-*`, `oom-*` and `slow-unit-*` files to the prefix, which defaults to the subprocess's current directory -- before [internal ref] they landed in whatever directory `tharkun.sv` was launched from. The backend always passes a prefix (its own private temporary directory when the caller names none, removed at `stop()`); `tests/hybrid/test_backend_artifacts.py` holds that. The worker runs the program for real, so it installs the engine child's environment model (`src/tharkun/solve/environment.py::install_files`, imported by bare name with the same self-cleaning `sys.path` insert as `src/tharkun/sv/_child.py`; declared files arrive as `Context.files` through `request.json`'s `files`), and its stdin is `/dev/null`: a program that opens, truncates or writes a file it does not own gets the same refusal there as in a replay (before this, a verify with a few seconds of budget truncated such a file on the host); `tests/test_sv_hybrid_sandbox.py` holds that. Imports `src/tharkun/sv/reach.py`, `tharkun.hybrid.backend::AtherisBackend`, and lazily `src/tharkun/solve/census.py::obligation_census`. Seeds the corpus ([internal ref] PR3, [internal ref]) with WHOLE draw vectors encoded by `src/tharkun/sv/_hybrid_draws.py::encode_checked` (the program's draw kinds from its first run, every bool both ways), and with deterministic regex members from `src/tharkun/solve/preimage/regex_members.py`: the shortest ones (`_regex_samples`, no longer Hypothesis' random draws), members at the reached code's `len(...)` constants and around a separator (`_boundary_samples`: a 320-character email whose `64@255` parts sit at their bounds), and members where one pattern text is compiled under different flags (`_flag_samples`: `'<!--\n-->'` for a DOTALL difference). `_composed_seeds` and the corpus files follow `STR_DRAW_MAX` instead of 256 bytes.
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/_hybrid_draws.py`, `src/tharkun/sv/concolic.py`, `src/tharkun/sv/eregion_bridge.py`, `src/tharkun/sv/reach.py`, `src/tharkun/sv/stages.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/stages.py`
 - `src/tharkun/sv/ledger.py`
   - **Role**: CPU-second and wall-clock time ledger (`Ledger`, [internal ref] step 3a); tracks spent/remaining budgets, live forkserver CPU, and compresses stage caps. Reads clocks via `engine.py`.
@@ -980,27 +1553,39 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/prove.py`, `src/tharkun/sv/scheduler.py`
 - `src/tharkun/sv/product_proof.py`
   - **Role**: Exact product proof engine (`prove`, stage 1b, [internal ref]/[internal ref]). Audits AST with `exact_subset.py::audit`, evaluates with `_symexec.py::run_exact`, and solves UNSAT/SAT with Z3; accepts draws inside defs ([internal ref]). Imports `sv/sites.py::LIFTED` at module level, `sv/engine.py` and `sv/sites.py::violation_sites` lazily.
-  - **Imports (tharkun.sv)**: `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/engine.py`, `src/tharkun/sv/exact_subset.py`, `src/tharkun/sv/exact_unroll.py`, `src/tharkun/sv/sites.py`, `src/tharkun/sv/store_witness.py`
-  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/scheduler.py`
+  - Guarded primitive checks first retain strict success obligations. A separate AssertionError-only fallback may end exact string/int-hint mismatch paths after argument evaluation; int/bool successes continue. Other values refuse the attempt. Both attempts use fresh lifted environments and share the solver budget; contract and whole-source authentication remain required.
+  - Closed source-def aliases and callback parameters use `exact_callables.py` to audit finite target sets and exact positional/keyword bindings. Closed one-parameter literal lambda arguments at once-only module/conditional sites normalize into fresh source defs before that audit; original body locations and native argument order remain. Captures, defaults, metadata access, escaping callables and repeated function-body lambda sites refuse. The scalar-only interpreter retains guarded function identities and returns, evaluates arguments once in native written order, and refuses containers and open dispatch. This adds no exception goal class.
+  - Unused authenticated builtin `bool` hints use the existing tested check_type contract and strict success obligations, preserving bool/int distinctions. Only bool satisfies a bool hint; int hints keep native int-or-bool success. The existing AssertionError-only primitive mismatch fallback runs after argument goals. String draws, opaque values, user hooks, used results and unsupported bindings remain refused by this checker extension; no new goal class or proof interface is added.
+  - The separate `exact_closures.py` rule admits only a plain one-parameter factory returning `lambda x: x+k` or `k+x`, with one unaliased module creation. It snapshots the argument once and preserves operand order, source bindings and ordinary audit. Source authentication precedes default/decorator/loop normalization; containers, mutable captures, defaults, rebinding, escape and broader factories refuse. Search closure semantics and the independent checker stay unchanged.
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/_symexec.py`, `src/tharkun/sv/engine.py`, `src/tharkun/sv/exact_callables.py`, `src/tharkun/sv/exact_classes.py`, `src/tharkun/sv/exact_closures.py`, `src/tharkun/sv/exact_decorators.py`, `src/tharkun/sv/exact_strings.py`, `src/tharkun/sv/exact_subset.py`, `src/tharkun/sv/exact_unroll.py`, `src/tharkun/sv/sites.py`, `src/tharkun/sv/store_witness.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/combined_proof.py`, `src/tharkun/sv/prove.py`, `src/tharkun/sv/scheduler.py`
 - `src/tharkun/sv/proof.py`
   - **Role**: Proof finalization (`finish`): checks candidate invariants through `validate.py` and exports confirmed Python correctness witnesses through `witness.py` in format 2.3.
   - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`, `src/tharkun/sv/store_witness.py`, `src/tharkun/sv/validate.py`, `src/tharkun/sv/witness.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/scheduler.py`, `src/tharkun/sv/store_witness.py`
 - `src/tharkun/sv/prove.py`
   - **Role**: Proof stage orchestrator: runs `prove_static` (census and absint) and `prove_dynamic` (`proof:stationary`). `prove_dynamic` calls `src/tharkun/solve/determinism.py::determinism_census` and `src/tharkun/solve/drawflow.py::plan_draws`, then launches `_probe.py` through `run_probe`.
-  - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`, `src/tharkun/sv/obligation_table.py`, `src/tharkun/sv/store_witness.py`
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`, `src/tharkun/sv/obligation_table.py`, `src/tharkun/sv/product_proof.py`, `src/tharkun/sv/store_witness.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/engine.py`, `src/tharkun/sv/scheduler.py`
 - `src/tharkun/sv/reach.py`
   - **Role**: Static reachability and call-graph analysis ([internal ref]). Reads imports and call graphs (stdlib only: `ast`, `os`, `re`, `string`), extracting tokens, regex patterns, and seed dictionaries. Called by `src/tharkun/sv/hybrid.py`. Imports `src/tharkun/sv/engine.py::read_source` and lazily `src/tharkun/solve/environment.py::TaskEnvironment`.
   - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/hybrid.py`
+- `src/tharkun/sv/_sweep_child.py`
+  - **Role**: Stdlib-only batched child of `proof:finite_domain`: runs one admitted program for thousands of integer draw vectors in one process and reports only the vectors that did not finish cleanly.
+  - **Imports (tharkun.sv)**: none
+  - **Is imported by (tharkun.sv)**: none
+- `src/tharkun/sv/finite_domain.py`
+  - **Role**: `proof:finite_domain` (T178): reads the box of integer draws the entry function's early-return guards leave (`derive_box`, `bounds`) and runs every vector (`sweep`; `sweep_batch` for a box over the cap, through `_sweep_child.py`); the scheduler adds the determinism certificate. See "Finite domain" in this file.
+  - **Imports (tharkun.sv)**: none
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/scheduler.py`
 - `src/tharkun/sv/scheduler.py`
-  - **Role**: Stage execution orchestrator (`run`, [internal ref]). Coordinates provers (`prove.py`, absint, `product_proof.py`), the obligation table (`obligation_table.py::ObligationTable`), the ledger (`ledger.py::Ledger`), the forkserver (`forkserver.py::ForkServer`), solving portfolio stages (`stages.py`), fact proofs (`fact_proof.py`), and canary runs.
-  - **Imports (tharkun.sv)**: `src/tharkun/sv/concolic.py`, `src/tharkun/sv/engine.py`, `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/forkserver.py`, `src/tharkun/sv/ledger.py`, `src/tharkun/sv/obligation_table.py`, `src/tharkun/sv/product_proof.py`, `src/tharkun/sv/proof.py`, `src/tharkun/sv/prove.py`, `src/tharkun/sv/spec.py`, `src/tharkun/sv/stages.py`, `src/tharkun/sv/store_witness.py`
+  - **Role**: Stage execution orchestrator (`run`, [internal ref]). Seed vectors ([internal ref]): admitted by `engine.py::vector_admissible`, put on `stages.py::Context.seed_vectors`, and their values seeded into the enumeration as component `seed:vectors`. Coordinates provers (`prove.py`, absint, `product_proof.py`), the obligation table (`obligation_table.py::ObligationTable`), the ledger (`ledger.py::Ledger`), the forkserver (`forkserver.py::ForkServer`), solving portfolio stages (`stages.py`), fact proofs (`fact_proof.py`), and canary runs.
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/combined_proof.py`, `src/tharkun/sv/concolic.py`, `src/tharkun/sv/engine.py`, `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/finite_domain.py`, `src/tharkun/sv/forkserver.py`, `src/tharkun/sv/ledger.py`, `src/tharkun/sv/obligation_table.py`, `src/tharkun/sv/observed_invariants.py`, `src/tharkun/sv/order_only.py`, `src/tharkun/sv/product_proof.py`, `src/tharkun/sv/proof.py`, `src/tharkun/sv/prove.py`, `src/tharkun/sv/spec.py`, `src/tharkun/sv/stages.py`, `src/tharkun/sv/store_witness.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/engine.py`
 - `src/tharkun/sv/sites.py`
   - **Role**: AST analysis only (stdlib; executes nothing): finds violation sites and synthesizes draw-parameterized harnesses (`build_harness`, `harness_refusal`, `violation_sites`). Imports `src/tharkun/solve/call_targets.py::call_target_index` lazily inside `_entry` ([internal ref]). Reached via `src/tharkun/sv/concolic.py` and `src/tharkun/sv/product_proof.py`.
-  - **Imports (tharkun.sv)**: none
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/exact_unroll.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_concolic_worker.py`, `src/tharkun/sv/concolic.py`, `src/tharkun/sv/product_proof.py`
 - `src/tharkun/sv/solver_seeds.py`
   - **Role**: Portfolio solver seeds stage (`_solver_seeds`). Derives boundary candidates from static guard conditions and scopes via `src/tharkun/sv/guard_values.py`.
@@ -1011,13 +1596,13 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
   - **Imports (tharkun.sv)**: none
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/__init__.py`, `src/tharkun/sv/__main__.py`, `src/tharkun/sv/scheduler.py`, `src/tharkun/sv/validate.py`
 - `src/tharkun/sv/stages.py`
-  - **Role**: Portfolio registry (`REGISTRY`, `Context`, `Stage`, `select`). Manages stage functions (`_concolic`, `_hybrid`, `_solver_seeds`, `_guard_values`, `_avengers`, `_producer`) and lazily invokes stage modules.
+  - **Role**: Portfolio registry (`REGISTRY`, `Context`, `Stage`, `select`). `Context.seed_vectors` carries the caller's seed vectors ([internal ref]) to the stages. Manages stage functions (`_concolic`, `_hybrid`, `_solver_seeds`, `_guard_values`, `_avengers`, `_producer`) and lazily invokes stage modules.
   - **Imports (tharkun.sv)**: `src/tharkun/sv/avengers_seed.py`, `src/tharkun/sv/concolic.py`, `src/tharkun/sv/engine.py`, `src/tharkun/sv/eregion_bridge.py`, `src/tharkun/sv/guard_values.py`, `src/tharkun/sv/hybrid.py`, `src/tharkun/sv/solver_seeds.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/__main__.py`, `src/tharkun/sv/hybrid.py`, `src/tharkun/sv/scheduler.py`
 - `src/tharkun/sv/store_witness.py`
   - **Role**: Experimental store-derived correctness witness. Projects the obligation table's site records into witness invariants (`project`), records and binds proof routes (`record_route`, `bind_route`), and, after the frozen checker and every legacy export, writes `store-witness.yml` next to `witness.yml` (`shadow`; skipped with `--no-store-witness`). Additive: a failure here never changes a verdict or `witness.yml`.
   - **Imports (tharkun.sv)**: `src/tharkun/sv/engine.py`, `src/tharkun/sv/proof.py`, `src/tharkun/sv/witness.py`
-  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/product_proof.py`, `src/tharkun/sv/proof.py`, `src/tharkun/sv/prove.py`, `src/tharkun/sv/scheduler.py`
+  - **Is imported by (tharkun.sv)**: `src/tharkun/sv/combined_proof.py`, `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/product_proof.py`, `src/tharkun/sv/proof.py`, `src/tharkun/sv/prove.py`, `src/tharkun/sv/scheduler.py`
 - `src/tharkun/sv/string_regex.py`
   - **Role**: Regex pattern constraint solver generating string models for concolic execution.
   - **Imports (tharkun.sv)**: `src/tharkun/sv/_symexec.py`
@@ -1028,7 +1613,7 @@ Measured from the committed source in this branch by `scripts/doc_import_map.py:
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/_symexec.py`
 - `src/tharkun/sv/validate.py`
   - **Role**: Candidate invariant validator (`check_candidates`, `check_candidates_individually`, `Validation`). Imports `src/tharkun/solve/census.py::obligation_census`, `src/tharkun/solve/obligations.py` (`Invariant`, `source_points`), `src/tharkun/solve/predicates.py` (`BUILTINS`, `check_predicate`), `src/tharkun/sv/spec.py::parse_property`, and `src/tharkun/sv/witness.py::loads`.
-  - **Imports (tharkun.sv)**: `src/tharkun/sv/method_lift.py`, `src/tharkun/sv/spec.py`, `src/tharkun/sv/witness.py`
+  - **Imports (tharkun.sv)**: `src/tharkun/sv/combined_proof.py`, `src/tharkun/sv/method_lift.py`, `src/tharkun/sv/spec.py`, `src/tharkun/sv/witness.py`
   - **Is imported by (tharkun.sv)**: `src/tharkun/sv/__main__.py`, `src/tharkun/sv/fact_proof.py`, `src/tharkun/sv/proof.py`
 - `src/tharkun/sv/witness.py`
   - **Role**: Python correctness-witness format 2.3 serialization and source/hash/location metadata; candidates reach it only after proof confirmation.
@@ -1229,9 +1814,12 @@ comparison reads (`_child.py`, `scheduler.py`):
   decorator, slots or descriptor, so `==` is `is`, `<` raises a `TypeError` naming only the class
   and hashing is the object's. Tuple comparison stops at the first slot that is not identical, so
   which pair is compared and whether a tie reaches the instances is a function of the numbers
-  and of object identity, never of an address. In this mode only, `enumerate(<builtin container>)`,
-  an argument-free `set()` with `add` of plain members, and a function whose last statement
-  returns or raises (it cannot fall off and return `None`) are modelled.
+  and of object identity, never of an address. In this mode only, an argument-free `set()` with `add`
+  of plain members and a function whose last statement returns or raises (it cannot fall off and
+  return `None`) are modelled. `enumerate(<builtin container>)` is modelled in BOTH modes
+  (2026-11-05): its first implementation (`b0b8b842`, an AI session, Claude Sonnet 5.5) was wrong, it
+  decided by the mode, and by the evaluation order for a parameter, instead of by what is iterated
+  (a `str` yields `str`s whatever the mode); Opus sweep S13, `tests/test_determinism_enumerate.py`.
 
 Observed today for the reader of this section: the strict census already drops the dict-lookup
 text conversion whenever the provenance is `unsafe` (a handler, a lambda, a nested def, a
@@ -1241,6 +1829,60 @@ adversaries (an `__exit__` that suppresses on an address bit, `sys.exc_info` in 
 `__del__` that reads the exception, an overridden `sys.excepthook`, the `KeyError` chained as
 `__context__`) vary between runs, are refused in both modes and never come out TRUE:
 `tests/test_class_only_exceptions.py`.
+
+The same mode admits `check_type(value, hint)` for ANY value when the hint has no iterate / items effect
+(`solve/determinism.py::_Census.check_type_call`). Both harness stand-ins (the benchmark's variant and
+`_child.py`) evaluate the hint structurally, call `isinstance(value, hint)`, iterate or call `.items()` only for
+container hints, hash nothing, and format `{hint!r}` / `{value!r}` into the `TypeError` only on a MISMATCH, never on
+success. So for such a hint the only program code that can run is the `__class__` fallback of `isinstance` and,
+on a mismatch, a user `__repr__`; `determinism.py::isinstance_hook_reason` refuses the mode if any file defines,
+assigns or attribute-stores `__getattribute__`, `__getattr__`, `__class__`, `__instancecheck__`,
+`__subclasscheck__`, `__subclasshook__` or `__repr__`. The hint is a builtin scalar, `None`, `Any`, `Optional` /
+`Union` / `|` of those, the builtin class `type` or `type(None)`, or the bare name of a plain user class
+(`_Census.plain_user_class`: one module-level class, never rebound at module level (or by a `global`), not shadowed
+in a scope the hint is read in (a parameter or local of the same spelling in ANOTHER function does not matter), no
+base but `object` or another such class of the file (single or multiple inheritance: the metaclass is then `type`),
+no metaclass, no decorator, so an ABC, a `Protocol` or a variable holding the class never qualifies). The first
+version (d6dcf9df, 2026-10-16) accepted no user base and treated any same-spelled parameter anywhere in the file as a
+shadow; both were stricter than soundness needs, and the typpete tasks `mro`, `classes`, `class_pre_store` and
+`default_args_class` were refused for them. Container hints keep the literal-or-scalar
+rule. The scheduler asks for the mode in two places, each a separate re-run after the strict census refused:
+the deterministic TRUE and the finite-tree TRUE (the `nondet_bool` tasks of `type-eval-py`).
+`tests/test_class_only_check_type.py` has the native adversaries (an address-dependent `__class__` property, a
+spying `__getattribute__`, a metaclass `__instancecheck__`, a raising `__repr__`, `register()` on a branch, a
+rebound `Optional[C]`, a container hint over a user iterable).
+
+Determinism certificates added for the typpete input-free programs (lane 1519 SMALLEST-SET, DET_CHECKTYPE / DET_HASH / DET_SET,
+`tests/test_det_plain_class_hints.py`, `tests/test_det_typpete_certificates.py`; each has refused adversaries next to it):
+`check_type` takes a variable holding a builtin list / tuple / dict of scalars (nested allowed, no set but a set of ints, no
+cycle, no user object: `Provenance.scalar_container`) under a container hint, and the call is no escape in `Provenance.call`
+(it reads its arguments, the tested contract); the hints `object`, `type` and `type(None)` are closed with no effect; `hash(v)`
+of a number (int, bool, float, complex) is certified, of anything else it still refuses (`_Census.hash_calls`, judged once
+provenance exists); a set of ints that is never changed or aliased may be read in any order-sensitive way
+(`_Census.int_only_set`); a method call resolves through the C3 linearization of a multiple-inheritance chain of plain classes
+(`Provenance._c3`; an inconsistent order or a rebound base stays opaque); `dict.copy()` is a dict of the same keys and values;
+`str` as a function parameter or return annotation converts nothing unless the program reads annotations back
+(`_Census.parameter_annotation`). Not done (each still refuses, with its typpete task): a `try` anywhere switches the whole
+provenance off (eight_queens, list_methods), a method returning a comparison printed through `print` (disjoint_sets),
+`dict()` / `popitem` / `pop` on a float-keyed dict (dict_methods), a set passed through tuple unpacking (expressions1_fixed) and a
+dict comprehension over an int set (expressions).
+The strict census no longer refuses `str` / `repr` / `ascii` / `format` as the CLASS argument of a direct call of the
+builtin `isinstance` / `issubclass` (alone or in a flat tuple; `_Census.classinfo_argument`): `isinstance(x, str)`
+names a class and converts nothing. Both the name and the callee must resolve to builtins (not shadowed, rebound,
+a parameter or imported under another name), the call has exactly two positional arguments, and the name is the
+second one. Every other use of those names as a value (`map(str, ...)`, `key=str`, an assignment, a classinfo
+variable, a nested tuple, the first argument) still refuses; `tests/test_classinfo_names.py`.
+
+A from-imported undecorated source def of a bundled module may now be used as a VALUE, not only called directly
+(`a = func if flag else func2; a()`; `_Census.check_text`'s `source_call_funcs`). A module ATTRIBUTE used as a value
+(`saved = helper.func`) stays refused, as `tests/test_absint_declared_siblings.py` pins. In provenance the name is UNKNOWN
+exactly as a direct call's callee is, so nothing address-safe is claimed from it, and the callee's body is censused as
+program code. A function object hashes and prints by address, and every use that would observe that still refuses on
+its own: a set or frozenset member that is iterated or popped, `id` / `hash`, `repr` / `str` / `print` / `format` /
+f-string / `%`, `.__repr__()`, an exception message, a dict lookup text. `sorted` / `min` / `max` / `<` over functions
+are accepted and are not an address dependence (functions are unorderable: the same `TypeError`, naming only the
+class, on every run, checked natively and already accepted for local functions); `func.__name__` is fine.
+`tests/test_imported_function_values.py`.
 
 ## 3a: one scheduler (built, except the per-obligation loop) ([internal ref])
 
@@ -1271,8 +1913,9 @@ below say what each stage reads from it and writes to it; "Today's order" is the
      `obligation_census`): instant, no budget. May decide TRUE only (`proof:no-site`).
    - `solve/absint/__init__.py::prove` (`docs/ABSINT.md`): cost `time_budget = max(1.0, min(60.0, remaining()*0.1))`
      -- up to 10% of whatever CPU is left, capped at 60s, spent with NOTHING run. When the joined analysis
-     does not prove TRUE and the source draws `nondet_bool`, it runs once more with each eligible boolean draw
-     case-split (ABSINT.md "Case splits on a boolean draw"), inside the same grant and on at most
+     does not prove TRUE and the source draws `nondet_bool`/`nondet_int` or builds a list display, it runs once more with each eligible boolean draw
+     case-split, each small `nondet_int` result enumerated and the list displays nothing observes as a list built per position (ABSINT.md "Case splits on a boolean draw",
+     "List displays nothing observes as a list"), inside the same grant and on at most
      `max(3 s, 8x)` of the joined run's CPU; the joined result is what an UNKNOWN reports. Reads the source,
      `class_hints` (from a later stage, see below) and `invariant_locations` (from `obligation_census`
      plus every `ast.While` header, via `solve/obligations.py::source_points`). Writes its per-site
@@ -1287,7 +1930,7 @@ below say what each stage reads from it and writes to it; "Today's order" is the
     equivalent-mutant proving, general first step, owner ruling 2026-09-29), only if
     `prove and proof is None and remaining() > 1` -- absint (stage 1) already tried and failed
     (its zone domain cannot carry `abs()`'s exact piecewise-linear shape across a case split, see
-    [internal ref]'s design note). Scope: EVERY `_sv_verifier` draw must be `nondet_int()` / `nondet_bool()`
+    [internal ref]'s design note). Scope: EVERY `_sv_verifier` draw must be `nondet_int()` / `nondet_bool()` / `nondet_str()`
     with no argument, either a bare top-level statement `name = _sv_verifier.nondet_TYPE()` or, since [internal ref],
     a call anywhere an expression may stand INSIDE a def of the program (never in a loop/lambda/nested def,
     never a loose module-level expression -- see `product_proof.py::_lift`). A top-level draw is one z3 term
@@ -1296,7 +1939,7 @@ below say what each stage reads from it and writes to it; "Today's order" is the
     is what makes the real tasks' shape provable: `def main(): x = nondet_int(); if not (lo <= x <= hi): return;
     assert <relation>` then `main()`. The property must be exactly `AssertionError`, and the WHOLE module
     must sit inside the audited allowlist `sv/exact_subset.py::audit` (every AST node at every depth,
-    every name read/bound/called; int/bool values only; no loop, attribute, container, string,
+    every name read/bound/called; the scalar/list subset below and proof-only builtin strings; no unmodelled loop or attribute,
     nested def/import, builtin or `__*` rebinding -- anything not listed is
     refused, so exactness is by construction, not by a list of attacks; PR #114 reviews 1-2). [internal ref] widened
     the allowlist by four exact cases, each pinned by `tests/test_sv_product_proof.py`: a comparison CHAIN over
@@ -1309,6 +1952,31 @@ below say what each stage reads from it and writes to it; "Today's order" is the
     child runs the program; a program that binds `__name__` is refused). Nothing is lifted from a def's vector:
     a model of a program whose draws sit in defs has no single draw vector (which draws a path consumes, in
     what order, depends on the path), so this stage returns `None` on SAT and the search stages own the FALSE.
+    String draws use `sv/exact_strings.py`'s sequences of32-bit code points, including astral characters,
+    lone surrogates and literal backslash escape text. Their alphabet overapproximates Unicode and
+    `string.printable`: UNSAT proves a stronger property, while SAT stays UNKNOWN in this producer.
+    The audited string transfers are equality/inequality, concatenation, emptiness and branch merges;
+    neither the search executor's StringSort nor StringVal escape decoding participates. The WHOLE
+    source still passes the same structural audit. String identity, ordering, methods, slices, multiplication,
+    chained comparisons and the int-only check_type rewrite remain refused. In particular, the old
+    comparison-chain totality argument assumes int/bool operands and cannot admit mixed string paths.
+    No float model, property class, native FALSE replay channel or independent witness checker changed.
+    `sv/exact_decorators.py` authenticates a source-owned decorator only when its closed wrapper calls
+    the captured function once with every positional parameter in order, then returns that exact result.
+    No effects, annotations, defaults, reordered arguments, rebinding or other uses of the decorator are
+    admitted. The callee's complete body remains at its original lines; its function value may only be
+    called in the audited subset. The declaration stays visible to the ordinary binding audit.
+    The existing returned additive capture rule in `sv/exact_closures.py` authenticates the original
+    plain factory before defaults/decorators/loops can erase its source shape. One module creation
+    evaluates the factory argument once into a fresh snapshot; direct positional calls preserve that
+    captured value and exact addition order. Original factory/result bindings remain visible to the
+    ordinary audit. Containers, mutable/global captures, defaults, multiple results and escaping values
+    stay refused; no general closure heap, search transfer or checker representation is added.
+    The sole type observation is builtin `type(a) is type(b)` or `is not`, gated by the tested type
+    contract and the same argument audit. Only these proofs preserve bool/int kind distinctions through
+    branches, conditional/boolean operands, returns and list cells. The former numeric coercion would
+    hide `type(True) != type(1)`. Escaping type values and type-observed min/max remain refused;
+    ordinary search and proofs without type observations retain their previous merge semantics.
     The builtin calls of the subset (`abs(x)`, `int(x)`, `min(a, b)`, `max(a, b)`) are read through their contract rules ([internal ref] step 2):
     `exact_subset.py::_builtin_arity` asks the rule to accept `solve/contracts/visitors.py::ProductVisitor`, which answers the audited arity
     (`ProductVisitor.EXACT_ARITY`) only while the contract is TESTED, so an untested or withdrawn contract takes the builtin out of the
@@ -1336,12 +2004,20 @@ below say what each stage reads from it and writes to it; "Today's order" is the
     audit) replaces `for i in range(<constants>)` by the statements it stands for: the arguments are literal ints or
     names bound exactly once in the whole module to a foldable int expression (`K = 4`), the target is assigned before
     EVERY copy of the body and left at the last value, no `else` / `break` / `continue` (a `return` is fine: the
-    interpreter's early-return merge handles it), at most 64 trips and 20,000 AST nodes. It is an exact unrolling, not a
+    interpreter's early-return merge handles it), at most 20,000 expanded AST nodes, costed before range materialization. It is an exact unrolling, not a
     bound, so `run_exact` still sees no loop. Every copy keeps the original lines (the sites are the same lines) and its
     draw calls are distinct nodes (a fresh term per iteration). A `for` it does not unroll stays a `for` and
     `exact_subset.py::_Audit._stmt` refuses it by name; a `while` that is not a counter loop (PR 4, below) is refused by name.
-    PR 3, ALIAS-FREE LISTS of ints / bools: a list is built by a literal (at most 256 scalar elements), `[x] * K` (`K` a
-    literal or a module constant folding to 0..256, `exact_unroll.py::fold_int`) or `[e for i in range(<constant>)]`, which
+    Constant folding has no integer-magnitude or shift-count ceiling: exact builtin ints and bools use native
+    `+ - * // % << >>`, including huge right shifts and negative values. The default 62-bit / shift-64 path
+    stays cheap; a wider operation is evaluated only where source dependencies reach an observed range, counter
+    or repetition count. Unused growing constants are not materialized. A lazy cumulative bit-work allowance
+    (`exact_unroll.FOLD_WORK_BUDGET`) is charged before wider allocation and shared with the later source audit; exhaustion leaves the entire operation unexpanded/refused, never a truncated value or loop.
+    Negative shifts and division by zero remain refused, as do unrepresented `__index__` hooks and other expression
+    syntax. This does not add shift execution to ordinary product arithmetic. Registered native sizes and false twins
+    live in `tests/test_sv_constant_fold_domain.py`.
+    PR 3, ALIAS-FREE LISTS of ints / bools: a list is built by a finite scalar literal, `[x] * K` (`K` a
+    literal or a module constant folding to an integer, `exact_unroll.py::fold_int`) or `[e for i in range(<constant>)]`, which
     `exact_unroll.py::_expand_comprehension` (called from `unroll_for_loops`, so before the audit) replaces by the literal of
     its elements with the trip value written into each copy of `e` (one generator, no `if`, no lambda / comprehension /
     walrus in `e`; a copy per trip, so every draw in `e` is a fresh term). `exact_subset.py::_Audit._type_lists` settles
@@ -1349,7 +2025,7 @@ below say what each stage reads from it and writes to it; "Today's order" is the
     `list[bool]` parameter annotations, a parameter indexed or measured in its def, a parameter handed a list at some call:
     a fixpoint over the call sites); then a list name may only be indexed (`xs[i]`), measured (`len(xs)`), stored into
     (`xs[i] = v`, `xs[i] += v`: `_Audit._subscript_target`, only a list assigned in THIS scope that is not a parameter) or
-    passed to a def whose parameter is a list (`_Audit._call`); it is never a value (no alias, return, comparison, operand,
+    passed to a def whose parameter is a list (`_Audit._call`); it is never a value (no alias, return, general operand,
     truth test, slice, nested list, method, iteration, `del`; a list parameter is never rebound, a list name is never
     assigned a scalar or unpacked into). So no two names ever hold one list, every list has a fixed length known when it is
     built, every cell is an int or a bool, and the interpreter is exact: `_symexec.py::_Runner.ev_Subscript` and
@@ -1363,7 +2039,7 @@ below say what each stage reads from it and writes to it; "Today's order" is the
     `vllm_has_repeating_pattern`, and `chromium_is_eligible_dispatch` through the comprehension), their `_buggy` twins as
     replayable models, 0 contradictions. Named refusals (each by its own message, listed in the test): a list used as a
     value, a store through a parameter or into another scope's list, a slice or tuple subscript, a nested list, `append` /
-    `del` / iteration / `+=` on a list, a size that is not a constant in 0..256, a rebound constant, a `list[str]`
+    `del` / iteration / `+=` on a list, a repetition count not known to the constant folder, a rebound constant, a `list[str]`
     annotation or a list annotation on a scalar parameter, a comprehension with a filter, two generators, a draw bound or a
     lambda, `len` or a subscript of anything that is not a list name, a comparison chain over a cell.
     PR 4, COUNTER `while`: `exact_unroll.py::_fuse_counter_loops` (run by `_Unroll.generic_visit` on every statement list,
@@ -1373,7 +2049,7 @@ below say what each stage reads from it and writes to it; "Today's order" is the
     the left, the LAST statement of the body steps the counter by a constant (`i += 1`, `i = i + 1`, `i = i - 2`:
     `_counter_step`) in the direction the test reads (`<` / `<=` with a positive step, `>` / `>=` with a negative one), nothing
     else in the body stores, deletes or declares the counter and nothing breaks or continues (`_body_leaves_the_counter`), no
-    `else`, at most 64 trips and 20,000 nodes. The trips are `range(start, stop, step)` (`stop + 1` for `<=`, `stop - 1` for
+    `else`, at most 20,000 expanded nodes checked before materialization. The trips are `range(start, stop, step)` (`stop + 1` for `<=`, `stop - 1` for
     `>=`); the copies include the step, so the counter is right at the top of every copy and is left at the first value
     failing the test, as in Python; an empty trip count removes the loop and the init stays; a `return` in the body is a
     statement of its copy (the early-return merge handles it); a draw in the body is a fresh term per copy. The constants are
@@ -1388,7 +2064,7 @@ below say what each stage reads from it and writes to it; "Today's order" is the
     constants or a draw or by keyword, a parameter of a def never called, the counter stored in the body or rebound by an inner
     `for`, a step under an `if`, not last, zero, against the test, a draw or a product (`r = r * 2`), `break` / `continue` /
     `else`, an init that is not the statement just before (also the target an unrolled `for` leaves), a draw as init, no init,
-    `!=`, the bound on the left, a chain, a truth test, more than 64 trips. What stays refused, by name, for the Tier A tasks:
+    `!=`, the bound on the left, a chain, a truth test, or an expansion exceeding the node-work budget. What stays refused, by name, for the Tier A tasks:
     a loop whose bound is a guarded draw (`while j < gen_count`, boto3_dynamodb_placeholder_merge, which also stores through
     a list parameter), a variant loop (`while buffered > 0 and steps <= MAX`, boto3_batch_writer), `break` in a nested
     counter loop (boto3_collection_limit, boto3_create_tags), a doubling step (vllm_next_power_of_2, with `&`).
@@ -1430,20 +2106,25 @@ below say what each stage reads from it and writes to it; "Today's order" is the
    - if the first run drew NOTHING and raised no uncontrolled-nondeterminism flag
      (`not first.draws and not first.flags`): a SECOND run under `hashseed=1`. This branch always
      RETURNS -- FALSE if the second run also violates; UNKNOWN if it times out, crashes, or disagrees
-     with the first; the already-found `proof` if the two runs agree and a proof exists; else
-     `solve/determinism.py::determinism_census` decides TRUE (`deterministic`) or UNKNOWN. Stage 4
+     with the first, or itself drew or raised a flag; the already-found `proof` if the two runs agree
+     and a proof exists; else `solve/determinism.py::determinism_census` decides TRUE (`deterministic`)
+     or UNKNOWN. The witness checker's `open_obligations` play no part in this TRUE: the census plus the
+     one complete run cover every execution, an argument the per-site checker cannot express. A run
+     counts only if the program's own code started (`sv/_child.py::run` reports a harness exception
+     before that as `crashed`), and `sys.stdout`/`sys.stderr` are certified only as written to (the
+     child's are pipes, a native run's may be a terminal). Stage 4
      (`prove_dynamic`), the portfolio and the enumeration NEVER run on this path.
    - 3b. otherwise (the program drew something), and `prove and proof is None and not first.flags and
      remaining() > 1`: `sv/fact_proof.py::prove_from_facts` ([internal ref] step 3, "Facts from producers" below):
-     every installed fact producer (`sv/fact_producers.py`; none installed costs one entry-point lookup)
+     every installed fact producer and the builtin native-observation producer (`sv/fact_producers.py`)
      is handed the open obligations, what it proposes is published into the store
      (`sv/eregion_bridge.py`), each proposal is certified ON ITS OWN by
      `sv/validate.py::check_candidates_individually`, and TRUE is decided only when every open
      obligation has a certified invariant that IS its own invariant. Reads the census, the store's
-     candidate evidence; writes candidate and certified `Evidence`; cost: at most `PRODUCER_SHARE`
+     candidate and native-observation evidence; writes candidate and certified `Evidence`; cost: at most `PRODUCER_SHARE`
      (0.15) of what remains and 30 CPU seconds for the producers AND the certification together (one
      checker run, at most `checker_seconds`, is always allowed on top), at most 32 candidates. May
-     decide TRUE only; a TRUE becomes the running `proof` with the same canary cap as stage 1's.
+     decide TRUE only; a TRUE becomes the running `proof` with the same canary cap as stage 1's. New native samples retry the stage after portfolio replays and enumeration batches, sharing the original allowance across retries.
    - then (the program drew something, or raised a flag), and `prove and proof is None and
      not first.flags and remaining() > 1`: `sv/prove.py::prove_dynamic` (`docs/SV.md`'s own
      `proof:stationary` section, above) runs. Reads program, classes, `python`, `jobs`, `run_timeout`,
@@ -1538,6 +2219,7 @@ after the frozen finalizer has completed its check and all legacy exports.
 |---|---|---|---|
 | `site_safety` | Fact, never certified | `ObligationTable.publish_safety` / `safety` | `SiteKey`, canonical safety term text, `proposed` or `established` status, Evidence parents |
 | `proof_route` | Evidence | `ObligationTable.publish_route` / `proof_routes` | deciding route, source digest, exception classes, covered site identities, site-record parent count, whole-program coverage and projection location |
+| `check_coverage` | Evidence | combined proof / finalizer | fresh original-source hash and assertion AST-path coverage; never a certified obligation decision |
 
 An `established` safety claim names existing Evidence parents; consumers check
 their coverage. It does not discharge an obligation. Route provenance uses the
@@ -1625,17 +2307,19 @@ the contract makes it uniform across every component instead of re-derived per c
 | census (no-site) | `sv/prove.py::prove_static` | source, classes | nothing shared | instant | TRUE only |
 | absint | `solve/absint/__init__.py::prove`; `sv/engine.py::_static_proof` | source, classes, `class_hints` (the second try), invariant locations | `site_record`, `candidate_invariant` | up to 10% of remaining, capped 60s | TRUE only |
 | exact product proof | `sv/product_proof.py::prove` | source, classes | nothing shared | replay at most min(30s, remaining); Z3 timeout min(60s, max(10s, 15% of remaining)) | TRUE (Z3 UNSAT) or FALSE (a model replay-confirmed; never for draws inside defs) |
+| combined proof | `sv/combined_proof.py::prove`; `sv/combined_proof.py::cover` | original source and classes; `site_record` as eligibility only | `check_coverage` | up to 3s of remaining, including fresh absint and exact product checks | TRUE only, after freshly covering every original assertion; projected SAT never decides FALSE |
 | symbolic (whole-harness) | `sv/concolic.py::solve` | program, classes, `site_record` | `site_outcome`, `stage_ran` | up to `concolic_share` of remaining, capped 60s CPU | proposes only (replay decides FALSE) |
-| execution (first/second run) | `sv/engine.py::run_once` | program, forced draws (none) | `class_hints`, `input_sensitivity` | one child, `run_timeout` share | FALSE (replayed run) |
+| execution (first/second run) | `sv/engine.py::run_once` | program, forced draws (none) | `class_hints`, `input_sensitivity`, optional `site_observation` | one child, `run_timeout` share | FALSE (replayed run) |
 | determinism certificate | `solve/determinism.py::determinism_census` | source | nothing shared | parse + census, no execution | TRUE only (given two agreeing runs) |
-| facts (fact producers) | `sv/fact_proof.py::prove_from_facts`; `sv/fact_producers.py::run` | `obligation` (open rows), `invariant_candidate` | `invariant_candidate` and `draw_vector` (the producers'), `certified_invariant` | 0.15 of remaining, capped 30s CPU, producers and certification together | TRUE only, and only when every current obligation has its own invariant checked in this invocation |
+| facts (fact producers) | `sv/fact_proof.py::prove_from_facts`; `sv/fact_producers.py::run` | `obligation` (open rows), `invariant_candidate`, `site_observation` | `invariant_candidate` and `draw_vector` (the producers'), `certified_invariant` | 0.15 of remaining, capped 30s plus one checker run, shared across observation retries | TRUE only, and only when every current obligation has its own invariant checked in this invocation |
 | stationary | `sv/prove.py::prove_dynamic` | program, classes, `python`, `jobs`, `call_target` | `loop_trip_count`; replays its probes via `run_once` | its own loop, bounded by remaining and `MAX_RUNS` | TRUE or FALSE |
 | seed stages | `sv/guard_values.py::seed_values`; `sv/solver_seeds.py::seed_values`; `sv/avengers_seed.py::seed_values` | source (static), `site_record` (comparison/boundaries/composition) | seeded values (scheduler-local) | milliseconds to seconds, static | hint only |
 | producer vectors | `sv/stages.py::_producer` | `draw_vector`, the first run (for the pre-check) | nothing shared | one replay per vector, at most `MAX_PRODUCER_VECTORS` | proposes only (replay decides FALSE) |
 | symbolic (narrowed) / hybrid | `sv/stages.py::_concolic`; `sv/hybrid.py::search` | `obligation` (hybrid: the open rows), `site_record`, `site_outcome` (the lines the symbolic stage left open), the first run, and for hybrid the task code the program calls (`sv/reach.py`) | `site_outcome`, `stage_ran` | `stage.share` of remaining | proposes only |
+| order-only small model | `sv/order_only.py::analyze`; `sv/scheduler.py::run` | source (whole-module taint analysis), the early-return guards, `_engine._certify_determinism` | nothing shared | static analysis, then up to `ORDER_ONLY_SHARE` of remaining for native runs | TRUE (certified deterministic) or FALSE (replayed) |
 | enumeration | `sv/engine.py::Candidates` | seeded values, program literals, the first run's draws | nothing shared | the remainder of the ledger | FALSE (replayed); TRUE via `finite_tree` |
 | remainder (deepen) | `sv/scheduler.py::run`; `sv/hybrid.py::deepen` | `obligation` (the precise rows), what the earlier rounds kept (`Context.state`) | nothing shared | what enumeration left, in rounds of half the remaining; a cap still bounds it | proposes only (replay decides FALSE) |
-| finalizer | `sv/scheduler.py::run`; `sv/proof.py::finish` | `obligation` census, the verdict's `candidate_invariants` and bound route premises (`certified_invariant`, `call_target`) | `proof_route` (actual final TRUE), `candidate_invariant`, `obligation` (discharged, via `ObligationTable.discharge`), `witness.yml` | up to `checker_seconds` (3.0), shared with the YAML writes | never downgrades; records what stays open |
+| finalizer | `sv/scheduler.py::run`; `sv/proof.py::finish` | `obligation` census, the verdict's `candidate_invariants` and bound route premises (`certified_invariant`, `call_target`, `check_coverage`) | `proof_route` (actual final TRUE), `candidate_invariant`, `obligation` (discharged, via `ObligationTable.discharge`), `witness.yml` | up to `checker_seconds` (3.0), shared with the YAML writes | never downgrades; records what stays open |
 | store witness shadow | `sv/store_witness.py::project`; `sv/store_witness.py::shadow` | source identity, `site_record`, `proof_route` | `site_safety`, `store-witness.yml`, `store_*` metrics | 256 sites, 10000 Z3 resource units/query, up to 1s or 5% of remaining ledger | nothing; runs after legacy exports |
 <!-- END CONTRACT TABLE -->
 
@@ -1748,6 +2432,20 @@ so every proof) a class call stays unmodelled as before, and `product_proof.py` 
   its `__dict__` against the harness AST by first line (a patched, wrapped or generated method is refused), reads
   class attributes from the live dict (an import-time `Cls.x = 5` is what the program reads), and only the harness
   AST is ever inlined.
+- **An imported class** (the entry module defines a class, so its harness is the `import` form and the class is never in
+  the harness AST: `inputs.py::_inline_refusal`): `ClassTable.imported` takes the `ClassDef` from the module's own
+  source, which `concolic.py::imported_sources` read in the parent (the worker's file confinement refuses the read; the
+  worker gets it as `module_sources`) from the roots the harness puts on `sys.path` literally. It must be the file the
+  live class came from, the call needs a proven `imported` record named `<module>.<Class>.<method>`, and because an
+  inlined method runs on the HARNESS's globals, a method that reads a global of its own module (not a builtin) or a
+  private-mangled name is refused (`ClassTable._closed`). Found by Eregion toys 0760-0763 (`x + cls.PREFIX == N`), whose
+  `sv` rung took 10 to 19 s (plateau of the unmodelled call, 33 clean solved replays) and is now one concolic round.
+  `module_sources` keeps the literal-root capture (the first root that answers a name is the one a real
+  import resolves, so an inlined def/class always comes from the exact file the `import` names); an imported
+  DEF whose own body asserts or raises is refused by the inline instead (`_symexec.py::_ImportedDefs.
+  _closed_binds`): its assertion is its caller's observation route (the inputs ladder's own-assert rung --
+  the symexec train31 guards, lane 1493's batches 6 and 7), never an inlined constraint of another module's
+  source, while an imported CLASS's methods keep the exact `ClassTable._closed` gates.
 - **Objects** are interned `Ref` handles (`_symexec.py::Ref`) to cells of a per-path copy-on-write `Heap`: a write
   replaces the cell's attribute dict, so forking a path is a shallow dict copy. The heap is forked and merged with the
   environment wherever the executor forks one (`_Runner._merge_if`, `_exec_fn` for a function with early returns,
@@ -1802,8 +2500,9 @@ and its trip value `SIZE` is also used as a board size (`y * SIZE + x`), so no e
 bounds the draw but does not make it a trip count, and stationarity covers trip counts `c + abs(d)` only. Measured over the
 102 Tier A programs (vllm, boto3, chromium-dashboard): 94 draw ints, 0 of the 94 let a draw reach a `range()`; the windows
 are `1 << 10`, `1 << 20`, `1 << 30` (not enumerable) and the values are used in arithmetic. Accepting the guard would turn the
-refusal "the draw is not taken abs()" into "the draw reaches no loop", nothing more; so the refusal stays and says what it
-is (`drawflow.py::plan_draws`). A narrow sound shape exists for the day it is needed -- an adjacent `if <test>: return` whose
+refusal "the draw is not taken abs()" into "the draw reaches no loop", nothing more. Ordinary integer
+expressions now have a separate full-domain plan ([internal ref]), requiring the existing exact whole-program prover; this does
+not turn them into stationary trip counts or finite samples. A narrow finite guarded shape exists for the day it is needed -- an adjacent `if <test>: return` whose
 passing implies `lo <= v <= hi`, a window of at most `MAX_FINITE` values being a finite draw (the window plus ONE outside
 representative, since the guard body uses no value), a larger one a trip draw of offset `max(lo, 0)` only when `v` reaches
 `range()` -- but no program of the corpora would use it.
@@ -1924,7 +2623,7 @@ of any decision on Step 2's per-obligation interleaving.
 
 ### Facts from producers ([internal ref] step 3: the Eregion bridge)
 
-*Built ([internal ref], [internal ref]); ON whenever a producer is installed.* Owner rulings that
+*Built ([internal ref], [internal ref]); ON whenever a producer is installed or native assertion/loop observations exist.* Owner rulings that
 bind it (2026-09-29): the bridge is an EXTENSION of the fact store (a producer is one more writer of
 `KnowledgeBase` `Evidence`, not a separate translator); a fact counts only after an independent per-candidate
 check certifies it; Tharkun never depends on Eregion; Eregion's engine packages import nothing from Tharkun.
@@ -1949,7 +2648,7 @@ check certifies it; Tharkun never depends on Eregion; Eregion's engine packages 
 3. `prove_from_facts` reads the candidates back OUT of the store and checks each with
    `sv/validate.py::check_candidates_individually`; a proved one is published as `certified_invariant`
    (`eregion_bridge.py::publish_certified`, called from nowhere else).
-4. TRUE needs: a complete census, no adapter-gap rows, at least one open obligation of the property's
+4. TRUE needs: a complete census, no unresolved adapter-gap rows, at least one open obligation of the property's
    classes, the first run without nondeterminism flags, CPython 3.14 (the checker's requirement), and a
    successful independent check in this invocation of EVERY current obligation's own invariant. Old
    certified evidence and discharged row statuses do not replace a current check. A wholly discharged
@@ -1960,7 +2659,15 @@ check certifies it; Tharkun never depends on Eregion; Eregion's engine packages 
 **What a producer adds.** The checker proves an invariant from the source alone, so today a producer's
 contribution is the NOMINATION (which obligations to try; its own engine flags travel as `evidence`, never
 as a verdict) and the checker's Z3 run is the proof. A fact that carries information the checker cannot
-derive (a loop invariant, a class-state invariant) needs a verifier for its own shape first.
+derive needs a verifier for its own shape first. The existing source checker validates loop initiation, preservation and exit; class-state invariants still have no corresponding adapter.
+
+**Native observation producer (`sv/observed_invariants.py`).** After the abstract interpreter leaves assertion obligations open, optional monitoring in disposable native children copies exact builtin scalars and builtin container lengths at original assertions and `while` heads. It never calls custom object or subclass hooks. `site_observation` is uncertified evidence in the shared obligation table; fresh and forked execution use the same transport. Proof ablation and already-proved programs collect nothing. Monitoring arms only compiled code with watched source points and drops its global entry callback before target calls. Optional sampling pauses before consuming the live recursion budget; the target continues under its own recursion limit. Samples remain proposals, and every proof still needs a full source check.
+
+The builtin `observations` producer runs in the ordinary capped producer child. It proposes observed numeric ranges, pairwise integer/length affine relations, type sets and the reached assertion's own predicate. Every proposal must survive every available sample at that source point. There is no fixed input-size, variable-count or integer-width bound. Machine-size integer samples retain JSON numbers; larger samples and candidate coefficients use exact hexadecimal spelling, avoiding CPython's decimal digit limit without changing interpreter settings. Optional sampling has one conservative 512 KiB storage allowance per native run, charged before copying/encoding scalars; exhausting it removes the sampler's events and lets the program finish. Oversized individual values also stop sampling before conversion. This is a work/transport budget for uncertified hints, with no restriction on native inputs and no cut proof: every retained candidate still needs the full source check. An empty plan claims no monitoring tool. Sampling is not an invariant proof: native subprocess limits, the producer limit and the source-checking allowance bound work; spending them proves nothing.
+
+`fact_proof` admits only the assertion census's specific Boolean/purity/totality gap to a fresh whole-source check. All other gaps, incomplete censuses and violated rows still refuse this route. Auxiliary loop candidates must pass the existing unbounded induction and whole-source checker before supporting a location nomination; the finalizer rechecks and exports those auxiliaries. A false twin that agrees with all early observations is rejected when induction fails. No sample, stored certification or bounded loop prefix replaces a current source check of every obligation. Existing checker refusals (unsupported helper/control-flow shapes, strings/containers and other unmodeled operations) remain UNKNOWN.
+
+The scheduler retries when later native runs publish new samples, within one allowance shared across all fact-stage invocations. A proved result uses the ordinary canary and finalizer. `tests/test_sv_observed_invariants.py` covers all-sample pruning, native sizes through 129, exact integer growth, custom hooks, fork transport, late observations and the false twin first failing at iteration 65. It also keeps the complete `bm_richards_det` task as a memory regression control, checks native completion/late violations after sampling stops and rejects encoding a value larger than the hint budget. Future native-run changes include every pyperformance property in the paired controls (80 expected TRUE and eight expected FALSE in the T94 inventory).
 
 **Eregion's producer (`eregion_codegen/tharkun_producer.py`).** Scope: the open `ZeroDivisionError`
 obligations of a task whose `if __name__ == "__main__":` block reaches the division through straight-line
@@ -2185,3 +2892,323 @@ provers/stages through the same lazy imports this list already names, so this li
 new dependency layer -- only by one new caller (`sv/scheduler.py`) of everything already here, and one
 new callee of it (`sv/engine.py::verify`, which imports `sv/scheduler.py::run` the same lazy way it
 imports `sv/prove.py`, `sv/concolic.py` and `sv/stages.py` today).
+
+### Shared regex proposals ([internal ref])
+
+`sv/hybrid.py::_regex_vectors` and `_seed_corpus` now use the same `_regex_samples` implementation:
+deterministic, shortest-first, native-checked printable members from `solve/preimage/regex_members.py`.
+The separate random `_generate_from_regex` call in the vector producer is removed. Boundary and
+flag-difference corpus samples retain their existing generators and limits.
+
+The `inputs` caller also reuses these samples after its cheap backward walk, using the regexes of the
+already-discovered called units. It constructs typed parameter rows and re-encodes their draw vectors;
+a union discriminator is not assumed to preserve the first run's kinds. These remain proposals, never
+proofs or extra witness-input channels. Native SV replay and the environment rules of `SV_IO_MODEL.md`
+are unchanged. Hypothesis still combines ordinary typed rows; this change does not replace the corpus
+sampler with a new regex backend.
+
+### No-match callable substitution proposals ([internal ref])
+
+The existing driver preimage walker offers `Pattern.sub(lambda ..., subject)`'s identity arm only
+when the bounded native `Pattern.search` preimage confirms there is no match and the subject satisfies
+the transferred result demand. The solver does not execute the lambda or its defaults. Evaluated
+lambda defaults and nonliteral count arguments abstain. [internal ref] adds a bounded matching-template arm
+for group/literal/free-text concatenations; see below.
+This is a candidate rule used by the existing search, with the same native replay and selected-line
+checks as every other proposal. It adds no witness input kind and changes no SV environment/proof rule.
+
+### Hypothesis backend eligibility and retained sampler ([internal ref])
+
+Hypothesis is already a core dependency (`pyproject.toml`) and is reached by SV's existing concolic
+driver/property search; before [internal ref] the regex vector producer also called its regex generator. It
+is not one of the project's forbidden Touchstone/Pynguin/black backends. No such backend
+is added or enabled here. `tests/test_sv_no_backends.py` continues to enforce the direct backend-import
+boundary; the availability-gated Avengers descriptions elsewhere do not authorize a new backend.
+
+Using Hypothesis to propose values is consistent with this document's FALSE/UNKNOWN rules and
+`SV_IO_MODEL.md` only while native replay remains authoritative and witnesses contain admissible
+verifier draws/argv, never invented stdin or file contents. A fixed seed, `strategies.examples`'s
+no-database/no-local-constants mode and fixed dependency versions support reproducibility; a wall
+budget can still change the number of proposals tried. The competition archive must bundle its
+runtime dependencies and licenses for offline execution (the sealed-wheel rationale is documented in
+`sv/method_lift.py`). [SV-COMP 2027 submission requirements](https://sv-comp.sosy-lab.org/2027/submission.php)
+require the necessary libraries/tools in the archive; this is an engineering eligibility assessment,
+not organizer approval of a newly rebuilt archive.
+
+The proposed single Hypothesis regex backend was **not adopted**: the existing bounded
+`strategies.py::_regex_strategy` loses the supported `a(?=B)B` witness and can erase atomic/possessive
+semantics, while arbitrary draws also lose the existing shortest corpus neighbors. Both eligibility
+and full sampler coverage were required; coverage failed. `_regex_samples`, `_boundary_samples` and
+`_flag_samples` therefore keep the in-house native-checked sampler and their printable/size contracts.
+The existing Hypothesis row-combination path is retained; no dependency or competition archive changes.
+
+Discovered regex retries do not also introduce an ordinary literal batch before SV. A regex miss
+therefore falls through to the existing concolic/hybrid stages, preserving their coverage and behavior.
+
+
+### Coupled regex replacement proposals ([internal ref])
+
+`driver.py::_preimage_sub_matches` uses the existing shortest native regex samples, copied group spans
+and wanted text to propose correlated subjects and replacement text. The target lambda never executes
+in the solver: only its admitted group/text AST and builtin regex matching are interpreted. Every
+subject is rechecked by the existing `Pattern.search` preimage; the replacement/count and transferred
+`want.py::CaseMap` demand are checked before proposing a row. Alternative pairs stay separate across
+backward assignments and guards. The existing typed encoding and native ORIGINAL selected-line/return
+replays decide FOUND, with no change to the lattice/proof domain or SV witness input channels.
+
+This is bounded supplier search, with the existing regex native-work limits and documented template/
+case-combination bounds (`docs/INPUTS.md`, “Coupled matching substitution”). It adds no absence proof,
+backend, dependency or policy. Under bible commandments 2/3/15 and doc 09 “Two doors” / provider
+precedence, exhaustion is UNKNOWN and every returned answer must survive native anchored replay.
+
+
+[internal ref] layering correction: `solve/preimage/regex_members.py::samples` holds the existing shortest,
+printable sampling implementation below DRIVE. `sv/hybrid.py::_regex_samples` remains a thin
+compatibility wrapper with the existing sample constants; its callers are unchanged. The driver
+uses the shared lower-layer function directly and never imports the SV front end. This is code
+motion of the same sampler, with no new generator, backend, proposal domain or proof rule.
+
+
+### Closed verifier checker calls (1455, extended eval)
+
+`solve/check_type_hints.py::check_type_arguments` binds the two ordinary
+`value`/`hint` parameters, including native keyword forms. Expansion,
+duplicate binding and unknown names remain unclosed. Determinism, census
+and draw planning require the tested checker/None-return contract; absint
+withdraws its existing primitive/class transfer when that return is missing.
+
+`solve/drawflow.py::plan_draws` treats a closed `check_type` call as a
+consumer, rather than inventing an additional draw. It still inspects real
+argument reads: a raw integer value or an ordinal-dependent check cannot
+become a trip-count proof through this change.
+
+`sv/prove.py::prove_dynamic` first runs the strict whole-program determinism
+census. If it refuses, an independent complete census may certify the
+existing class-only exception mode. That mode still refuses all in-flight
+exception observers and unclosed checker callbacks. A caught TypeError's
+args, custom repr/class/metaclass/iteration hooks and a separately observed
+address do not gain a certificate. Only TRUE results may use this mode, and
+record it explicitly; every other result from the relaxed stationary route
+is discarded. TypeError counterexamples use the existing strict native
+search/replay routes. The full checker contract retains CLASS+ARGS behavior;
+neither child runtime changes.
+
+Validation uses CPython3.14.4 and the existing recorded upstream checker
+oracle, closed binding/return withdrawal and native mismatch args controls,
+plus real stationary proofs and callback/observer adversaries. Local eval
+reproductions are copied from the pinned extended cycle; its active tree,
+raw results and watcher remain untouched.
+
+## Task-owned Python source imports ([internal ref])
+
+Program-file tasks also discover one literal `from sibling import function [as alias]`
+from the entry's own directory through `extern._task_import_closure`. Packages,
+extra imports, compiled competitors, cached bytecode and symlink escapes stay
+outside this shortcut; an unsupported closure retains entry-only native search.
+The exact product route independently authenticates both files' raw bytes and
+lowers only the imported plain closed expression function of an inert module: the module may hold any number of other top-level `def`s whose definition evaluates nothing
+(no decorator, default or annotation) and that are not imported; any other module-level statement, class or import refuses. (Correction: the first implementation, an AI
+lane's 643860e3, demanded a module with exactly one def: it keyed on the spelling of its one test program, not on the meaning "defining functions has no import-time
+effect".) Defaults,
+annotations, decorators, imported goals and calls (including `check_type`) refuse.
+Entry-site locations and import order remain intact, and both source hashes are
+rechecked before returning TRUE and after the native canary.
+
+An unused resolved `check_type(value, str)` retains a success obligation over
+every reaching value in the existing exact code-point/type model. Argument
+evaluation, fresh draws and goals are preserved. A closed sibling's string/int
+concatenation already ends its integer path with builtin `TypeError`; only its
+string path reaches the checker. The property and all check-success obligations
+must be UNSAT together. A possible str-hint mismatch refuses instead of being
+erased or gaining a new exit model. No goal classes or import effects are added.
+Source discovery and producer TRUE do not certify imported obligation identities:
+the independent checker may still report open coverage, and no checked/exported
+correctness witness is claimed for this route.
+
+When task context declares only the primary program, determinism certification
+uses its directory as a program-source root, behind explicit static import roots. `determinism_census`
+passes that context to the existing `pyresolve.Resolver`; ambient interpreter
+paths are not searched. Flat and package imports, aliases, relative imports
+inside packages and literal star exports resolve through the same source cache.
+Every reached module and package initializer is recursively censused, including
+initializers containing only imports. Imported functions remain live. An import
+is not an allow-by-name determinism certificate.
+
+Source module attributes are public, read-only module bindings. Import-location
+metadata use or rebinding, observed/mutated or nonliteral __all__, source-root escapes,
+compiled competitors, stdlib shadows, cycles and graphs beyond 64 modules refuse.
+The harness-provided `_sv_verifier` API retains its existing meaning when a task
+contains a local stand-in; it is not a stdlib shadow.
+Explicit multi-file manifests remain closed; ordinary resolver clients keep
+their previous source boundary. Reading
+fixed task source to analyze it does not supply file CONTENT to a FALSE witness;
+the existing SV IO ruling and native replay channels remain unchanged.
+
+
+## Ordinary integer value plans ([internal ref])
+
+`solve/drawflow.py::plan_draws` distinguishes an ordinary integer value draw
+from a trip count. Its domain remains all Python integers. `sv/prove.py::_stationary`
+requires the existing `product_proof.prove` exact whole-program route for such
+a plan; it does not feed a few integers into the stationary probe and call them
+representative. Returns, call arguments, arithmetic operands and signed `abs`
+expressions retain that full domain too. A raw `range(draw)` count is a value
+plan requiring the exact route; it does not gain a stationary-loop certificate.
+The audited subset, supported property, unsupported constructs,
+solver budget and native FALSE replay rules of that route still apply. In
+particular, a draw executed inside a function can participate in an exact TRUE
+proof, while its SAT model remains UNKNOWN here: search owns its execution-order
+counterexample vector. A failed
+exact proof remains UNKNOWN. Trip and quotient plans retain their existing proof.
+
+The exact subset also admits an unused, resolved `_sv_verifier.check_type(value,
+int)` when its value expression is an audited int/bool scalar and the existing
+tested success contract is installed through `ProductVisitor.visit_verifier_check_type`.
+It preserves evaluation of the argument,
+including calls, fresh draws, exceptions and assertion goals. A checker argument
+keeps its full-domain value classification; it cannot become a finite or trip plan.
+The exact route removes only
+the guaranteed-success check. Lists, other hints, escaping results, shadowed
+names and untested contracts remain outside this subset. This does not add a
+float, string, object or implicit-exception proof model.
+
+The scheduler records that its earlier exact route was attempted, so a later
+value plan does not run the same solver again. Direct stationary-proof callers
+can still request the shared exact route. This is execution-history metadata,
+not a CLI feature switch or a new proof rule.
+
+### Builtin class values in immediate comparisons (1455 batch27)
+
+The determinism census distinguishes the builtin `str` class used as data in
+an immediate identity/equality comparison from an escaping text converter.
+Literal list/tuple/set wrappers and a direct subscript are allowed only when
+the resulting expression feeds that comparison. Assignments, converter calls,
+map/key callbacks, other conversion functions and unresolved bindings retain
+their existing checks. This removes an address-source false alarm in the
+extended eval's class-set and indexed class-table assertions; it does not
+change finite draw planning or prove the surrounding program. Native
+CPython3.14.4 cases and a false class-identity absint control cover the seam.
+
+
+### Scalar verifier-dict provenance (1455 batch28)
+
+The address census consumes the existing tested `_sv_verifier.nondet_dict`
+return contract for two directly resolved primitive verifier callbacks.
+Ordinary positional/keyword binding is checked without running callbacks.
+Key/value kind unions flow through builtin dict unpacking; equal keys still
+overwrite, and no exact key, length or value correspondence is inferred.
+Unknown mappings, callbacks, expansion and mutations keep unknown facts. The
+contract remains effectful/nondeterministic: this is provenance between fixed
+draws, not a purity claim or a new finite draw plan. CPython3.14.4 native
+empty/nonempty/overwrite controls and contract-withdrawal/adversarial tests
+cover the seam; absint retains its existing definite dict return and inexact
+contents. Its coarse dict-length bound is unchanged.
+
+
+### Immediate scalar dict projections (1455 batch29)
+
+The address census consumes the tested `dict.items` view return only when
+its zero-argument call feeds one immediate dict comprehension projecting
+two distinct bare key/value bindings, optionally filtered by the bare key's
+truth value. Both sides must have primitive scalar provenance. Other views,
+projections, callback predicates and unknown receivers retain their previous
+unknown/escape behavior; the view is never generalized into a stored iterator.
+
+The mapping view can expose aliases through its read-only `.mapping` proxy,
+so an escaping view still invalidates the receiver. Native CPython3.14.4
+controls cover empty/truthy keys, lexical/first-iterable bindings, metadata
+withdrawal, iterator/truth-hook exception args and nested alias mutation.
+Dropping the empty key still raises `KeyError('')`; a deterministic exception
+class/args observation is not an absence proof or a new finite draw plan.
+
+Evidence: [Python3.14 dict views](https://docs.python.org/3.14/library/stdtypes.html#dictionary-view-objects)
+and [CPython v3.14.4 dictobject.c](https://github.com/python/cpython/blob/v3.14.4/Objects/dictobject.c).
+The rolling3.14 documentation is used for the API statement; native results
+and boundaries are derived only from the CPython3.14.4 test environment.
+
+## Independent checking of known finite tuple helpers
+
+The private witness checker accepts straight-line helpers with any known finite
+number of plain `int` parameters, scalar assignments and boolean tuple results,
+including zero arguments and empty tuples. The result must be immediately
+unpacked into exactly as many fresh, distinct scalar names. A mismatch is
+UNCHECKED before caller bindings change; values are never truncated by `zip`.
+
+The existing primitive tuple representation is reused. Actual positional and
+keyword arguments and tuple elements are evaluated once in source order.
+Repeated arguments and values retain the existing scalar references; this adds
+no new identity theorem. Defaults, decorators, annotations outside the existing
+int-parameter boundary, nested or escaping tuples, mutation and unauthenticated
+callees remain refused. Pure scalar callees retain their current contract,
+binding and depth checks. The P0 class guard and source/YAML authentication are
+unchanged, as are primitive-exit and closed-callable routes.
+
+There is no tuple arity or assignment-count cap. Tuple syntax preflight, argument
+binding, result materialization and unpacking share the checker's existing
+10,000-work counter and deadline. A streaming syntax walk checks work before
+allocating node collections, and bulk tuple allocations are preflighted. Budget
+or deadline exhaustion leaves the original obligations open; it never returns
+a checked prefix. Source parsing/authentication prepasses retain their existing
+behavior. See `tests/test_witness_finite_tuples.py` for native arities, order,
+alias, false-invariant, authentication and resource controls. Fixed-range and
+paused identity work remain separate.
+## Socket effects during confined execution
+
+The task environment refuses CPython `socket.*` audit events before host access.
+This covers socket construction, connection/binding and name-service events even
+through captured `_socket` or `ssl` aliases. It records the existing
+`file_effect` and `file_unmodelled` environment flags, so catching the refusal
+cannot manufacture a FALSE witness. Reversible contexts restore the previous
+guard state on normal exit, exceptions and failed setup; nested contexts share
+their outer environment. No payload length or socket family is a model bound.
+This is an execution refusal, not a model of network responses or a general
+Python sandbox: opaque pre-existing descriptors and native-extension I/O remain
+outside the represented task inputs and proof domains.
+
+
+## Finite domain (`proof:finite_domain`, T178, lane 1518, 2026-11-05)
+
+**Files and how they relate.** `src/tharkun/sv/finite_domain.py` (`derive_box`, `bounds`, `Box`, `sweep`) is pure AST analysis plus one
+sweep helper; `src/tharkun/sv/scheduler.py` calls it as stage 3b, before the portfolio (`_finite_domain.derive_box(proof_source)`, then `sweep(...)` (a deadline of `DEADLINE_SHARE` = 0.9 of the budget left, stopping at the first cut run) with the
+scheduler's own fresh-child `run`, then `engine._certify_determinism` for O4). Layer order for a bounded program: the abstract
+interpreter (`solve/absint`, stage 2: `proof:interval` / `proof:shape`) first; this proof only runs on what it left open; the exact
+symbolic product proof, concolic path exhaustion and bounded lists/strings are the layers designed (owner, 2026-11-05) and NOT built (ruled, not built).
+
+**Shape.** The entry function (the one the program ends by calling, no parameters) starts with D, consecutive `name = nondet_int()`
+statements, then G, consecutive guards `if COND: return` where COND is built from comparisons, `and`/`or`/`not`, the draw names and integer
+literals only. The QuixBugs `*_2` and `ion` tasks have exactly this shape (`if not (1 <= n <= 30): return`).
+
+**The proof.** (O1) a guard of that form cannot raise, so an input outside the box returns before any site. (O2) `bounds` reads a necessary
+condition of "every guard returned False" off the guards (negation pushed through `not`/`and`/`or`, a conjunct it cannot read gives no bound,
+which is weaker, never wrong); the box is the product of the intervals, at most `BOX_CAP` (5000) vectors, every draw bounded on both sides.
+(O3) every vector is run in a fresh child; a violation is a FALSE with its witness. (O4) runs deterministic given the draws
+(`_certify_determinism`, as for `finite_tree`). (O5) the program names the verifier's `nondet_*` exactly `len(D)` times (an alias, a second
+draw or a draw in a callee refuses), the entry name and the verifier's names are bound once and the entry is called once.
+`tests/test_finite_domain.py` pins the shape, the refusals and a guard whose second alternative (`or n == 99`) must still be found.
+
+**First-try error (owner 1408).** `engine.FINITE_KINDS = ("bool", "rindex")` (2026-09-24, an AI session, Claude Opus 5.5, `c2d0ba96`/`2a1e1f0a`)
+took a draw's finiteness from its KIND; an int bounded by the program's own precondition was never finite, so every QuixBugs `*_2` task
+searched for a violation until the budget ended (101 UNKNOWN pairs on the first official-set grader cycle). Here the domain comes from the guards.
+
+**Limits (named).** Only `nondet_int` draws; a box over `BOX_CAP` (QuixBugs `to_base`: 1000 x 35) or that the budget cannot run (each vector is a
+fresh child: `get_factors` with 1000 vectors) is UNKNOWN as before; determinism the census cannot certify (`set.pop()` in `hanoi_2`) is UNKNOWN.
+
+**Order and budget (corrected 2026-11-05, lane 1518).** The first implementation (`2fe973d1`, an AI lane) ran the sweep before the portfolio and checked the budget only
+between batches, and kept running after a cut run; a box whose runs each hit the run timeout spent the budget plus a batch and starved the absint rounds that decide
+quixbugs `hanoi_1` dynamic-typing and `hanoi_2` arithmetic in about 19 s (found by lane 1519). The sweep now stops at the first run that is cut, flagged or draws a different
+number of values, has a deadline of `DEADLINE_SHARE` (0.9) of the budget left, and after `PROJECT_AFTER` (8) runs stops when its measured rate projects past that deadline.
+It stays before the portfolio: moved after it (tried), the portfolio leaves quixbugs `get_factors` (1,000 fresh runs, about 100 s) too little and its five TRUE pairs are lost.
+
+**Forked runs (lane 1518, 2026-11-05).** A sweep of 1,000 fresh children (quixbugs `get_factors`) needed 116-161 s of the 162 s budget, so the grader returned UNKNOWN. When the strict
+determinism census certifies the program BEFORE the sweep, its runs are a function of the draws, so a run forked from the warmed fork server (`forkserver.py`, about 3.5x cheaper: 0.037 s against
+0.131 s per run under load) is the same evidence as a fresh child; the scheduler then sweeps with `explore` and the `forked` flag is accepted. Before trusting the server it compares the first, a middle
+and the last vector run both ways (status, exception, site, draw count); any difference keeps every run fresh. A violation found by a forked run is a FALSE only after the usual fresh replay
+(`found(..., fresh=False)`). Without the certificate nothing changes: fresh runs, as for `finite_tree`. Measured under load 108 with eight sweeps at once: the seven `get_factors` TRUE pairs in 98 s.
+
+**Batched sweep (lane 1518, 2026-11-05).** A box over `BOX_CAP` (quixbugs `to_base`: 1000 x 35 = 35,000 vectors) cannot be covered by one child per vector even forked. For a program that
+`finite_domain.batch_admissible` admits (imports of `_sv_verifier`, `math` and `string` only; `nondet_int` the only verifier function; no reflection, file, clock, random or interpreter state; no
+`global`/async/generator) and that the strict determinism census certifies, `finite_domain.sweep_batch` runs the box in a few batched children (`sv/_sweep_child.py`: a fresh module namespace and a
+fresh verifier stub per vector, 4,000 vectors per process) up to `BATCH_CAP` (250,000) vectors under the stage's deadline. The batched child is trusted for ONE claim, "this vector ran to its end
+without raising"; every vector it reports as not clean (an exception of any kind, `SystemExit`, a timeout, another draw count) goes back to the engine's own fresh child, which alone decides a
+violation, and the first, a middle and the last vector are run by that child too and must be clean with no flag. More than 200 suspects, a failing batched child or the deadline end the sweep
+UNKNOWN. A violation is therefore a FALSE exactly as before; a TRUE additionally needs the admission above.

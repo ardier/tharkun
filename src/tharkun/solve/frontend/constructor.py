@@ -156,6 +156,124 @@ def _parameter(
     )
 
 
+def _signature_comment_types(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str | None] | None:
+    """The argument types a PEP 484 signature comment (``# type: (A, B) -> R``) gives, or ``None``.
+
+    Aligned to EVERY parameter of the ``def`` in order (positional, ``*args``,
+    keyword-only, ``**kwargs``).  PEP 484 leaves the receiver out of a method's
+    comment, so a list one shorter than the parameters is aligned after the
+    first; any other length is not trusted.  ``(...) -> R`` gives no types.
+    """
+    comment = getattr(node, "type_comment", None)
+    if not comment:
+        return None
+    try:
+        parsed = ast.parse(comment, mode="func_type")
+    except SyntaxError:
+        return None
+    if len(parsed.argtypes) == 1 and isinstance(parsed.argtypes[0], ast.Constant) and parsed.argtypes[0].value is Ellipsis:
+        return None
+    args = node.args
+    total = (
+        len(args.posonlyargs) + len(args.args) + len(args.kwonlyargs)
+        + (args.vararg is not None) + (args.kwarg is not None)
+    )
+    texts = [_annotation_text(item) for item in parsed.argtypes]
+    if len(texts) == total:
+        return texts
+    if len(texts) == total - 1:
+        return [None, *texts]
+    return None
+
+
+def function_parameters(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    drop_receiver: bool = False,
+) -> tuple[ConstructorParameter, ...]:
+    """The parameters of one ``def``, statically, in declaration order.
+
+    ``drop_receiver`` drops the first positional parameter whatever it is named
+    (``self`` of a method, ``cls`` of a classmethod); a staticmethod or a free
+    function keeps it.  Shared by the constructor template and Avengers'
+    method-call templates ([internal ref]), so both read a signature the same way.
+
+    A parameter with no annotation takes its type from a PEP 484 type comment
+    when the source has one -- the per-argument ``# type: A`` or the function's
+    ``# type: (A, B) -> R`` -- provided the tree was parsed with
+    ``type_comments=True`` (``import_resolver.py::parse_with_type_comments``).
+    An annotation always wins over a comment.
+    """
+    parameters: list[ConstructorParameter] = []
+    args = node.args
+    positional = [*args.posonlyargs, *args.args]
+    default_start = len(positional) - len(args.defaults)
+    commented = _signature_comment_types(node)
+    position = 0
+
+    def typed(parameter: ConstructorParameter, arg: ast.arg, index: int) -> ConstructorParameter:
+        if parameter.annotation is not None:
+            return parameter
+        text = getattr(arg, "type_comment", None) or (commented[index] if commented else None)
+        if text is None:
+            return parameter
+        if not isinstance(text, str):
+            return parameter
+        try:
+            ast.parse(text, mode="eval")
+        except SyntaxError:
+            return parameter
+        return ConstructorParameter(
+            name=parameter.name,
+            annotation=text.strip(),
+            kind=parameter.kind,
+            has_default=parameter.has_default,
+            default_is_literal=parameter.default_is_literal,
+            default=parameter.default,
+            default_source=parameter.default_source,
+        )
+
+    for index, arg in enumerate(positional):
+        here = position
+        position += 1
+        if drop_receiver and index == 0:
+            continue
+        has_default = index >= default_start
+        default_node = args.defaults[index - default_start] if has_default else None
+        kind = (
+            "positional_only"
+            if index < len(args.posonlyargs)
+            else "positional_or_keyword"
+        )
+        parameters.append(
+            typed(_parameter(arg, kind, default_node, has_default=has_default), arg, here)
+        )
+
+    if args.vararg is not None:
+        parameters.append(typed(_parameter(args.vararg, "var_positional"), args.vararg, position))
+        position += 1
+
+    for arg, default_node in zip(args.kwonlyargs, args.kw_defaults):
+        parameters.append(
+            typed(
+                _parameter(
+                    arg,
+                    "keyword_only",
+                    default_node,
+                    has_default=default_node is not None,
+                ),
+                arg,
+                position,
+            )
+        )
+        position += 1
+
+    if args.kwarg is not None:
+        parameters.append(typed(_parameter(args.kwarg, "var_keyword"), args.kwarg, position))
+
+    return tuple(parameters)
+
+
 def _constructor_parameters(cls_def: ast.ClassDef) -> tuple[ConstructorParameter, ...]:
     """Extract a complete, immutable parameter template from *cls_def*."""
     for node in cls_def.body:
@@ -163,43 +281,12 @@ def _constructor_parameters(cls_def: ast.ClassDef) -> tuple[ConstructorParameter
             continue
         if node.name != "__init__":
             continue
-
-        parameters: list[ConstructorParameter] = []
-        args = node.args
-        positional = [*args.posonlyargs, *args.args]
-        default_start = len(positional) - len(args.defaults)
-
-        for index, arg in enumerate(positional):
-            if arg.arg == "self":
-                continue
-            has_default = index >= default_start
-            default_node = args.defaults[index - default_start] if has_default else None
-            kind = (
-                "positional_only"
-                if index < len(args.posonlyargs)
-                else "positional_or_keyword"
-            )
-            parameters.append(
-                _parameter(arg, kind, default_node, has_default=has_default)
-            )
-
-        if args.vararg is not None:
-            parameters.append(_parameter(args.vararg, "var_positional"))
-
-        for arg, default_node in zip(args.kwonlyargs, args.kw_defaults):
-            parameters.append(
-                _parameter(
-                    arg,
-                    "keyword_only",
-                    default_node,
-                    has_default=default_node is not None,
-                )
-            )
-
-        if args.kwarg is not None:
-            parameters.append(_parameter(args.kwarg, "var_keyword"))
-
-        return tuple(parameters)
+        # ``self`` by name, as before: an ``__init__`` whose receiver is spelled
+        # differently keeps reporting it, which no caller relies on changing.
+        positional = [*node.args.posonlyargs, *node.args.args]
+        return function_parameters(
+            node, drop_receiver=bool(positional) and positional[0].arg == "self"
+        )
 
     # No __init__ in the source. It may still have one: a dataclass writes it
     # from the annotated fields in its body, and reporting an empty template for
@@ -302,6 +389,29 @@ def _dataclass_parameters(
             )
         )
     return tuple(parameters)
+
+
+def declares_constructor(cls_def: ast.ClassDef) -> bool:
+    """Whether *cls_def*'s OWN source says what its constructor takes.
+
+    True for a body that defines ``__init__`` or ``__new__`` and for a
+    dataclass-style decorator that generates one.  False otherwise -- the class
+    inherits its constructor, or a base or metaclass makes one at run time
+    (``NamedTuple``, ``collections.namedtuple``, ``Enum``, an exception or
+    ``ModuleType`` subclass) -- and then the empty parameter list
+    :func:`constructor_template` reports is a statement about the SOURCE, not
+    about the constructor: a caller that can run the class asks it instead.
+    """
+    for node in cls_def.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {"__init__", "__new__"}:
+            return True
+    return _dataclass_parameters(cls_def) is not None
+
+
+def class_declares_constructor(source_path: str, class_name: str) -> bool | None:
+    """:func:`declares_constructor` for a class found by (dotted) name; ``None`` when it is not found."""
+    cls_def = load_class_def(os.path.realpath(source_path), class_name)
+    return None if cls_def is None else declares_constructor(cls_def)
 
 
 def constructor_template(

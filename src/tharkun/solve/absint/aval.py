@@ -17,6 +17,8 @@ absint adds only what needs the whole-program state:
   linear form, and bounds on a zone variable: relational facts);
 * ``term`` / ``why`` -- the float part's value term and the proof text of a
   bound a lemma produced (``lemmas.py``);
+* ``value_term`` -- optional immutable builtin value provenance (`equality.py`);
+* ``int_values`` -- optional finite integer membership, independent of identity;
 * ``refs`` -- heap objects it may be (``heap.py``); ``st`` -- static objects
   (builtins, modules, exception classes); ``top`` -- anything (any use aborts).
 
@@ -104,9 +106,9 @@ class V:
     of str constants or ``ANY_STR``, ``n`` None-ness); they are stored in a
     :class:`~tharkun.solve.values.Value`."""
 
-    __slots__ = ("val", "lin", "slo", "shi", "term", "why", "refs", "st", "top")
+    __slots__ = ("val", "lin", "slo", "shi", "term", "why", "refs", "st", "top", "value_term", "int_values")
 
-    def __init__(self, i=None, b=None, f=False, s=None, n=False, refs=frozenset(), st=frozenset(), top=False):
+    def __init__(self, i=None, b=None, f=False, s=None, n=False, refs=frozenset(), st=frozenset(), top=False, value_term=None, int_values=None):
         kinds = []
         ifact, lin, slo, shi = _NO_INT, None, None, None
         if i is not None:
@@ -151,6 +153,9 @@ class V:
         self.refs = refs
         self.st = st
         self.top = top
+        self.value_term = value_term
+        # Empty alternatives use BOT; mixed kinds do not carry this coordinate.
+        self.int_values = int_values if int_values and self.only_int() else None
 
     # ------------------------------------------------------------------ views
     def _has(self, kind: str) -> bool:
@@ -189,6 +194,9 @@ class V:
 
     def replace(self, **kw) -> "V":
         d = {k: kw[k] if k in kw else getattr(self, k) for k in ("i", "b", "f", "s", "n", "refs", "st", "top")}
+        d["value_term"] = kw.get("value_term", self.value_term if "s" not in kw else None)
+        # Integer view changes here rename/bound the same value; arithmetic builds a new V.
+        d["int_values"] = kw.get("int_values", self.int_values)
         return V(**d)
 
     # ------------------------------------------------------------------ queries
@@ -212,8 +220,14 @@ class V:
             k.append("static")
         return k
 
+    def _value_term_key(self):
+        # A singleton string already names its exact value; provenance adds no fact.
+        if self.value_term is not None and self.val.s.consts is not None and len(self.val.s.consts) == 1:
+            return None
+        return self.value_term
+
     def _key(self):
-        return (self.val, self.lin, self.slo, self.shi, self.term, self.refs, self.st, self.top)
+        return (self.val, self.lin, self.slo, self.shi, self.term, self.refs, self.st, self.top, self._value_term_key() if self.value_term is not None else None, self.int_values)
 
     def __eq__(self, o: object) -> bool:
         return isinstance(o, V) and self._key() == o._key()

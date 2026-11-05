@@ -1,4 +1,4 @@
-# Third-party references consulted ([internal ref])
+# Third-party references consulted (#1070)
 
 Before writing a contract, its author cross-checks it against existing Python semantic
 models rather than starting from a blank page. **Nothing in `src/tharkun/solve/contracts/`
@@ -39,3 +39,11 @@ before trusting either side.
   a "never raises" claim; those contracts here are tested against CPython directly.
 - Mopsa's Python stubs contain no `list`/`dict`/`set` file (LGPL OCaml has that
   semantics natively) -- per the ticket's instruction, not fetched or read.
+
+`typing.get_type_hints`, [`dataclasses._is_dataclass_instance`](https://github.com/python/cpython/blob/v3.14.4/Lib/dataclasses.py), and [`JSONEncoder.default`](https://github.com/python/cpython/blob/v3.14.4/Lib/json/encoder.py) follow their CPython 3.14.4 implementations; [type-hint resolution](https://github.com/python/cpython/blob/v3.14.4/Lib/typing.py) can evaluate forward references.
+
+For `getattr`, [CPython 3.14.4's `builtin_getattr`](https://github.com/python/cpython/blob/v3.14.4/Python/bltinmodule.c#L1228)
+selects `PyObject_GetAttr` or `PyObject_GetOptionalAttr` depending on whether a default is supplied; the
+[object implementation](https://github.com/python/cpython/blob/v3.14.4/Objects/object.c) handles lookup and optional errors.
+
+`functools.wraps` [constructs a partial of `update_wrapper`](https://github.com/python/cpython/blob/v3.14.4/Lib/functools.py); applying it is a later call. [`inspect.signature`](https://github.com/python/cpython/blob/v3.14.4/Lib/inspect.py) follows introspection hooks and can evaluate string annotations.

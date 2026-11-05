@@ -108,7 +108,7 @@ class SetPop(Rule):
     CONTRACT = Contract(
         qualname="set.pop",
         raises=never_claims(
-            native={"KeyError": "the receiver is empty"},
+            native={"KeyError": "the receiver is empty", "TypeError": "wrong number of arguments or any keyword"},
             tested=frozenset(ALL_PROPERTY_CLASSES),
         ),
         may_raise_other=False,
@@ -198,7 +198,7 @@ class SetClear(Rule):
     names = ("set.clear",)
     CONTRACT = Contract(
         qualname="set.clear",
-        raises=never_claims(tested=frozenset(ALL_PROPERTY_CLASSES)),
+        raises=never_claims(native={"TypeError": "wrong number of arguments or any keyword"}, tested=frozenset(ALL_PROPERTY_CLASSES)),
         may_raise_other=False,
         returns=ReturnSpec("None", tested=True),
         effects=Effects(mutates_receiver=True),
@@ -217,7 +217,7 @@ class SetCopy(Rule):
     names = ("set.copy",)
     CONTRACT = Contract(
         qualname="set.copy",
-        raises=never_claims(tested=frozenset(ALL_PROPERTY_CLASSES)),
+        raises=never_claims(native={"TypeError": "wrong number of arguments or any keyword"}, tested=frozenset(ALL_PROPERTY_CLASSES)),
         may_raise_other=False,
         returns=ReturnSpec("set", "a new, shallow-copied set", tested=True),
         effects=Effects(deterministic=True),
@@ -228,15 +228,15 @@ class SetCopy(Rule):
 
 _ITER_ELEM = "each argument's __iter__/__next__, and each yielded element's __hash__/__eq__"
 _ITER_TYPEERROR = "an argument is not iterable, or yields an unhashable element (a set is not converted)"
-_ELEM_EQ = "an element's __eq__ (only on a hash collision between distinct objects)"
+_ELEM_EQ = "an element's __eq__ (only on a hash collision between distinct objects), or syntax dispatch to the other operand's reflected operator/comparison"
 _ARITY = "wrong number of arguments or any keyword argument"
 _OPERAND_TYPEERROR = (
     "the other operand is neither a set nor a frozenset and does not implement the reflected operator "
-    "(a dict keys/items view does)"
+    "(a dict keys/items view does), or reflected dispatch raises TypeError; also wrong binding"
 )
 _OPERAND_COMPARE_TYPEERROR = (
     "the other operand is neither a set nor a frozenset and does not implement the reflected comparison "
-    "(a dict keys/items view does)"
+    "(a dict keys/items view does), or reflected dispatch raises TypeError; also wrong binding"
 )
 
 
@@ -257,9 +257,7 @@ def _iterable_method(name, c_func, returns, *, mutates=False, arity_note=""):
 
 
 def _operator(name, c_func, *, inplace=False):
-    returns = (ReturnSpec("set", "the receiver itself (the same object), mutated in place", tested=True) if inplace
-               else ReturnSpec("set", "a NEW set (a frozenset when the LEFT operand is a frozenset); neither operand "
-                                     "changes", tested=True))
+    returns = ReturnSpec("object", "a set result (or the mutated receiver for in-place operations) for builtin set operands; the raw method may return NotImplemented, and syntax may return any reflected-operator result", tested=True)
     return Contract(
         qualname=f"set.__{name}__",
         raises=dunder_propagation_claims(
@@ -280,7 +278,7 @@ def _comparison(name, c_func):
             _ELEM_EQ, native={"TypeError": _OPERAND_COMPARE_TYPEERROR}, tested_native=frozenset({"TypeError"}),
         ),
         may_raise_other=True,
-        returns=ReturnSpec("bool", tested=True),
+        returns=ReturnSpec("object", "bool for builtin set operands; the raw method may return NotImplemented, and syntax may return any reflected-comparison result", tested=True),
         effects=Effects(deterministic=True),
         source=(_DOCS, f"CPython Objects/setobject.c::{c_func}"),
         tested=True,
@@ -502,7 +500,7 @@ class SetGe(Rule):
 
 @register_rule
 class SetEq(Rule):
-    """The rule of ``set == x``: never an error."""
+    """The rule of ``set == x``: reflected comparison is open."""
 
     SAMPLES = {"set.__eq__": _S + "b = s == {1, 2}\n"}
     names = ("set.__eq__",)
@@ -510,9 +508,7 @@ class SetEq(Rule):
         qualname="set.__eq__",
         raises=dunder_propagation_claims(_ELEM_EQ),
         may_raise_other=True,
-        returns=ReturnSpec("bool", "False for any operand that is not a set or frozenset (never an error); two sets "
-                                   "are equal iff they have the same length and every element of one is in the "
-                                   "other", tested=True),
+        returns=ReturnSpec("object", "bool for builtin set operands; other kinds return NotImplemented from the raw method, then syntax delegates to reflected comparison or its bool fallback", tested=True),
         effects=Effects(deterministic=True),
         source=(_DOCS, "CPython Objects/setobject.c::set_richcompare (Py_EQ)"),
         tested=True,
@@ -521,7 +517,7 @@ class SetEq(Rule):
 
 @register_rule
 class SetNe(Rule):
-    """The rule of ``set != x``: never an error."""
+    """The rule of ``set != x``: reflected comparison is open."""
 
     SAMPLES = {"set.__ne__": _S + "b = s != {1, 2}\n"}
     names = ("set.__ne__",)
@@ -529,7 +525,7 @@ class SetNe(Rule):
         qualname="set.__ne__",
         raises=dunder_propagation_claims(_ELEM_EQ),
         may_raise_other=True,
-        returns=ReturnSpec("bool", "True for any operand that is not a set or frozenset (never an error)", tested=True),
+        returns=ReturnSpec("object", "bool for builtin set operands; other kinds return NotImplemented from the raw method, then syntax delegates to reflected comparison or its bool fallback", tested=True),
         effects=Effects(deterministic=True),
         source=(_DOCS, "CPython Objects/setobject.c::set_richcompare (Py_NE)"),
         tested=True,

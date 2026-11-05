@@ -155,13 +155,31 @@ class RandomMixin:
         return self.binop(st, ast.Add(), x, step, n)
 
     def m_random_seed(self, st, a, k, n):
+        from .aval import ANY_STR, BOT
+        from .heap import DictObj, ListObj, TupleObj
         bound = self._random_args(st, n, a, k, "seed")
         if bound is None:
             return BOT
-        if "a" in bound:
-            v = bound["a"]
-            bad = bool(v.refs or v.st)  # None, int, float, str (and bytes) are accepted
-            self.check(n, "arg-type", {"TypeError"}, not bad, "seed of " + ",".join(v.kinds()))
+        value=bound.get('a',NONE)
+        version=bound.get('version')
+        if version is not None and (version.refs or version.st):
+            raise Unsupported('random.seed: version comparison is not a closed scalar',n)
+        if value.st or any(type(st.heap[r]) not in (ListObj,TupleObj,DictObj) for r in value.refs):
+            raise Unsupported('random.seed: open seed protocol',n)
+        valid=bool(value.i is not None or value.b or value.f or value.s is not None or value.n)
+        bad=bool(value.refs)
+        if value.s is not None:
+            # shortcut: text with a possible encoding error is refused in try; add UnicodeEncodeError transfer when needed.
+            if value.s == ANY_STR:
+                if self._try_stack:raise Unsupported('random.seed: text may have an encoding error',n)
+            elif any(any(0xd800<=ord(c)<=0xdfff for c in text) for text in value.s):
+                raise Unsupported('random.seed: surrogate encoding is outside the transfer',n)
+        payload={'TypeError':self.contract_exception_args('random.seed','TypeError','native-unsupported-seed',(),n)} if bad else None
+        self.check(n,'arg-type',{'TypeError'},not bad,
+                   'closed native seed and scalar version comparisons',st=st,exact_args=payload,contract_qualname='random.seed')
+        if not valid:
+            st.set_bottom()
+            return BOT
         return NONE
 
     # ------------------------------------------------------------------ randrange and getrandbits ([internal ref] follow-up)

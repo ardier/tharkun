@@ -48,6 +48,10 @@ class is refused from then on (the rest of the path keeps running on plain value
 from __future__ import annotations
 
 import ast
+import builtins
+import os
+import symtable
+import sys
 import types
 
 import z3
@@ -124,13 +128,58 @@ class Heap:
 class ClassTable:
     """The live classes of the harness module, validated once each (see the module docstring)."""
 
-    def __init__(self, tree: ast.Module, globals_: dict):
+    def __init__(self, tree: ast.Module, globals_: dict, module_sources=None):
+        self.sources = module_sources or {}
         self.ast = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
         self.g = globals_
         self._done: dict = {}
+        self._imported: dict = {}
 
     def is_user_class(self, v) -> bool:
-        return isinstance(v, type) and v.__name__ in self.ast and self.g.get(v.__name__) is v
+        return (isinstance(v, type) and v.__name__ in self.ast and self.g.get(v.__name__) is v) or self.imported(v)
+
+    def imported(self, v):
+        """``(ClassDef, symbol table)`` of a class the harness IMPORTED from a module of the program (a ``.py`` file
+        outside the interpreter's own trees), else ``None``.  The harness of an entry module that defines a class is
+        the import form (``inputs.py::_inline_refusal``), so its classes are never in the harness AST."""
+        if not isinstance(v, type):
+            return None
+        if v not in self._imported:
+            self._imported[v] = self._read_imported(v)
+        return self._imported[v]
+
+    def _read_imported(self, cls):
+        """The source of an imported module is the parent's read of the file (``module_sources``: the worker's file
+        confinement refuses a read here), and it must be the file the live class came from."""
+        got = self.sources.get(cls.__module__)
+        path = getattr(sys.modules.get(cls.__module__), "__file__", None)
+        if not got or not path or self.g.get(cls.__name__) is not cls or os.path.abspath(path) != os.path.abspath(got[0]):
+            return None
+        try:
+            node = next((n for n in ast.parse(got[1], got[0]).body if isinstance(n, ast.ClassDef) and n.name == cls.__name__), None)
+            table = symtable.symtable(got[1], got[0], "exec")
+        except (SyntaxError, ValueError):
+            return None
+        return None if node is None else (node, table)
+
+    @staticmethod
+    def _closed(table, cls_name: str, fd: ast.FunctionDef) -> None:
+        """An imported method is inlined with the HARNESS's globals, so it must read no global of its own module (only
+        builtins) and no private-mangled name (the compiler renamed those per class)."""
+        klass = next((c for c in table.get_children() if c.get_type() == "class" and c.get_name() == cls_name), None)
+        fn = next((c for c in (klass.get_children() if klass else ()) if c.get_name() == fd.name and c.get_lineno() == fd.lineno), None)
+        if fn is None:
+            raise Unsupported(f"class {cls_name}.{fd.name}: no symbol table for the imported def")
+        todo = [fn]
+        while todo:
+            t = todo.pop()
+            todo.extend(t.get_children())
+            for sym in t.get_symbols():
+                name = sym.get_name()
+                if name.startswith("__") and not name.endswith("__"):
+                    raise Unsupported(f"class {cls_name}.{fd.name}: the private-mangled name {name}")
+                if sym.is_global() and sym.is_referenced() and not hasattr(builtins, name):
+                    raise Unsupported(f"class {cls_name}.{fd.name}: reads the module global {name}, not in the harness")
 
     def info(self, cls) -> ClassInfo:
         got = self._done.get(cls)
@@ -146,7 +195,8 @@ class ClassTable:
 
     def _build(self, cls) -> ClassInfo:
         name = cls.__name__
-        node = self.ast.get(name)
+        foreign = self.imported(cls)
+        node = foreign[0] if foreign else self.ast.get(name)
         if node is None or self.g.get(name) is not cls:
             raise Unsupported(f"class {name} is not a module-level class of the program")
         if type(cls) is not type:
@@ -184,6 +234,8 @@ class ClassTable:
             if fd is None:
                 raise Unsupported(f"class {name}.{key}: the live method is not the def of the class body "
                                   f"(patched, wrapped or generated)")
+            if foreign:
+                self._closed(foreign[1], name, fd)
             if fn.__code__.co_flags & _GENERATOR_FLAGS:
                 raise Unsupported(f"class {name}.{key} is a generator or async function")
             info.methods[key] = Method(kind, fd, info)
@@ -221,14 +273,15 @@ def _kind_name(v) -> str:
 class ObjectModel:
     """The class protocol of one :class:`~tharkun.sv._symexec._Runner`: its heap, its live classes and the fact."""
 
-    def __init__(self, runner, tree: ast.Module, globals_: dict, records, proven_classes=()):
+    def __init__(self, runner, tree: ast.Module, globals_: dict, records, proven_classes=(), module_sources=None):
         self.r = runner
-        self.table = ClassTable(tree, globals_)
+        self.table = ClassTable(tree, globals_, module_sources)
         self.index = call_target_index(records)
         #: the class names a program name may denote: a class-origin ``module_constant`` that is proven
         #: (``proven_classes``), and the callee of every proven ``user_class`` call_target
         self.proven_names = set(proven_classes) | {
-            rec["callee"] for rec in self.index.values() if rec["target"] == "user_class" and rec["proven"]}
+            rec["callee"] for rec in self.index.values() if rec["target"] == "user_class" and rec["proven"]} | {
+            rec["callee"].split(".")[0] for rec in self.index.values() if rec["target"] == "imported" and rec["proven"]}
         self.heap = Heap()
         self.next_oid = 0
         self.version = 0                    # every heap write, to tell whether a skipped statement wrote
@@ -493,7 +546,8 @@ class ObjectModel:
 
     def _call_on_class(self, n: ast.Call, f: ast.Attribute, cls):
         callee = ast.unparse(f)
-        ct = self._require(callee, "user_method")
+        imported = self.table.imported(cls)
+        ct = self._require(callee, "imported" if imported else "user_method")
         self._check_method_name(f.attr)
         self._classes_known()
         hit = self._chain(self.table.info(cls), f.attr, self.heap)
@@ -502,9 +556,9 @@ class ObjectModel:
         kind, m = hit
         if kind != "method":
             raise Unsupported(f"call {callee}: a class attribute that is not a method")
-        if ct["name"] != f"{m.owner.name}.{f.attr}":
-            raise Unsupported(f"call {callee}: the call_target names {ct['name']}, the live class has "
-                              f"{m.owner.name}.{f.attr}")
+        live = f"{cls.__module__}.{m.owner.name}.{f.attr}" if imported else f"{m.owner.name}.{f.attr}"
+        if ct["name"] != live or (imported and m.owner.cls is not cls):
+            raise Unsupported(f"call {callee}: the call_target names {ct['name']}, the live class has {live}")
         args = self._args(n)
         if m.kind == "class":
             args = [cls] + args
@@ -578,10 +632,13 @@ class ObjectModel:
                 merged[name] = va
             else:
                 try:
-                    merged[name] = _typed_ite(guard, va, vb)
+                    merged[name] = self._merge_value(guard, va, vb)
                 except Unsupported:
                     merged[name] = POISON
         return merged
+
+    def _merge_value(self, guard, a, b):
+        return _typed_ite(guard, a, b)
 
     def _fallback(self, key, name: str, heap: Heap):
         """What reading ``key.name`` gives on a path whose own cell has no ``name``."""

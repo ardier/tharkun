@@ -20,6 +20,8 @@ call) are ``Unsupported``; ``key=None`` is the call without a key.
 
 from __future__ import annotations
 
+import ast
+
 from .aval import ANY_STR, BOT, FLOAT, V, const_bool, const_int, int_iv
 from .errors import Unsupported
 from .state import vjoin
@@ -57,6 +59,70 @@ def _is_none_only(v: V) -> bool:
 
 class ReducersMixin:
     """Mixed into ``interp.py::Analyzer``; every method here uses only Analyzer methods and the shared value types."""
+
+    def _integer_reduce(self, st, args, kwargs, node):
+        """Prove a pure integer fold invariant; None keeps the generic contract path."""
+        if len(args) not in (2, 3) or set(kwargs) - {'initial'} or (len(args) == 3 and kwargs):
+            return None
+        function, source = args[:2]
+        initial = args[2] if len(args) == 3 else kwargs.get('initial')
+        if (not source.refs or not source.replace(refs=frozenset()).is_bot()
+                or any(st.heap[a].kind not in ('list', 'tuple') for a in source.refs)):
+            return None
+        element = self.elem_summary(st, source)
+        if (element is not None and (element.i is None or not element.replace(i=None).is_bot())):
+            return None
+        if initial is not None and (initial.i is None or not initial.replace(i=None).is_bot()):
+            return None
+        # Only a parameter-only expression can be checked once without losing
+        # effects or correlations as an arbitrary-length fold repeats its callback.
+        if len(function.refs) != 1 or not function.replace(refs=frozenset()).is_bot():
+            return None
+        callback = st.heap[next(iter(function.refs))]
+        if callback.kind != 'func' or callback.flavor != 'plain':
+            return None
+        definition = callback.node
+        if isinstance(definition, ast.Lambda):
+            expression = definition.body
+        elif (isinstance(definition, ast.FunctionDef) and not definition.decorator_list
+              and len(definition.body) == 1 and isinstance(definition.body[0], ast.Return)
+              and definition.body[0].value is not None):
+            expression = definition.body[0].value
+        else:
+            return None
+        signature = definition.args
+        parameters = signature.posonlyargs + signature.args
+        if len(parameters) != 2 or signature.vararg or signature.kwarg or signature.kwonlyargs:
+            return None
+        names = {p.arg for p in parameters}
+        allowed = (ast.BinOp, ast.UnaryOp, ast.Name, ast.Constant, ast.Load,
+                   ast.Add, ast.Sub, ast.Mult, ast.BitAnd, ast.BitOr, ast.BitXor,
+                   ast.UAdd, ast.USub, ast.Invert)
+        for part in ast.walk(expression):
+            if (not isinstance(part, allowed)
+                    or isinstance(part, ast.Name) and part.id not in names
+                    or isinstance(part, ast.Constant) and type(part.value) is not int):
+                return None
+        self._in_try_refuse('functools.reduce (non-property raises are not routed)', node)
+        lo, hi, _ = self._reduce_source(st, source, node, 'functools.reduce')
+        proven = {exc: 'exact builtin integer list/tuple and parameter-only integer callback: no hook runs'
+                  for exc in NO_HOOK_CLASSES}
+        self.check(node, 'reduce-nonempty', {'TypeError'}, initial is not None or lo >= 1,
+                   'an initial value or at least one element is required')
+        if initial is not None or lo >= 1:
+            proven['TypeError'] = 'valid binding, exact integer operands and a nonempty source or initial value'
+        if hi == 0 or element is None:
+            if initial is None:
+                st.set_bottom()
+                return BOT, proven
+            return initial, proven
+        # All integers contain the seed and are closed under the admitted body.
+        # Analyze that body on the invariant, rather than executing target code.
+        integer = int_iv(None, None)
+        result = self.call(st, function, [integer, integer], {}, node)
+        if result.i is None or not result.replace(i=None).is_bot():
+            raise Unsupported('integer reduce callback did not preserve the integer invariant', node)
+        return integer, proven
 
     # ------------------------------------------------------------ the source
     def _reduce_source(self, st, v: V, node, name: str):

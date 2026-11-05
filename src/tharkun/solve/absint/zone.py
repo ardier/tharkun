@@ -19,12 +19,44 @@ ZERO = "0"
 
 
 class Zone:
-    __slots__ = ("m", "vars", "bottom")
+    __slots__ = ("m", "vars", "bottom", "affine")
 
     def __init__(self) -> None:
         self.m: dict[tuple[str, str], int] = {}
         self.vars: set[str] = {ZERO}
         self.bottom = False
+        self.affine = None
+
+    def enable_affine(self, clock, deadline):
+        from .affine import Affine
+        self.affine = Affine(clock, deadline)
+
+    def remember_affine(self, terms, constant):
+        if self.affine is not None and not self.bottom:
+            self.vars.update(name for name, coefficient in terms if coefficient)
+            self.affine.remember(terms, constant)
+            if self.affine.inconsistent:
+                self.bottom = True
+                self.m.clear()
+
+    def _affine_basis(self):
+        if self.affine is None:
+            return None
+        basis = self.affine.copy()
+        names = {name for row in basis.rows.values() for name in row if name != ZERO}
+        constants = {name for name in self.vars
+                     if self.bounds(name)[0] is not None and self.bounds(name)[0] == self.bounds(name)[1]}
+        for name in names:
+            lo, hi = self.bounds(name)
+            if lo is not None and lo == hi and basis.rows.get(name) != {name: 1, ZERO: -lo}:
+                basis.remember([(name, 1)], -lo)
+            if name not in constants:
+                for other in sorted(self.vars - constants - {name}):
+                    delta = self.get(name, other)
+                    if delta is not None and self.get(other, name) == -delta:
+                        basis.remember([(name, 1), (other, -1)], -delta)
+                        break
+        return basis
 
     # ------------------------------------------------------------------ basics
     def copy(self) -> "Zone":
@@ -32,6 +64,7 @@ class Zone:
         z.m = dict(self.m)
         z.vars = set(self.vars)
         z.bottom = self.bottom
+        z.affine = None if self.affine is None else self.affine.copy()
         return z
 
     def get(self, a: str, b: str) -> int | None:
@@ -107,6 +140,9 @@ class Zone:
             raise ValueError("cannot forget the zero variable")
         if x not in self.vars:
             return
+        if self.affine is not None:
+            self.affine = self._affine_basis()
+            self.affine.forget(x)
         self.vars.discard(x)
         self.m = {k: v for k, v in self.m.items() if k[0] != x and k[1] != x}
 
@@ -117,6 +153,8 @@ class Zone:
         if x == y:
             if c == 0:
                 return
+            if self.affine is not None:
+                self.affine.shift(x, c)
             nm = {}
             for (a, b), v in self.m.items():
                 if a == x:
@@ -133,6 +171,8 @@ class Zone:
             self.vars.add(y)
         self.add(x, y, c)
         self.add(y, x, -c)
+        terms = [(x, 1)] if y == ZERO else [(x, 1), (y, -1)]
+        self.remember_affine(terms, -c)
 
     def assign_interval(self, x: str, lo: int | None, hi: int | None) -> None:
         self.forget(x)
@@ -141,11 +181,15 @@ class Zone:
             self.add(x, ZERO, hi)
         if lo is not None:
             self.add(ZERO, x, -lo)
+        if lo is not None and lo == hi:
+            self.remember_affine([(x, 1)], -lo)
 
     def rename(self, old: str, new: str) -> None:
         if old == new or old not in self.vars:
             return
         self.forget(new)
+        if self.affine is not None:
+            self.affine.rename(old, new)
         self.vars.discard(old)
         self.vars.add(new)
         nm = {}
@@ -160,15 +204,20 @@ class Zone:
             return
         vs = list(self.vars)
         m = self.m
+        # Row indexing avoids tuple-key lookups for every candidate path.
+        rows = {i: {i: 0} for i in vs}
+        for (i, j), bound in m.items():
+            if i in rows and j in rows and i != j:
+                rows[i][j] = bound
         for k in vs:
+            # A zero diagonal leaves row k unchanged unless a negative cycle ends closure.
+            outgoing = tuple(rows[k].items())
             for i in vs:
-                dik = 0 if i == k else m.get((i, k))
+                row = rows[i]
+                dik = row.get(k)
                 if dik is None:
                     continue
-                for j in vs:
-                    dkj = 0 if k == j else m.get((k, j))
-                    if dkj is None:
-                        continue
+                for j, dkj in outgoing:
                     nv = dik + dkj
                     if i == j:
                         if nv < 0:
@@ -176,8 +225,9 @@ class Zone:
                             self.m.clear()
                             return
                         continue
-                    old = m.get((i, j))
+                    old = row.get(j)
                     if old is None or nv < old:
+                        row[j] = nv
                         m[(i, j)] = nv
 
     def leq(self, other: "Zone") -> bool:
@@ -190,6 +240,9 @@ class Zone:
             mine = self.m.get(k)
             if mine is None or mine > c:
                 return False
+        if other.affine is not None and other.affine.rows:
+            if self.affine is None or not self._affine_basis().leq(other.affine):
+                return False
         return True
 
     def join(self, other: "Zone") -> "Zone":
@@ -201,6 +254,8 @@ class Zone:
         z.vars = self.vars | other.vars
         om = other.m
         z.m = {k: (v if v >= om[k] else om[k]) for k, v in self.m.items() if k in om}
+        if self.affine is not None and other.affine is not None:
+            z.affine = self._affine_basis().join(other._affine_basis())
         return z
 
     def widen(self, new: "Zone") -> "Zone":
@@ -213,6 +268,8 @@ class Zone:
         z.vars = self.vars | new.vars
         nm = new.m
         z.m = {k: v for k, v in self.m.items() if k in nm and nm[k] <= v}
+        if self.affine is not None and new.affine is not None:
+            z.affine = self._affine_basis().join(new._affine_basis())
         return z
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid

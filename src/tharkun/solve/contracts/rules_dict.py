@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from tharkun.solve.contracts._helpers import dunder_propagation_claims, never_claims
 from tharkun.solve.contracts.rules import Rule, register_rule
-from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec
+from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec, ArgumentRef, RaiseArgsCase, ScopedArgsRaiseClaim
 
 _DOCS = "https://docs.python.org/3.14/library/stdtypes.html#dict"
 
@@ -39,18 +39,20 @@ class DictGetitem(Rule):
     names = ("dict.__getitem__",)
     CONTRACT = Contract(
         qualname="dict.__getitem__",
-        raises=dunder_propagation_claims(
-            "the key's __hash__ (always) or __eq__ (only on a hash collision)",
+        raises=tuple(ScopedArgsRaiseClaim(c.exc,c.condition,c.tested,
+            args_cases=(RaiseArgsCase('native-missing-key','exact builtin dict; key hashing/equality succeeded; key is absent',(ArgumentRef(1),),True),))
+            if c.exc=='KeyError' else c for c in dunder_propagation_claims(
+            "the key's __hash__ (always), __eq__ on a hash collision, or a subclass receiver's __missing__",
             native={
                 "TypeError": _UNHASHABLE,
-                "KeyError": "the key is hashable but not present in the receiver",
+                "KeyError": "after successful hash/equality, key is absent and no subclass __missing__ overrides the native miss; also propagates KeyError from hash/equality/__missing__ hooks",
             },
             tested_native=frozenset({"TypeError", "KeyError"}),
-        ),
+        )),
         may_raise_other=True,
         returns=ReturnSpec("the value type", tested=True),
         effects=Effects(deterministic=True),
-        source=(_DOCS, "CPython Objects/dictobject.c::dict_subscript"),
+        source=(_DOCS, "https://github.com/python/cpython/blob/3.14/Objects/dictobject.c"),
         tested=True,
     )
 
@@ -314,4 +316,76 @@ class DictCopy(Rule):
     )
 
 
-__all__ = ["DictGetitem", "DictSetitem", "DictGet", "DictPop", "DictPopitem", "DictSetdefault", "DictUpdate", "DictKeys", "DictValues", "DictItems", "DictClear", "DictCopy"]
+@register_rule
+class DictDelitem(Rule):
+    """The rule of ``del d[key]`` (``dict.__delitem__``)."""
+
+    SAMPLES = {'dict.__delitem__': 'd = {1: 2}\ndel d[1]\n'}
+    TWINS = {}
+
+    names = ("dict.__delitem__",)
+    CONTRACT = Contract(
+        qualname="dict.__delitem__",
+        raises=dunder_propagation_claims(
+            "the key's __hash__ (always) or __eq__ (only on a hash collision)",
+            native={
+                "TypeError": _UNHASHABLE,
+                "KeyError": "after successful hash/equality, the key is absent; also propagates KeyError from hash/equality hooks",
+            },
+            tested_native=frozenset({"TypeError", "KeyError"}),
+        ),
+        may_raise_other=True,
+        returns=None,
+        effects=Effects(mutates_receiver=True),
+        source=(_DOCS, "CPython Objects/dictobject.c::dict_ass_sub, PyDict_DelItem"),
+        tested=True,
+    )
+
+
+@register_rule
+class DictContains(Rule):
+    """The rule of ``k in d`` (``dict.__contains__``)."""
+
+    SAMPLES = {'dict.__contains__': 'd = {1: 2}\nb = 1 in d\n'}
+    TWINS = {}
+
+    names = ("dict.__contains__",)
+    CONTRACT = Contract(
+        qualname="dict.__contains__",
+        raises=dunder_propagation_claims(
+            "the key's __hash__ (always, even on an empty dict) or __eq__ (only on a hash collision)",
+            native={"TypeError": _UNHASHABLE},
+            tested_native=frozenset({"TypeError"}),
+        ),
+        may_raise_other=True,
+        returns=ReturnSpec("bool", "never raises KeyError; True iff the key is present", tested=True),
+        effects=Effects(deterministic=True),
+        source=(_DOCS, "CPython Objects/dictobject.c::dict___contains__, PyDict_Contains"),
+        tested=True,
+    )
+
+
+@register_rule
+class DictFromkeys(Rule):
+    """The rule of ``dict.fromkeys(iterable, value=None)``."""
+
+    SAMPLES = {'dict.fromkeys': 'd = dict.fromkeys([1, 2])\n'}
+    TWINS = {'dict.fromkeys': 'd = dict.fromkeys()\n'}
+
+    names = ("dict.fromkeys",)
+    CONTRACT = Contract(
+        qualname="dict.fromkeys",
+        raises=dunder_propagation_claims(
+            "the iterable's __iter__/__next__ or a key's __hash__ (or __eq__ on a collision)",
+            native={"TypeError": "the argument is not iterable, a key is unhashable, or the call has no iterable / more than two arguments / a keyword"},
+            tested_native=frozenset({"TypeError"}),
+        ),
+        may_raise_other=True,
+        returns=ReturnSpec("dict", "every distinct key of the iterable (in first-seen order) mapped to the SAME value object (None by default)", tested=True),
+        effects=Effects(deterministic=True),
+        source=(_DOCS, "CPython Objects/dictobject.c::dict_fromkeys_impl, _PyDict_FromKeys"),
+        tested=True,
+    )
+
+
+__all__ = ["DictGetitem", "DictSetitem", "DictGet", "DictPop", "DictPopitem", "DictSetdefault", "DictUpdate", "DictKeys", "DictValues", "DictItems", "DictClear", "DictCopy", "DictDelitem", "DictContains", "DictFromkeys"]

@@ -40,7 +40,7 @@ COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 #: Attributes that hand a program the frame or the namespace it runs in.
 FRAME_ATTRS = frozenset(
     {"f_locals", "f_globals", "f_back", "_getframe", "currentframe", "__globals__", "gi_frame",
-     "cr_frame", "tb_frame"}
+     "cr_frame", "tb_frame", "getrefcount", "get_referrers", "get_referents"}
 )
 
 _FUNCTION_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
@@ -144,6 +144,9 @@ def reaches_the_namespace(tree: ast.AST) -> bool:
                 return True
         elif isinstance(node, ast.Attribute):
             if node.attr in FRAME_ATTRS:
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if any(a.name in FRAME_ATTRS or a.name in hot for a in node.names):
                 return True
         elif isinstance(node, ast.Global):
             if hot & set(node.names):

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from tharkun.solve.contracts._helpers import dunder_propagation_claims, never_claims
 from tharkun.solve.contracts.rules import Rule, Shape, register_rule
-from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec
+from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec, ArgumentRef, RaiseArgsCase, ScopedArgsRaiseClaim
 
 _DOCS = "https://docs.python.org/3.14/library/collections.html"
 _ALL_TESTED = frozenset(ALL_PROPERTY_CLASSES)
@@ -185,19 +185,21 @@ class CollectionsDequeRotate(Rule):
 class CollectionsDefaultdictGetitem(Rule):
     """The rule of ``collections.defaultdict.__getitem__``."""
 
-    SAMPLES = {'collections.defaultdict.__getitem__': 'import collections\ndd = collections.defaultdict(int)\nv = dd[1]\n'}
+    SAMPLES = {'collections.defaultdict.__getitem__': 'import collections\ndd = collections.defaultdict(list)\nv = dd[1]\n'}
     TWINS = {}
 
     names = ("collections.defaultdict.__getitem__",)
     CONTRACT = Contract(
         qualname="collections.defaultdict.__getitem__",
-        raises=dunder_propagation_claims(
-            "default_factory() when the key is absent (via __missing__) -- default_factory's OWN exceptions propagate",
+        raises=tuple(ScopedArgsRaiseClaim(c.exc,c.condition,c.tested,
+            args_cases=(RaiseArgsCase('native-missing-key','exact defaultdict with factory None; key hashing/equality succeeded; key is absent',(ArgumentRef(1),),True),))
+            if c.exc=='KeyError' else c for c in dunder_propagation_claims(
+            "key hashing/equality, receiver __missing__, or default_factory() -- their exceptions propagate",
             native={
-                "KeyError": "the key is absent AND default_factory is None (the constructor's default) -- the ONLY case this raises; a real factory NEVER lets a missing key raise KeyError",
+                "KeyError": "after successful hashing/equality, key is absent and default_factory is None; also propagates KeyError from hashing/equality, __missing__, or a factory",
             },
             tested_native=frozenset({"KeyError"}),
-        ),
+        )),
         may_raise_other=True,  # REVIEW FIX: default_factory is arbitrary user code; may raise ValueError, a custom exception, etc.
         returns=ReturnSpec("the value type, or default_factory()'s return for a missing key", tested=True),
         effects=Effects(mutates_receiver=True, may_execute_callback=True, notes="a missing-key read INSERTS default_factory()'s result into the dict -- unlike dict.get(), reading a defaultdict has a side effect"),
@@ -354,3 +356,34 @@ class CollectionsNamedtupleReplace(Rule):
 
 
 __all__ = ["CollectionsDequeAppend", "CollectionsDequeAppendleft", "CollectionsDequePop", "CollectionsDequePopleft", "CollectionsDequeExtend", "CollectionsDequeRotate", "CollectionsDefaultdictGetitem", "CollectionsCounterGetitem", "CollectionsCounterMostCommon", "CollectionsOrderedDictMoveToEnd", "CollectionsNamedtuple", "CollectionsNamedtupleReplace"]
+
+
+@register_rule
+class CollectionsDefaultdictMissing(Rule):
+    """The native missing-key hook, including direct calls on present/unhashable keys."""
+
+    names=('collections.defaultdict.__missing__',)
+    SHAPE=Shape(2,2)
+    SAMPLES={names[0]: "import collections\nd=collections.defaultdict(list)\nx=d.__missing__('key')\n"}
+    TWINS={names[0]: "import collections\nd=collections.defaultdict(None)\nx=d.__missing__()\n"}
+    CONTRACT=Contract(
+        qualname=names[0],
+        raises=tuple(ScopedArgsRaiseClaim(c.exc,c.condition,c.tested,
+                       args_cases=(RaiseArgsCase('no-factory','native defaultdict.__missing__ with default_factory None; key is not inspected or hashed',
+                                                 (ArgumentRef(1),),True),)) if c.exc=='KeyError' else c
+                     for c in dunder_propagation_claims(
+                         'default_factory(), then native setdefault-style insertion and key hashing/equality',
+                         native={'KeyError':'default_factory is None, or a factory/insertion/hash/equality callback raises KeyError',
+                                 'TypeError':'wrong binding/receiver, noncallable factory, unhashable insertion key, or callback raises TypeError'},
+                         tested_native=frozenset({'KeyError','TypeError'}))),
+        may_raise_other=True,
+        returns=ReturnSpec('object','for a non-None factory, its result is proposed for setdefault-style insertion; a present/reentrant value wins and is returned; the factory is called even for a present key',tested=True),
+        effects=Effects(mutates_receiver=True,may_execute_callback=True),
+        source=(f'{_DOCS}#collections.defaultdict.__missing__',
+                'https://github.com/python/cpython/blob/3.14/Modules/_collectionsmodule.c'),
+        tested=True,
+        notes='With factory None this raises KeyError(key) without hashing, formatting or testing membership. Other factories and insertion hash/equality can execute arbitrary code; native insertion bypasses a subclass __setitem__.',
+    )
+
+
+__all__ += ['CollectionsDefaultdictMissing']

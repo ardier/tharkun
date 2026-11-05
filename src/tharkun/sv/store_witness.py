@@ -35,14 +35,15 @@ def bind_route(verdict, route, source, filename, classes, *, parents=()):
     try:
         from tharkun.sv.engine import Verdict
 
-        expected = {"no-site": "proof:no-site", "product": "symbolic:product",
+        expected = {"no-site": "proof:no-site", "product": "symbolic:product", "combined": "proof:combined",
                     "determinism": "deterministic", "stationary": "proof:stationary"}.get(route)
         if (not isinstance(verdict, Verdict) or verdict.verdict != "true"
                 or (route == "producer" and not verdict.component.startswith("proof:facts:"))
                 or (route != "producer" and (expected is None or verdict.component != expected))):
             return verdict
         parents = tuple(parents)
-        kind = {"producer": "certified_invariant", "stationary": "call_target"}.get(route)
+        kind = {"producer": "certified_invariant", "stationary": "call_target",
+                "combined": "check_coverage"}.get(route)
         if (any(len(parent) != 2 or parent[0] != kind for parent in parents)
                 or (route == "producer" and not parents)):
             return verdict

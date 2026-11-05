@@ -20,12 +20,17 @@ from __future__ import annotations
 
 from tharkun.solve.contracts.reachability import closed_call_hooks
 from tharkun.solve.contracts.registry import all_contracts, for_module, for_receiver, get, load_all
-from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, RaiseClaim, ReturnSpec
+from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, RaiseClaim, ConstantArgsRaiseClaim, ArgumentRef, RaiseArgsCase, ScopedArgsRaiseClaim, OtherRaiseClaim, ReturnSpec
 
 __all__ = [
     "ALL_PROPERTY_CLASSES",
     "Contract",
     "RaiseClaim",
+    "ConstantArgsRaiseClaim",
+    "ArgumentRef",
+    "RaiseArgsCase",
+    "ScopedArgsRaiseClaim",
+    "OtherRaiseClaim",
     "ReturnSpec",
     "Effects",
     "get",

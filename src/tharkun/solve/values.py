@@ -717,11 +717,15 @@ def to_float(a: IntFact):
     big = float(_FLOAT_MAX_INT)
     if a.lo is None or a.lo < -_FLOAT_MAX_INT:
         lo, raises = -big, _OVF
+    elif a.lo > _FLOAT_MAX_INT:
+        lo, raises = big, _OVF
     else:
         lo = float(a.lo)
         lo = _down(lo) if lo > a.lo else lo
     if a.hi is None or a.hi > _FLOAT_MAX_INT:
         hi, raises = big, _OVF
+    elif a.hi < -_FLOAT_MAX_INT:
+        hi, raises = -big, _OVF
     else:
         hi = float(a.hi)
         hi = _up(hi) if hi < a.hi else hi

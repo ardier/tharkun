@@ -1,9 +1,11 @@
 # Testing: critical checks and Wave 2
 
 The default pytest selection is the critical suite: `pytest.ini` selects `not wave2`.
-Most long checks remain critical and are split into independent nodes. Two real timing-sensitive
-checks run in Wave 2 on each new `sv_2027` SHA: the Hypothesis loop-back-edge reach search and
-physical parallel CPU accounting. Their original correctness assertions remain in place; the
+Most long checks remain critical and are split into independent nodes. Real timing-sensitive
+checks run in Wave 2 on each new `sv_2027` SHA: the Hypothesis loop-back-edge reach search,
+physical parallel CPU accounting, and the live fork server's child-CPU report
+(`tests/test_sv_forkserver.py::test_live_server_reports_child_cpu`, which misses its CPU floor
+under a loaded parallel gate and passes alone, [internal ref]). Their original correctness assertions remain in place; the
 search gets 3,000 examples and 32 driver rounds in a test-only wrapper. CPU accounting keeps its
 4 CPU-second / less-than-8 child CPU-second contract.
 
@@ -64,16 +66,16 @@ No gate assertion may depend on a random search succeeding within a wall-clock b
 finishes first (owner, 2026-10-06: "pynguin is probabilistic, it cannot be a basis for a hard test"). A test of that kind is
 rewritten one of three ways:
 
-- **a deterministic stand-in** drives the part that needs the search's result: `tests/test_sv_avengers_stage.py::fixed_pynguin`
-  replaces `PynguinBackendPass.generate` with a fixed generator that writes Pynguin-style test source with one known
-  in-window argument, and the production miner, replay and seed harvest run on it (the stage's own wall-clock ceilings are
-  raised to 60 s per class and 120 s in all, so a loaded host cannot make them the limiting factor: 48 concurrent pytest
-  processes on a 128-core host tripped the first 10 s ones);
-- **only what holds for ANY outcome** is asserted of a real search (every value it returns is well formed, every validated
+- **a deterministic stand-in** drives the part that needs the search's result, or the check is made deterministic by construction. The avengers seed stage's gate (`tests/test_sv_avengers_stage.py`) needs neither: the stage uses Avengers' built-in portfolio (no Pynguin backend, owner ruling 2026-10-19, [internal ref]), whose search reaches the `Bomb` guard's window through the condition solver, so the assertion is deterministic. A new test that does need a randomized backend replaces the backend's `generate` with a fixed generator and raises the stage's own wall-clock ceilings, so a loaded host cannot make them the limiting factor (48 concurrent pytest processes on a 128-core host tripped a 10 s one);
+- **only what holds for ANY outcome** is asserted of a real search. The native facts-proof canary checks that it was
+  attempted and that its completion or resource cut is reported honestly; a loaded host may cut a sample without
+  invalidating the independently certified proof (docs/SV.md "The canary is a budget"). Deterministic tests in
+  `tests/test_sv_goal.py` separately require completed and cut canary records. For other real searches, every value it
+  returns is well formed, every validated
   object replays as a success and the pass was dispatched once, both benchmark arms really ran Atheris with the same
-  `-max_total_time`: the fairness between the arms is that equality, not a bound on their wall times);
+  `-max_total_time`: the fairness between the arms is that equality, not a bound on their wall times;
 - **the rate is a measured metric**, printed as one JSON line by a script the nightly runs, never a pass/fail:
-  `scripts/pynguin_seed_hit_rate.py` (how often real Pynguin seeds a value inside the class-guard window) and
+  `scripts/pynguin_seed_hit_rate.py` (how often the avengers seed stage seeds a value inside the class-guard window; written when Pynguin was the backend: it measures only when Pynguin is installed and reports zero runs otherwise) and
   `scripts/hybrid_bench_metric.py` (how often the hybrid arm reaches deeper than plain Atheris, on the modular guard and the
   gunicorn regex chain; the nightly runs it at `--seconds 12` per arm, the budget the old assertions had, so the rate is
   comparable -- the gate's own 6 s run asserts only that both arms ran).
@@ -82,6 +84,31 @@ A wall-clock budget that is only a CEILING for something that finishes at once (
 run that raises) is made generous instead (`test_sv_forkserver`, `test_avengers_executor`, `test_sv_environment`,
 `test_sv_solver_tricks`); the one place a test needs elapsed time (`test_scheduler`) drives the ledger's own CPU clock
 (`engine._cpu_seconds`, with the `cpu_time_only` seam) so no sleep or wall clock is involved.
+
+The [internal ref] regressions follow that rule: the reach-rung handoff uses the real confined driver
+from a known reaching input, while the object-works check uses a caller recipe and still solves
+its scalar leaves and arguments. Original-program replays, guards and attribution assertions
+remain in place. Avengers objectives/store tests allow 30 s per child (rather than 3 s), and the
+native relative-path shadow check allows 60 s for verification (rather than 5 s). These ceilings
+cover startup under the loaded 64-worker suite, not a different correctness condition; production
+timeouts and request budgets are unchanged.
+The fresh-process slicing controls use the same 30 s startup ceiling: the unchanged nine-line
+exception control exceeded 3 s in a loaded whole-suite run and passed alone in 0.33 s.
+The forkserver failed-write cleanup control also allows 30 s for its target to start its
+descendant: the injected flush error ends the request, while a 0.5 s deadline could kill
+the target before the marker and therefore never exercise failed-write cleanup.
+
+The method-coverage portfolio regression supplies fixed states and executes the
+fixture's bounded start/stop methods directly; its native companion retains the
+1.5-second isolated replay ceiling and permits missing work only with an explicit
+constructor/setup or relevant-method timeout. Native crash/hang containment also
+remains covered in `test_avengers_executor.py`. The two-method context-fact
+identity regression checks its fixed recipe with the bounded native fixture in
+the parent. Its real-child companion retains the default five-second ceiling
+and requires either the matching bound observation or an explicit timeout.
+Publication is separate from constructor search and injects the old missing-method key
+to require the original collision. Full bootstrap demand-search integration
+remains in the other `test_bootstrap_down_edge.py` cases.
 
 ## Files and how they relate
 

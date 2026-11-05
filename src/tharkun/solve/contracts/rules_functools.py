@@ -8,11 +8,29 @@ the snake_case of the class name); every ``Contract`` is exactly the one this mo
 
 from __future__ import annotations
 
-from tharkun.solve.contracts._helpers import dunder_propagation_claims
+from tharkun.solve.contracts._helpers import dunder_propagation_claims, never_claims
 from tharkun.solve.contracts.rules import Rule, register_rule
-from tharkun.solve.contracts.types import Contract, Effects, ReturnSpec
+from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec
 
 _DOCS = "https://docs.python.org/3.14/library/functools.html"
+
+
+@register_rule
+class FunctoolsWraps(Rule):
+    """Construct a decorator; applying it later is a separate call."""
+
+    names = ('functools.wraps',)
+    SAMPLES = {'functools.wraps': 'import functools\nx = functools.wraps(len)\n'}
+    TWINS = {'functools.wraps': 'import functools\nx = functools.wraps()\n'}
+    CONTRACT = Contract(
+        qualname='functools.wraps',
+        raises=never_claims(native={'TypeError': 'incorrect argument binding or Placeholder supplied as wrapped, assigned or updated'}, tested=frozenset(ALL_PROPERTY_CLASSES)),
+        may_raise_other=True,
+        returns=ReturnSpec('functools.partial', 'a partial of update_wrapper storing wrapped, assigned and updated; does not apply it', tested=True),
+        effects=Effects(may_execute_callback=False, notes='Construction stores arguments without inspecting or invoking them. Applying the returned decorator later runs update_wrapper and may execute arbitrary hooks.'),
+        source=(f'{_DOCS}#functools.wraps', 'CPython v3.14.4 Lib/functools.py::wraps'),
+        tested=True,
+    )
 
 
 @register_rule
@@ -99,4 +117,4 @@ class FunctoolsLruCache(Rule):
     )
 
 
-__all__ = ["FunctoolsReduce", "FunctoolsPartial", "FunctoolsLruCache"]
+__all__ = ["FunctoolsWraps", "FunctoolsReduce", "FunctoolsPartial", "FunctoolsLruCache"]

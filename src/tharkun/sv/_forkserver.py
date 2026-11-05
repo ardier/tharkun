@@ -3,6 +3,12 @@
 The socket is private to the verifier/server; draw children inherit no IPC descriptor.
 Results are advisory: the engine replays violations and never proves from fork runs.
 """
+import sys as _sys
+
+#: the module set this interpreter started with (the server runs with ``-S``): the pre-site eviction keeps exactly it, so
+#: what ``site.main()`` imports in a child IS the native startup set ([internal ref])
+_STARTUP = frozenset(_sys.modules)
+
 import ctypes
 import json
 import math
@@ -79,7 +85,13 @@ def _child_setup(tmp, memory_bytes, timeout, dispositions):
     atexit._clear()
     # The server starts with -S: .pth/sitecustomize hooks can start threads, so run
     # them only in disposable children, after isolation and resource limits apply.
+    # [internal ref]: the server's own modules (this file, _child, json, ...) are NOT the target's.  Drop them BEFORE site runs,
+    # so what site imports is the native startup set -- measured here, in the child.  A probe process would run this
+    # venv's site hooks in the server's name (tests/test_sv_forkserver.py::test_site_startup_threads_run_only_after_fork).
+    _child.evict_import_cache(_STARTUP)
     site.main()
+    sys.modules.setdefault("site", site)   # natively `site` IS the object whose main() ran
+    _child.NATIVE_STARTUP = frozenset(sys.modules)
     _child._random.seed(None)  # discard the preloaded generator's state before modelling
 
 
@@ -139,12 +151,22 @@ def _cleanup_descendants(child_pid):
 def _execute(req, dispositions):
     if not _single_threaded():
         return {'status': 'crashed', 'msg': 'fork server is not single-threaded'}
-    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGCHLD])
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGCHLD, signal.SIGTERM])
     pid = os.fork()
     if pid == 0:
         try:
+            if req.get("box"):
+                BOX_HOME = _child.BOX_HOME
+                os.environ.update({"HOME": BOX_HOME, "XDG_CONFIG_HOME": BOX_HOME + "/.config",
+                                   "XDG_DATA_HOME": BOX_HOME + "/.local/share",
+                                   "XDG_CACHE_HOME": BOX_HOME + "/.cache",
+                                   "XDG_STATE_HOME": BOX_HOME + "/.local/state"})
             _child_setup(req['tmp'], req['memory_bytes'], req['timeout'], dispositions)
-            _child.main(req['path'])
+            with open(req['path']) as stream:
+                request = json.load(stream)
+            content = _child.stdin_bytes(request.get("world")) if request.get("box") else None
+            with _child.feed_stdin(content):
+                _child.main(req['path'])
         except BaseException:
             os._exit(1)
         # Run atexit functions for target cleanup; verdict is already written to req['out'].
@@ -155,6 +177,14 @@ def _execute(req, dispositions):
         except BaseException:
             pass
         os._exit(0)
+    def cancel(_signum, _frame):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    previous_term = signal.signal(signal.SIGTERM, cancel)
+    signal.pthread_sigmask(signal.SIG_SETMASK, (old_mask | {signal.SIGCHLD}) - {signal.SIGTERM})
     timed_out = False
     deadline = time.monotonic() + req['timeout']
     status = 0
@@ -176,6 +206,8 @@ def _execute(req, dispositions):
             signal.sigtimedwait({signal.SIGCHLD}, left)
     finally:
         _cleanup_descendants(pid)
+        signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGTERM])
+        signal.signal(signal.SIGTERM, previous_term)
         signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
     return {'status': 'timeout' if timed_out else ('ok' if status == 0 else 'crashed')}
 

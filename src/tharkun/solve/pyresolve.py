@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import hashlib
 import os
 import sys
 import types
@@ -42,6 +43,11 @@ from tharkun.solve import extern
 
 #: attribute dunders that reach nothing hidden: ``Base.__init__(self)`` runs program code
 DUNDER_OK = frozenset({"__init__", "__name__", "__qualname__", "__doc__", "__module__"})
+
+#: reads ``determinism_census`` admits (``Resolver(_value_reflection=True)``): the value is a tuple of classes in a fixed order
+#: (the C3 linearisation / the declared bases), the same on every run; reaching anything else from it needs another reflective
+#: name, which stays refused, and a text, hash or set use of it is judged by the provenance analysis like any unknown value
+CLASS_REFLECTION = frozenset({"__bases__", "__mro__"})
 
 REFLECTIVE = frozenset({"eval", "exec", "compile", "__import__", "globals", "locals", "vars",
                         "breakpoint", "__builtins__"})
@@ -183,6 +189,20 @@ class Imports:
     names: dict             # local name -> (module name, attribute)
 
 
+def _import_may_initialize(module: str, tree: ast.Module, filename: str) -> bool:
+    from tharkun.solve.loader import _module_path_present
+
+    roots = extern.root_snapshots(tree, filename)[1]
+    if not filename.startswith("<"):
+        roots = [os.path.dirname(os.path.abspath(filename)), *roots]
+    top = module.split(".")[0]
+    try:
+        return (top in sys.builtin_module_names or top in sys.stdlib_module_names
+                or _module_path_present(top, [*roots, *sys.path]))
+    except (ImportError, AttributeError, OSError, ValueError):
+        return True
+
+
 def _declared_sibling_modules(filename: str, files) -> dict[str, tuple[str, ...]]:
     """Index unique flat .py siblings for the primary or a declared sibling."""
     if not filename or filename.startswith("<") or not files:
@@ -250,7 +270,31 @@ class Resolver:
     def __init__(self, tree: ast.Module, allowed_modules, *, filename: str = "<program>",
                  _cache: dict | None = None, _pkg_dir: str | None = None, _stack: tuple = (),
                  _toplevel_roots: list | None = None, absent_imports=frozenset(),
-                 _declared_files=(), _declared_sibling: bool = False):
+                 _declared_files=(), _declared_sibling: bool = False, _task_root: str | None = None,
+                 _value_reflection: bool = False, _source_scope=None):
+        #: determinism_census only: a SOURCE module may be used as a value, and ``__bases__`` / ``__mro__`` may be read (see
+        #: :data:`CLASS_REFLECTION`); every other consumer of this Resolver keeps refusing both
+        self._value_reflection = _value_reflection
+        if _task_root is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    if node.id in {"__path__", "__loader__", "__spec__", "__package__"}:
+                        raise Top(f"line {node.lineno}: task import metadata is used")
+                    if node.id == "__all__" and isinstance(node.ctx, ast.Load):
+                        raise Top(f"line {node.lineno}: task exports are observed or modified")
+                if isinstance(node, ast.MatchMapping) and node.rest in {"__path__", "__loader__", "__spec__", "__package__"}:
+                    raise Top("task import metadata is modified by a pattern")
+                if isinstance(node, ast.alias) and (node.asname or node.name) == "__all__":
+                    raise Top("task exports are rebound by import")
+                if isinstance(node, (ast.AugAssign, ast.Delete)):
+                    targets = node.targets if isinstance(node, ast.Delete) else [node.target]
+                    if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+                        raise Top(f"line {node.lineno}: task exports are modified")
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+                        if extern._const_str_list(node.value) is None:
+                            raise Top(f"line {node.lineno}: task exports are not a literal string list")
         if not _stack:
             native_reason = extern.native_import_reason(tree, filename)
             if native_reason:
@@ -262,7 +306,11 @@ class Resolver:
         #: raises, the same on every run of the same environment, so it resolves ([internal ref])
         self.absent_imports = frozenset(absent_imports)
         self.filename = filename
+        self._source_scope = (_source_scope if _source_scope is not None else
+                              {"files": {}, "lookups": {}})
         self._declared_files = tuple(_declared_files)
+        self._task_root = _task_root
+        self.submodules: dict[str, "Resolver"] = {}
         self._is_declared_sibling = (_declared_sibling or
                                      _is_declared_sibling_file(filename, self._declared_files))
         self._declared_modules = _declared_sibling_modules(filename, self._declared_files)
@@ -281,6 +329,9 @@ class Resolver:
         self.pkg_inits: list["Resolver"] = []
         if _pkg_dir is None:
             self._snapshots, self._final_roots = extern.root_snapshots(tree, filename)
+            if _task_root is not None:
+                self._snapshots = {key: [*roots, _task_root] for key, roots in self._snapshots.items()}
+                self._final_roots = [*self._final_roots, _task_root]
             self._toplevel_roots = self._final_roots
         else:
             self._snapshots = {}
@@ -292,6 +343,12 @@ class Resolver:
                 self.parent[ch] = node
         self.bindings = self._bindings()
         self.imports = self._imports()
+        if _task_root is not None:
+            imported = self.imports.modules.keys() | self.imports.names.keys()
+            if "__all__" in imported:
+                raise Top("task exports are rebound by import")
+            if (self.bindings.keys() | imported) & {"__path__", "__loader__", "__spec__", "__package__"}:
+                raise Top("task import metadata is rebound")
         self.user_attrs = self._user_attrs() | frozenset().union(
             *(sub.user_attrs for sub in self._unique_externs()), frozenset())
         self.known_attrs = type_attrs(self.allowed) | self.user_attrs
@@ -301,7 +358,7 @@ class Resolver:
     def _unique_externs(self):
         seen: set[int] = set()
         out = []
-        for sub in self.externs.values():
+        for sub in (*self.externs.values(), *self.submodules.values()):
             if id(sub) not in seen:
                 seen.add(id(sub))
                 out.append(sub)
@@ -417,9 +474,28 @@ class Resolver:
                     if sub is None:
                         raise Top(f"line {node.lineno}: imports {a.name}")
                     alias = a.asname or a.name
+                    if self._task_root is not None and not a.asname and "." in a.name:
+                        alias = a.name.split(".")[0]
+                        sub = self._resolve_dotted(alias, self._import_roots(node), node)
                     mods[alias] = a.name
+                    if self._task_root is not None and not a.asname:
+                        mods[alias] = alias
                     self.externs[alias] = sub
             elif isinstance(node, ast.ImportFrom):
+                if self._task_root is not None and node.level and not node.module:
+                    directory = extern.package_dir_for(node.level, self.filename) if self._pkg_dir else None
+                    if (directory is None or self._is_declared_sibling or
+                            not os.path.isfile(os.path.join(directory, "__init__.py"))):
+                        raise Top(f"line {node.lineno}: relative import outside a package")
+                    for a in node.names:
+                        child = self._resolve_dotted(a.name, [directory], node) if a.name != "*" else None
+                        if child is None:
+                            raise Top(f"line {node.lineno}: relative submodule {a.name!r} does not resolve")
+                        alias = a.asname or a.name
+                        mods[alias] = f"$extern:{child.filename}"
+                        self.externs[alias] = child
+                        self.submodules[alias] = child
+                    continue
                 if node.level == 0 and node.module in self.allowed:
                     self._refuse_declared_stdlib_collision(node.module, node)
                     attrs = module_attrs(node.module) or frozenset()
@@ -444,19 +520,37 @@ class Resolver:
                     raise Top(f"line {node.lineno}: imports from {node.module!r}")
                 public = sub.public_names()
                 for a in node.names:
-                    if a.name == "*":
-                        for name in public:
+                    for name in public if a.name == "*" else (a.name,):
+                        if self._task_root is not None:
+                            child = sub.submodules.get(name)
+                            if child is None and name in sub.imports.modules:
+                                child = sub.externs.get(name)
+                            if child is None and name not in sub.bindings and sub.filename.endswith("__init__.py"):
+                                child = self._resolve_dotted(name, [os.path.dirname(sub.filename)], node)
+                                if child is not None:
+                                    sub.submodules[name] = child
+                            if child is not None:
+                                alias = name if a.name == "*" else a.asname or name
+                                self.externs[f"$parent:{alias}"] = sub
+                                if alias in names or alias in mods:
+                                    raise Top(f"line {node.lineno}: {alias} rebound by import")
+                                mods[alias] = f"$extern:{child.filename}"
+                                self.externs[alias] = child
+                                if a.name == "*":
+                                    star_bound.add(alias)
+                                continue
+                        if a.name == "*":
                             if name in names or name in mods:
                                 raise Top(f"line {node.lineno}: {name} rebound by star import")
                             names[name] = (f"$extern:{sub.filename}", name)
                             self.externs[name] = sub
                             star_bound.add(name)
-                        continue
-                    if a.name.startswith("_") or a.name not in public:
-                        raise Top(f"line {node.lineno}: {node.module!r} has no public {a.name!r}")
-                    alias = a.asname or a.name
-                    names[alias] = (f"$extern:{sub.filename}", a.name)
-                    self.externs[alias] = sub
+                        else:
+                            if name.startswith("_") or name not in public:
+                                raise Top(f"line {node.lineno}: {node.module!r} has no public {name!r}")
+                            alias = a.asname or name
+                            names[alias] = (f"$extern:{sub.filename}", name)
+                            self.externs[alias] = sub
         for alias in list(mods) + list(names):
             if alias in star_bound:
                 # `*` never appears as `alias` in an ordinary `ast.Name`/def/other import, so
@@ -492,7 +586,8 @@ class Resolver:
         if id(node) not in body_ids:
             return None
         if node.level:
-            if self._is_declared_sibling:
+            if self._is_declared_sibling or (self._task_root is not None and
+                    not os.path.isfile(os.path.join(os.path.dirname(self.filename), "__init__.py"))):
                 return None                  # a declared flat sibling is not a package
             if self._pkg_dir is None or not node.module:
                 return None                  # a top-level program's own relative import, or a
@@ -509,6 +604,9 @@ class Resolver:
 
     def _refuse_declared_stdlib_collision(self, name: str, node: ast.AST) -> None:
         root = name.split(".", 1)[0]
+        if (self._task_root is not None and root != "_sv_verifier" and
+                extern.shadowed_stdlib_name([self._task_root], {root})):
+            raise Top(f"line {node.lineno}: task sibling {root!r} collides with an allowed module")
         if root in self._declared_modules:
             raise Top(f"line {node.lineno}: declared sibling {root!r} collides with an allowed module")
 
@@ -523,7 +621,7 @@ class Resolver:
         if len(paths) != 1:
             raise Top(f"line {node.lineno}: declared sibling {dotted!r} is ambiguous")
         try:
-            found = extern.find_in_roots(dotted, [os.path.dirname(paths[0])])
+            found = self._source_lookup(dotted, [os.path.dirname(paths[0])])
         except extern.ExternTop as e:
             raise Top(f"line {node.lineno}: {e}") from e
         if found is None or os.path.realpath(found[0]) != paths[0] or found[1]:
@@ -531,18 +629,32 @@ class Resolver:
         return self._load(paths[0], node, declared_sibling=True)
 
     def _resolve_dotted(self, dotted: str, roots: list[str], node: ast.AST):
-        shadowed = extern.shadowed_stdlib_name(roots, self.allowed)
+        # The harness supplies _sv_verifier; task-local stand-ins keep the existing API meaning.
+        shadowed = extern.shadowed_stdlib_name(roots, self.allowed - {"_sv_verifier"}
+                                              if self._task_root is not None else self.allowed)
         if shadowed is not None:
             raise Top(f"line {node.lineno}: a program root shadows the stdlib name {shadowed!r}")
         try:
-            found = extern.find_in_roots(dotted, roots)
+            found = self._source_lookup(dotted, roots)
         except extern.ExternTop as e:
             raise Top(f"line {node.lineno}: {e}") from e
         if found is None:
             return None
         leaf, inits = found
+        if self._task_root is not None:
+            for path in [*inits, leaf]:
+                if not any(os.path.commonpath((os.path.realpath(root), path)) == os.path.realpath(root)
+                           for root in roots):
+                    raise Top(f"line {node.lineno}: task module escapes its import root")
+                if extern._has_compiled_sibling(os.path.dirname(path), os.path.basename(path)[:-3]):
+                    raise Top(f"line {node.lineno}: task module has a compiled source competitor")
         init_resolvers = self._check_inits(inits, node)
         sub = self._load(leaf, node)
+        if self._task_root is not None:
+            for parent, child in zip(init_resolvers, [*init_resolvers[1:], sub]):
+                name = (os.path.basename(os.path.dirname(child.filename)) if child.filename.endswith("__init__.py")
+                        else os.path.basename(child.filename)[:-3])
+                parent.submodules[name] = child
         if init_resolvers and not sub.pkg_inits:
             # Attach once (``_load`` caches by path, so a second resolution of the same
             # leaf file returns the SAME object -- its own package-init chain is a fact
@@ -564,11 +676,10 @@ class Resolver:
         resolved: list["Resolver"] = []
         for init_path in inits:
             try:
-                src = open(init_path, encoding="utf-8", errors="ignore").read()
-                itree = ast.parse(src, init_path)
+                itree = self._source_tree(init_path)
             except (OSError, SyntaxError, ValueError) as e:
                 raise Top(f"line {node.lineno}: package init {init_path} does not parse: {e}")
-            if extern.toplevel_inert(itree):
+            if self._task_root is None and extern.toplevel_inert(itree):
                 continue
             sub = self._load(init_path, node)  # must fully resolve
             resolved.append(sub)
@@ -587,6 +698,27 @@ class Resolver:
             self.externs[f"$init:{init_path}"] = sub
         return resolved
 
+    def _source_tree(self, path):
+        with open(path, 'rb') as stream:
+            raw = stream.read()
+        digest = hashlib.sha256(raw).hexdigest()
+        files = self._source_scope['files']
+        if path in files and files[path] != digest:
+            raise Top('import source changed while resolving')
+        files[path] = digest
+        return ast.parse(raw, path)
+
+    def _source_lookup(self, module, roots):
+        roots = tuple(roots)
+        found = extern.find_in_roots(module, roots)
+        paths = None if found is None else tuple([*found[1], found[0]])
+        key = (module, roots)
+        lookups = self._source_scope['lookups']
+        if key in lookups and lookups[key] != paths:
+            raise Top('import resolution changed while resolving')
+        lookups[key] = paths
+        return found
+
     def _load(self, path: str, node: ast.AST, *, declared_sibling: bool = False) -> "Resolver":
         if path in self._stack:
             raise Top(f"line {node.lineno}: import cycle at {path}")
@@ -596,8 +728,7 @@ class Resolver:
         if cached != "$unset$":
             return cached
         try:
-            src = open(path, encoding="utf-8", errors="ignore").read()
-            tree = ast.parse(src, path)
+            tree = self._source_tree(path)
         except (OSError, SyntaxError, ValueError) as e:
             self._cache[path] = False
             raise Top(f"line {node.lineno}: {path} does not parse: {e}")
@@ -606,7 +737,8 @@ class Resolver:
                            _pkg_dir=os.path.dirname(path), _stack=self._stack + (path,),
                            _toplevel_roots=self._toplevel_roots, absent_imports=self.absent_imports,
                            _declared_files=self._declared_files,
-                           _declared_sibling=declared_sibling)
+                           _declared_sibling=declared_sibling, _task_root=self._task_root,
+                           _value_reflection=self._value_reflection, _source_scope=self._source_scope)
         except Top:
             self._cache[path] = False
             raise
@@ -614,7 +746,21 @@ class Resolver:
         return sub
 
     def public_names(self) -> frozenset:
-        return extern.toplevel_public_names(self.tree)
+        names = extern.toplevel_public_names(self.tree)
+        if "__all__" not in self.bindings:
+            names |= frozenset(self.submodules)
+        return frozenset(names)
+
+    def source_module(self, node: ast.AST) -> "Resolver | None":
+        """The source module a read-only import expression denotes, without executing it."""
+        if isinstance(node, ast.Name):
+            return self.externs.get(node.id) if node.id in self.imports.modules else None
+        if isinstance(node, ast.Attribute):
+            parent = self.source_module(node.value)
+            if parent is not None:
+                return parent.submodules.get(node.attr) or (
+                    parent.externs.get(node.attr) if node.attr in parent.imports.modules else None)
+        return None
 
     def all_resolvers(self) -> list["Resolver"]:
         """``self`` plus every uniquely-reached extern child, transitively -- condition (d):
@@ -800,7 +946,8 @@ class Resolver:
                     raise Top(f"line {node.lineno}: uses {node.id}")
             if node.id in self.imports.modules:
                 par = self.parent.get(node)
-                if not (isinstance(par, ast.Attribute) and par.value is node):
+                if not (isinstance(par, ast.Attribute) and par.value is node) and not (
+                        self._value_reflection and node.id in self.externs):
                     raise Top(f"line {node.lineno}: module {node.id} used as a value")
             if node.id in _ATTR_FUNCS and self.is_builtin(node):
                 call = self.parent.get(node)
@@ -811,6 +958,17 @@ class Resolver:
                 self.check_attr_name(call.args[1].value, node.lineno)
         elif isinstance(node, ast.Attribute):
             base = node.value
+            source = self.source_module(base)
+            if self._task_root is not None and source is not None:
+                if not isinstance(node.ctx, ast.Load):
+                    raise Top(f"line {node.lineno}: stores to module attribute {node.attr!r}")
+                if node.attr.startswith("_") or node.attr not in source.public_names():
+                    raise Top(f"line {node.lineno}: {node.attr!r} is not a public attribute of source module")
+                if self.source_module(node) is not None:
+                    parent = self.parent.get(node)
+                    if not (isinstance(parent, ast.Attribute) and parent.value is node) and not self._value_reflection:
+                        raise Top(f"line {node.lineno}: source module used as a value")
+                return
             base_mod = self._module_of(base)
             if base_mod is not None:
                 if (isinstance(base, ast.Name)
@@ -831,6 +989,8 @@ class Resolver:
                     raise Top(f"line {node.lineno}: stores to module {base_mod}")
                 if node.attr.startswith("_") or node.attr not in attrs:
                     raise Top(f"line {node.lineno}: {base_mod}.{node.attr} is not a public attribute")
+                return
+            if self._value_reflection and node.attr in CLASS_REFLECTION and isinstance(node.ctx, ast.Load):
                 return
             self.check_attr_name(node.attr, node.lineno)
 

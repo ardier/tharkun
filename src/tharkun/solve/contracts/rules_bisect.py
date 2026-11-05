@@ -15,7 +15,7 @@ the snake_case of the class name); every ``Contract`` is exactly the one this mo
 from __future__ import annotations
 
 from tharkun.solve.contracts._helpers import dunder_propagation_claims
-from tharkun.solve.contracts.rules import Rule, Shape, register_rule
+from tharkun.solve.contracts.rules import Rule, register_rule
 from tharkun.solve.contracts.types import Contract, Effects, ReturnSpec
 
 _DOCS = "https://docs.python.org/3.14/library/bisect.html"
@@ -54,7 +54,7 @@ class BisectInsort(Rule):
     TWINS = {'bisect.insort': 'import bisect\nxs = [1, 3]\nbisect.insort()\n'}
 
     names = ("bisect.insort",)
-    SHAPE = Shape(min_args=2, max_args=2)      # adapters/common.py::CALL_SHAPE: exactly 2 positional, no keyword
+    # Exact native binding, including named a/x and bounds, replaces the two-positional shortcut.
     CONTRACT = Contract(
         qualname="bisect.insort",
         raises=dunder_propagation_claims(

@@ -24,6 +24,12 @@ through a helper function). It therefore added NO soundness, only imprecision
 (RW ``proof:no-site`` regressions with no wrong-TRUE it prevented) -- see
 ``docs/SV.md``'s ``proof:no-site`` section for the argument in full.
 
+The contract-admitted module gate is distinct: `exception_sites._contract_rules`
+now reads the requested classes' claims ([internal ref]). A tested contract's
+existence cannot hide a native raise absent from the historical name tables;
+unknown and propagation-only claims remain possible without a machine-readable
+proof excluding them. This is restricted to the modules that gate already owns.
+
 The OBLIGATION half below is unaffected by this and is redesigned to match OB's
 witness-format shape
 (``solve/obligations.py`` on the still-unmerged [internal ref] slice-0 branch, read for its
@@ -190,7 +196,7 @@ def witness(source: str, filename: str, specification: str, invariants: list[Inv
     return [{"entry_type": "invariant_set", "metadata": {
         "format_version": "2.0", "uuid": str(uuid.uuid4()),
         "creation_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "producer": {"name": "Tharkun", "version": "0.2.1"},
+        "producer": {"name": "Tharkun", "version": "0.2.2"},
         "task": {"input_files": [filename], "input_file_hashes": {
             filename: hashlib.sha256(source.encode("utf-8")).hexdigest()},
             "specification": specification, "data_model": "CPython-3.14-binary64",

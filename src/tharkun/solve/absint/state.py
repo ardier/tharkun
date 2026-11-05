@@ -13,7 +13,7 @@ Soundness notes, checked by ``tests/test_absint.py``:
 from __future__ import annotations
 
 from .aval import (ANY_STR, BOT, FloatInfo, V, f_join, f_leq, f_widen)
-from .heap import (ArrayObj, DefaultDictObj, DictObj, DictView, BoundMethod, BuiltinMethod, ClassObj, FuncObj, InstObj, IteratorObj, ListObj, Obj, RangeObj, SetObj, StringIOObj, TupleObj)
+from .heap import (ArrayObj, DefaultDictObj, DictObj, DictView, BoundMethod, BuiltinMethod, ClassObj, ExceptionObj, FuncObj, GeneratorFrame, GeneratorObj, InstObj, IteratorObj, ListObj, Obj, NamedTupleClassObj, NamedTupleObj, RangeObj, SetObj, StringIOObj, TextWrapperObj, ReadFileObj, TupleObj, ZipObj, EnumerateObj)
 from .linear import (IntInfo, Lin, lin_bounds)
 from . import lemmas as _lem
 from .aval import _merge_why
@@ -171,9 +171,32 @@ def _str_leq(a, b):
     return a <= b
 
 
+def _int_choices(value: V, zone: Zone):
+    """Known integer alternatives, or one point already fixed by the interval/zone."""
+    if value.is_bot():
+        return frozenset()
+    if not value.only_int():
+        return None
+    if value.int_values is not None:
+        return value.int_values
+    ii = value.i
+    lo, hi = (lin_bounds(ii.lin, zone) if ii.lin is not None else
+              (_const_lo(ii.lo, zone), _const_hi(ii.hi, zone)))
+    return frozenset({lo}) if lo is not None and lo == hi else None
+
+
 def vjoin(a: V, za: Zone, b: V, zb: Zone) -> V:
     if a is b:
         return a
+    statics = a.st | b.st
+    if a != b and not a.is_bot() and not b.is_bot():
+        # An exact byte hint cannot survive a join with an unknown alternative.
+        statics = frozenset(tag for tag in statics if tag[0] != "bytes_const")
+    choices = None
+    if a.int_values is not None or b.int_values is not None:
+        left, right = _int_choices(a, za), _int_choices(b, zb)
+        if left is not None and right is not None:
+            choices = left | right
     return V(
         i=int_join(a.i, za, b.i, zb),
         b=(a.b or frozenset()) | (b.b or frozenset()) or None,
@@ -181,15 +204,27 @@ def vjoin(a: V, za: Zone, b: V, zb: Zone) -> V:
         s=_str_join(a.s, b.s),
         n=a.n or b.n,
         refs=a.refs | b.refs,
-        st=a.st | b.st,
+        st=statics,
         top=a.top or b.top,
+        value_term=(a.value_term if a.value_term is b.value_term else
+                    b.value_term if a.is_bot() else a.value_term if b.is_bot() else None),
+        int_values=choices,
     )
 
 
 def vleq(a: V, za: Zone, b: V) -> bool:
     if a is b:
         return True
+    if b.int_values is not None:
+        choices = _int_choices(a, za)
+        if choices is None or not choices <= b.int_values:
+            return False
+    if b.value_term is not None and b._value_term_key() is not None:
+        if a.value_term is not b.value_term and not a.is_bot():
+            return False
     if b.top:
+        if any(tag[0] == "bytes_const" for tag in b.st):
+            return a.is_bot() or a == b
         return True
     if a.top:
         return False
@@ -250,8 +285,13 @@ def ojoin(a: Obj, za, b: Obj, zb, widen=False) -> Obj:
     if a.kind != b.kind:
         raise Incompatible(f"{a.kind} vs {b.kind}")
     if a.kind == "tuple":
+        if getattr(a, "type_v", None) != getattr(b, "type_v", None):
+            raise Incompatible("different tuple classes")
         if a.items is not None and b.items is not None and len(a.items) == len(b.items):
-            return TupleObj(tuple(vj(x, za, y, zb) for x, y in zip(a.items, b.items)))
+            items = tuple(vj(x, za, y, zb) for x, y in zip(a.items, b.items))
+            return a.replace(items=items) if isinstance(a, NamedTupleObj) else TupleObj(items)
+        if isinstance(a, NamedTupleObj):
+            raise Incompatible("namedtuple arity differs")
         la = (len(a.items), len(a.items)) if a.items is not None else a.length
         lb = (len(b.items), len(b.items)) if b.items is not None else b.length
         ea = _elem_of_tuple(a, za)
@@ -294,24 +334,58 @@ def ojoin(a: Obj, za, b: Obj, zb, widen=False) -> Obj:
             if widen:
                 lo, hi = _lem.widen_lo(la, lb), _lem.widen_hi(ha, hb)
             qf[g] = (lo, hi, _merge_why(wa, wb))
-        return InstObj(a.cls, attrs, qf)
+        if (a.exc_args is None) != (b.exc_args is None):
+            raise Incompatible('exception argument storage differs')
+        exc_args = None if a.exc_args is None else vj(a.exc_args, za, b.exc_args, zb)
+        return InstObj(a.cls, attrs, qf, exc_args)
+    if a.kind == 'exception':
+        if a.cls != b.cls:
+            raise Incompatible('two exception classes at one site')
+        return ExceptionObj(a.cls, vj(a.args, za, b.args, zb))
     if a.kind == "class":
-        if a.node is not b.node:
-            raise Incompatible("two classes at one site")
+        if a.node is not b.node or getattr(a, "abstracts", None) != getattr(b, "abstracts", None):
+            raise Incompatible("two classes or abstract sets at one site")
+        if isinstance(a, NamedTupleClassObj) or isinstance(b, NamedTupleClassObj):
+            if (type(a) is not type(b) or a.name != b.name or a.fields != b.fields
+                    or len(a.defaults) != len(b.defaults)):
+                raise Incompatible("different namedtuple declarations")
         attrs = {}
         for k in set(a.attrs) | set(b.attrs):
             if k in a.attrs and k in b.attrs:
                 attrs[k] = vj(a.attrs[k], za, b.attrs[k], zb)
             else:
                 raise Incompatible("class attribute set on one path only")
+        if isinstance(a, NamedTupleClassObj):
+            return a.replace(attrs=attrs, defaults=tuple(vj(x, za, y, zb) for x, y in zip(a.defaults, b.defaults)))
         return a.replace(attrs=attrs)
     if a.kind == "func":
-        if a.node is not b.node or len(a.defaults) != len(b.defaults) or set(a.kwdefaults) != set(b.kwdefaults):
+        if (a.node is not b.node or a.abstract != b.abstract or len(a.defaults) != len(b.defaults)
+                or set(a.kwdefaults) != set(b.kwdefaults) or set(a.captures) != set(b.captures)
+                or a.capture_frames != b.capture_frames):
             raise Incompatible("two functions at one site")
         return a.replace(
             defaults=tuple(vj(x, za, y, zb) for x, y in zip(a.defaults, b.defaults)),
             kwdefaults={k: vj(a.kwdefaults[k], za, b.kwdefaults[k], zb) for k in a.kwdefaults},
+            captures={k: vj(a.captures[k], za, b.captures[k], zb) for k in a.captures},
         )
+    if a.kind == "generator":
+        states = {}
+        for pc in a.states.keys() | b.states.keys():
+            if pc not in a.states:
+                states[pc] = b.states[pc]
+            elif pc not in b.states:
+                states[pc] = a.states[pc]
+            else:
+                left, right = a.states[pc], b.states[pc]
+                join = vwiden if widen else vjoin
+                states[pc] = GeneratorFrame({
+                    k: join(left.bindings[k], za, right.bindings[k], zb)
+                       if k in left.bindings and k in right.bindings
+                       else (left.bindings if k in left.bindings else right.bindings)[k]
+                    for k in left.bindings.keys() | right.bindings.keys()},
+                    left.maybe_unbound | right.maybe_unbound
+                    | (left.bindings.keys() ^ right.bindings.keys()))
+        return GeneratorObj(vj(a.function, za, b.function, zb), states=states)
     if a.kind == "bmeth":
         if a.func != b.func:
             raise Incompatible("bound methods of two functions at one site")
@@ -321,11 +395,23 @@ def ojoin(a: Obj, za, b: Obj, zb, widen=False) -> Obj:
             raise Incompatible("two builtin methods at one site")
         return BuiltinMethod(a.name, vj(a.recv, za, b.recv, zb))
     if a.kind == "iterator":
+        if type(a) is EnumerateObj or type(b) is EnumerateObj:
+            if type(a) is not type(b):
+                raise Incompatible("incompatible native enumerate sources")
+            return EnumerateObj(vj(a.source, za, b.source, zb), vj(a.start, za, b.start, zb))
+        if type(a) is ZipObj or type(b) is ZipObj:
+            if type(a) is not type(b) or len(a.sources) != len(b.sources):
+                raise Incompatible("incompatible native zip sources")
+            return ZipObj(tuple(vj(x, za, y, zb) for x, y in zip(a.sources, b.sources)),
+                          a.strict or b.strict, a.fresh and b.fresh)
         return IteratorObj(vj(a.source, za, b.source, zb))
     if a.kind == "range":
         if a.lo == b.lo and a.hi == b.hi and a.step == b.step:
             return a
-        raise Incompatible("two ranges at one site")
+        if a.step != b.step:
+            raise Incompatible("range steps differ at one site")
+        join = _len_widen if widen else _len_join
+        return RangeObj(join(a.lo, za, b.lo, zb), join(a.hi, za, b.hi, zb), a.step)
     if a.kind == "dict":
         if type(a) is not type(b):
             raise Incompatible("plain dict and defaultdict at one allocation site")
@@ -347,10 +433,18 @@ def ojoin(a: Obj, za, b: Obj, zb, widen=False) -> Obj:
         if a.which != b.which:
             raise Incompatible("two dict views at one site")
         return DictView(a.dicts | b.dicts, a.which)
+    if a.kind == 'textwrapper':
+        if a.attrs.keys() != b.attrs.keys():
+            raise Incompatible('TextWrapper settings differ')
+        return TextWrapperObj({name: vj(value, za, b.attrs[name], zb) for name, value in a.attrs.items()})
     if a.kind == "stringio":
-        # [internal ref]: join the one field a StringIOObj carries, the same
-        # single-field shape as IteratorObj's ``source`` above.
-        return StringIOObj(vj(a.content, za, b.content, zb))
+        if a.binary != b.binary:
+            raise Incompatible("text and binary streams at one allocation site")
+        stream = a.stream if a.stream is not None and a.stream.same_state(b.stream) else None
+        return StringIOObj(vj(a.content, za, b.content, zb), stream,
+                           a.position if a.position == b.position else None, a.binary, a.closed | b.closed)
+    if a.kind == "readfile":
+        return ReadFileObj(vj(a.content, za, b.content, zb), a.closed | b.closed)
     if a.kind == "outfile":
         # [internal ref]: an output handle is only its binary-ness, fixed by the constant mode of its one
         # ``open`` call site; two kinds at one site cannot happen, and is refused if it ever does.
@@ -368,6 +462,8 @@ def _key_value(k) -> V:
         return const_int(k)
     if isinstance(k, str):
         return const_str(k)
+    if isinstance(k, tuple):
+        return V(top=True)  # Tuple-key iteration needs a heap shape; never project it to None.
     return NONE
 
 
@@ -391,6 +487,8 @@ def oleq(a: Obj, za, b: Obj) -> bool:
     if a.kind != b.kind:
         return False
     if a.kind == "tuple":
+        if getattr(a, "type_v", None) != getattr(b, "type_v", None):
+            return False
         if b.items is not None:
             return a.items is not None and len(a.items) == len(b.items) and all(
                 vleq(x, za, y) for x, y in zip(a.items, b.items))
@@ -410,7 +508,13 @@ def oleq(a: Obj, za, b: Obj) -> bool:
         return vleq(_all(a, za), za, b.elem)
     if a.kind == "set":
         return a.frozen == b.frozen and _len_leq(a.length, za, b.length) and vleq(a.elem, za, b.elem)
+    if a.kind == 'exception':
+        return a.cls == b.cls and vleq(a.args, za, b.args)
     if a.kind == "inst":
+        if (a.exc_args is None) != (b.exc_args is None):
+            return False
+        if a.exc_args is not None and not vleq(a.exc_args, za, b.exc_args):
+            return False
         if a.cls != b.cls:
             return False
         for k, (vb, db, rb) in b.attrs.items():
@@ -430,18 +534,43 @@ def oleq(a: Obj, za, b: Obj) -> bool:
                 return False
         return all(k in b.attrs for k in a.attrs)
     if a.kind == "class":
-        return set(a.attrs) == set(b.attrs) and all(vleq(a.attrs[k], za, b.attrs[k]) for k in a.attrs)
+        if isinstance(a, NamedTupleClassObj) or isinstance(b, NamedTupleClassObj):
+            if (type(a) is not type(b) or a.name != b.name or a.fields != b.fields
+                    or len(a.defaults) != len(b.defaults)
+                    or not all(vleq(x, za, y) for x, y in zip(a.defaults, b.defaults))):
+                return False
+        return getattr(a, "abstracts", None) == getattr(b, "abstracts", None) and set(a.attrs) == set(b.attrs) and all(vleq(a.attrs[k], za, b.attrs[k]) for k in a.attrs)
     if a.kind == "func":
-        return all(vleq(x, za, y) for x, y in zip(a.defaults, b.defaults)) and all(
-            vleq(a.kwdefaults[k], za, b.kwdefaults[k]) for k in a.kwdefaults)
+        return (a.abstract == b.abstract and a.capture_frames == b.capture_frames and set(a.captures) == set(b.captures)
+                and all(vleq(a.captures[k], za, b.captures[k]) for k in a.captures)
+                and all(vleq(x, za, y) for x, y in zip(a.defaults, b.defaults))
+                and all(vleq(a.kwdefaults[k], za, b.kwdefaults[k]) for k in a.kwdefaults))
+    if a.kind == "generator":
+        if not vleq(a.function, za, b.function) or not a.states.keys() <= b.states.keys():
+            return False
+        for pc, left in a.states.items():
+            right = b.states[pc]
+            if (not left.bindings.keys() <= right.bindings.keys()
+                    or not (left.maybe_unbound | (right.bindings.keys() - left.bindings.keys())) <= right.maybe_unbound
+                    or not all(vleq(value, za, right.bindings[k]) for k, value in left.bindings.items())):
+                return False
+        return True
     if a.kind == "bmeth":
         return a.func == b.func and vleq(a.self_v, za, b.self_v)
     if a.kind == "bimeth":
         return a.name == b.name and vleq(a.recv, za, b.recv)
     if a.kind == "iterator":
+        if type(a) is EnumerateObj or type(b) is EnumerateObj:
+            return (type(a) is type(b) and vleq(a.source, za, b.source)
+                    and vleq(a.start, za, b.start))
+        if type(a) is ZipObj or type(b) is ZipObj:
+            return (type(a) is type(b) and len(a.sources) == len(b.sources)
+                    and (not a.strict or b.strict, a.fresh and b.fresh)
+                    and all(vleq(x, za, y) for x, y in zip(a.sources, b.sources)))
         return vleq(a.source, za, b.source)
     if a.kind == "range":
-        return a.lo == b.lo and a.hi == b.hi and a.step == b.step
+        return (a.step == b.step and _len_leq(a.lo, za, b.lo)
+                and _len_leq(a.hi, za, b.hi))
     if a.kind == "dict":
         if type(a) is not type(b):
             return False
@@ -461,10 +590,16 @@ def oleq(a: Obj, za, b: Obj) -> bool:
     if a.kind == "pattern":
         # #1102b: no fields to compare -- same kind already checked above.
         return True
+    if a.kind == 'textwrapper':
+        return a.attrs.keys() == b.attrs.keys() and all(vleq(value, za, b.attrs[name]) for name, value in a.attrs.items())
     if a.kind == "stringio":
-        return vleq(a.content, za, b.content)
+        return (a.binary == b.binary and a.closed <= b.closed and vleq(a.content, za, b.content, zb)
+                and (b.position is None or a.position == b.position)
+                and (b.stream is None or a.stream is not None and a.stream.same_state(b.stream)))
     if a.kind == "outfile":
         return a.binary == b.binary
+    if a.kind == "readfile":
+        return vleq(a.content, za, b.content) and a.closed <= b.closed
     return False
 
 
@@ -542,13 +677,22 @@ class State:
         vj = vwiden if widen else vjoin
         s = State.__new__(State)
         s.frames = []
+        join_key = None
         for fa, fb in zip(self.frames, o.frames):
             assert fa.fid == fb.fid
             env = {}
             maybe_unbound = set(fa.maybe_unbound) | set(fb.maybe_unbound)
             for k in fa.env.keys() | fb.env.keys():
                 if k in fa.env and k in fb.env:
-                    env[k] = vj(fa.env[k], za, fb.env[k], zb)
+                    a, b = fa.env[k], fb.env[k]
+                    env[k] = vj(a, za, b, zb)
+                    if not widen and a.value_term is not None and b.value_term is not None:
+                        if a.value_term is not b.value_term:
+                            from .equality import Recipe
+                            if join_key is None:
+                                join_key = object()
+                            env[k] = env[k].replace(value_term=Recipe(
+                                "str", "join", (a.value_term, b.value_term), join_key))
                 else:
                     env[k] = fa.env.get(k) or fb.env[k]
                     maybe_unbound.add(k)
@@ -765,6 +909,8 @@ def _map_obj(ob: Obj, fn) -> Obj:
         e = fn(ob.elem)
         return ob if e is ob.elem else SetObj(ob.length, e, ob.frozen)
     if k == "tuple":
+        if isinstance(ob, NamedTupleObj):
+            return ob.replace(items=tuple(fn(x) for x in ob.items), type_v=fn(ob.type_v))
         if ob.items is not None:
             items = tuple(fn(x) for x in ob.items)
             return ob if all(a is b for a, b in zip(items, ob.items)) else TupleObj(items)
@@ -777,14 +923,32 @@ def _map_obj(ob: Obj, fn) -> Obj:
             nv = fn(v)
             ch = ch or nv is not v
             attrs[a] = (nv, d, r)
-        return InstObj(ob.cls, attrs, ob.qf) if ch else ob
+        exc_args = None if ob.exc_args is None else fn(ob.exc_args)
+        return InstObj(ob.cls, attrs, ob.qf, exc_args) if ch or exc_args is not ob.exc_args else ob
+    if k == 'exception':
+        return ob.replace(args=fn(ob.args))
+    if k == 'textwrapper':
+        return ob.replace(attrs={name: fn(value) for name, value in ob.attrs.items()})
     if k == "class":
+        if isinstance(ob, NamedTupleClassObj):
+            return ob.replace(attrs={k: fn(v) for k, v in ob.attrs.items()}, defaults=tuple(fn(x) for x in ob.defaults))
         attrs = {a: fn(v) for a, v in ob.attrs.items()}
         return ob.replace(attrs=attrs) if any(attrs[a] is not ob.attrs[a] for a in attrs) else ob
     if k == "func":
+        if not (ob.defaults or ob.kwdefaults or ob.captures):
+            return ob
         d = tuple(fn(x) for x in ob.defaults)
         kd = {a: fn(v) for a, v in ob.kwdefaults.items()}
-        return ob.replace(defaults=d, kwdefaults=kd)
+        captures = {a: fn(v) for a, v in ob.captures.items()}
+        if (all(a is b for a, b in zip(d, ob.defaults))
+                and all(kd[a] is b for a, b in ob.kwdefaults.items())
+                and all(captures[a] is b for a, b in ob.captures.items())):
+            return ob
+        return ob.replace(defaults=d, kwdefaults=kd, captures=captures)
+    if k == "generator":
+        return GeneratorObj(fn(ob.function), states={
+            pc: GeneratorFrame({k: fn(value) for k, value in frame.bindings.items()}, frame.maybe_unbound)
+            for pc, frame in ob.states.items()})
     if k == "bmeth":
         s = fn(ob.self_v)
         return ob if s is ob.self_v else BoundMethod(ob.func, s)
@@ -792,6 +956,10 @@ def _map_obj(ob: Obj, fn) -> Obj:
         s = fn(ob.recv)
         return ob if s is ob.recv else BuiltinMethod(ob.name, s)
     if k == "iterator":
+        if type(ob) is EnumerateObj:
+            return EnumerateObj(fn(ob.source), fn(ob.start))
+        if type(ob) is ZipObj:
+            return ZipObj(tuple(fn(value) for value in ob.sources), ob.strict, ob.fresh)
         return IteratorObj(fn(ob.source))
     if k == "dict":
         items = {a: fn(v) for a, v in ob.items.items()}
@@ -803,8 +971,10 @@ def _map_obj(ob: Obj, fn) -> Obj:
 def _term_stripper(pred):
     """``V -> V`` dropping the float value term when ``pred`` holds for any part of it."""
     def fn(v: V) -> V:
+        if v.term is None:
+            return v
         f = v.f
-        if f and f.term is not None and _mentions(f.term, pred):
+        if f and _mentions(f.term, pred):
             return v.replace(f=FloatInfo(f.fact, None, f.why))
         return v
 

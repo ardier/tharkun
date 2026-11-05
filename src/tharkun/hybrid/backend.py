@@ -38,6 +38,8 @@ import uuid
 from typing import Sequence
 
 _COV_RE = re.compile(rb"cov:\s*(\d+)")
+#: libFuzzer's execution counter: its status lines start ``#<executions> <event> ...`` (INITED, NEW, pulse, DONE)
+_EXEC_RE = re.compile(rb"^#(\d+)\s")
 
 
 class AtherisBackend:
@@ -69,6 +71,7 @@ class AtherisBackend:
             tempfile.gettempdir(), f"tharkun-atheris-{uuid.uuid4().hex[:12]}")
         self._proc: subprocess.Popen | None = None
         self._cov = 0
+        self._execs = 0
         self._reader: threading.Thread | None = None
         self._cpu = 0.0
 
@@ -104,9 +107,16 @@ class AtherisBackend:
                 val = int(m.group(1))
                 if val > self._cov:
                     self._cov = val
+            m = _EXEC_RE.match(line)
+            if m:
+                self._execs = max(self._execs, int(m.group(1)))
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    def executions(self) -> int:
+        """The highest libFuzzer execution counter seen so far (``#<n>`` status lines; 0 until reported)."""
+        return self._execs
 
     def coverage(self) -> int:
         """The highest libFuzzer ``cov:`` counter seen so far (0 until reported)."""
@@ -182,6 +192,9 @@ class FakeBackend:
 
     def cpu_seconds(self) -> float:
         return self.cpu
+
+    def executions(self) -> int:
+        return 0
 
     def stop(self) -> None:
         self.stopped = True

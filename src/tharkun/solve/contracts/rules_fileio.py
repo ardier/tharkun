@@ -1,4 +1,8 @@
-"""Rules for the write side of a file opened by ``open(..., "w" | "a" | "x")`` ([internal ref], [internal ref]).
+"""File open shapes and write-side handle rules ([internal ref], [internal ref], [internal ref]).
+
+``OpenRead`` adds the read-only text shape used by world-file absint. Its path/option
+validation shares CPython's open implementation with ``OpenOutput``; its native
+return type and the contract visitor's withdrawal behavior are tested separately.
 
 A write-only ``open()`` returns an ``io.TextIOWrapper`` (a text mode) or an ``io.BufferedWriter`` (a
 binary mode, default buffering); both are used through ``write``, ``writelines``, ``flush``, ``close``
@@ -19,7 +23,7 @@ What the claims say, all observed on CPython 3.14.4 (``tests/contracts/test_file
 * ``ValueError`` (a closed file; ``UnicodeEncodeError`` for unencodable text) and ``OSError`` (the
   environment) are not property classes: ``may_raise_other`` is True and they are named in the
   conditions' notes, not in ``raises``.
-* ``__exit__`` closes the file and returns ``None``: it never suppresses an exception of the body.
+* Default file handles close with None; custom buffer/subclass close results flow through __exit__ and may suppress an exception.
 
 Migrated to rules ([internal ref], [internal ref]): ``OpenOutput`` (the shape contract of ``open``) and one class per method of the
 two handle types (``OutputWrite``, ``OutputWritelines``, ``OutputFlush``, ``OutputClose``, ``OutputEnter``,
@@ -29,7 +33,8 @@ as plain data (``tests/contracts/test_registry_digest.py`` proves it byte-identi
 
 from __future__ import annotations
 
-from tharkun.solve.contracts._helpers import dunder_propagation_claims, never_claims
+from dataclasses import replace
+from tharkun.solve.contracts._helpers import dunder_propagation_claims
 from tharkun.solve.contracts.rules import Rule, Shape, register_rule
 from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec
 
@@ -52,23 +57,24 @@ def _write_side(kind: str) -> tuple[Contract, ...]:
     out = []
 
     if text:
-        write_raises = never_claims(
-            native={"TypeError": f"the argument is not a str instance (a str subclass is accepted), or the call is {_ARITY}"},
-            tested=_ALL,
+        write_raises = dunder_propagation_claims(
+            "the wrapper's encoder, error handler or underlying buffer callbacks",
+            native={"TypeError": f"the argument is not a str instance (a str subclass is accepted), the call is {_ARITY}, or a delegated callback propagates TypeError"},
+            tested_native=_TYPE_ONLY,
         )
         write_returns = ReturnSpec("int", "len(text): the number of characters passed, whatever newline translation or encoding does", tested=True)
-        write_callback = False
+        write_callback = True
         write_notes = (
             "A str subclass is accepted and none of its methods (__str__, __len__, encode, find, "
             "__iter__, ...) is called. Encoding errors (UnicodeEncodeError, a ValueError) and a closed "
-            "file (ValueError) end the call without a property class. The argument is checked BEFORE the "
+            "file (ValueError) need not be property classes, but custom encoders/buffers can propagate any exception. The argument is checked BEFORE the "
             "file: a non-str argument is a TypeError even on a closed file."
         )
         write_other = True
     else:
         write_raises = dunder_propagation_claims(
-            "the argument's __buffer__ while acquiring its buffer (a Python-level buffer provider)",
-            native={"TypeError": f"the argument does not support the buffer protocol (str, int, list, ... do not), or the call is {_ARITY}"},
+            "the argument's __buffer__ while acquiring its buffer, or callbacks on the underlying raw stream",
+            native={"TypeError": f"the argument does not support the buffer protocol (str, int, list, ... do not), or the call is {_ARITY}, or a delegated callback propagates TypeError"},
             tested_native=_TYPE_ONLY,
         )
         write_returns = ReturnSpec("int", "the number of bytes written (len of the buffer)", tested=True)
@@ -120,10 +126,11 @@ def _write_side(kind: str) -> tuple[Contract, ...]:
 
     out.append(Contract(
         qualname=f"{q}.flush",
-        raises=never_claims(native={"TypeError": f"the call is {_ARITY} (flush takes no argument)"}, tested=_ALL),
+        raises=dunder_propagation_claims("underlying buffer flush/write and receiver callbacks",
+            native={"TypeError": f"the call is {_ARITY} (flush takes no argument), or callback propagation"}, tested_native=_TYPE_ONLY),
         may_raise_other=True,
-        returns=ReturnSpec("None", tested=True),
-        effects=Effects(mutates_receiver=True, io=True, deterministic=False, may_execute_callback=False,
+        returns=ReturnSpec("object" if text else "None", "text wrappers return the underlying flush result; buffered writer flush returns None", tested=True),
+        effects=Effects(mutates_receiver=True, io=True, deterministic=False, may_execute_callback=True,
                         notes="pushes the buffer to the OS. " + _CLOSED_AND_OS),
         source=(f"{_DOCS}#io.IOBase.flush", "CPython Modules/_io/textio.c::_io_TextIOWrapper_flush_impl" if text
                 else "CPython Modules/_io/bufferedio.c::buffered_flush"),
@@ -132,33 +139,35 @@ def _write_side(kind: str) -> tuple[Contract, ...]:
 
     out.append(Contract(
         qualname=f"{q}.close",
-        raises=never_claims(native={"TypeError": f"the call is {_ARITY} (close takes no argument)"}, tested=_ALL),
+        raises=dunder_propagation_claims("receiver flush/closed and underlying buffer close callbacks",
+            native={"TypeError": f"the call is {_ARITY} (close takes no argument), or callback propagation"}, tested_native=_TYPE_ONLY),
         may_raise_other=True,
-        returns=ReturnSpec("None", tested=True),
-        effects=Effects(mutates_receiver=True, io=True, deterministic=False, may_execute_callback=False,
-                        notes="flushes, then closes; idempotent (closing a closed file is fine); every later write/flush/enter "
-                              "is a ValueError. A flush failure (OSError) is not a property class."),
+        returns=ReturnSpec("object", "the underlying close result (normally None), or None when already closed", tested=True),
+        effects=Effects(mutates_receiver=True, io=True, deterministic=False, may_execute_callback=True,
+                        notes="flushes, then closes; normal file buffers are idempotent and later I/O raises ValueError. "
+                              "Custom flush/closed/raw-close callbacks may return arbitrary objects or propagate any exception."),
         source=(f"{_DOCS}#io.IOBase.close", f"{iobase}::_io__IOBase_close_impl"),
         tested=True,
     ))
 
     out.append(Contract(
         qualname=f"{q}.__enter__",
-        raises=never_claims(native={"TypeError": f"the call is {_ARITY} (__enter__ takes no argument)"}, tested=_ALL),
+        raises=dunder_propagation_claims("the receiver's closed lookup/truth protocol (AttributeError from lookup is swallowed, but truth-hook AttributeError propagates)",
+            native={"TypeError": f"the call is {_ARITY} (__enter__ takes no argument), or callback propagation"}, tested_native=_TYPE_ONLY),
         may_raise_other=True,   # ValueError: I/O operation on closed file
         returns=ReturnSpec(f"io.{kind}", "the receiver itself", tested=True),
-        effects=Effects(deterministic=True, may_execute_callback=False, notes="no effect; the receiver comes back"),
+        effects=Effects(deterministic=True, may_execute_callback=True, notes="the receiver comes back after checking its closed attribute"),
         source=(f"{_DOCS}#io.IOBase.__enter__", f"{iobase}::iobase_enter"),
         tested=True,
     ))
 
     out.append(Contract(
         qualname=f"{q}.__exit__",
-        raises=never_claims(tested=_ALL),
+        raises=dunder_propagation_claims("the receiver's close lookup/call and its underlying callbacks"),
         may_raise_other=True,   # OSError from the flush inside close()
-        returns=ReturnSpec("None", "always None: a falsy result never suppresses the body's exception", tested=True),
-        effects=Effects(mutates_receiver=True, io=True, deterministic=False, may_execute_callback=False,
-                        notes="calls close(), with or without a body exception, and returns None (the exception, if any, propagates unchanged)"),
+        returns=ReturnSpec("object", "the receiver close() result, normally None; a truthy custom result suppresses the body exception", tested=True),
+        effects=Effects(mutates_receiver=True, io=True, deterministic=False, may_execute_callback=True,
+                        notes="calls close() and returns that result, including truthy subclass overrides that suppress a body exception"),
         source=(f"{_DOCS}#io.IOBase.__exit__", f"{iobase}::iobase_exit"),
         tested=True,
     ))
@@ -193,8 +202,17 @@ _OPEN_OUTPUT = Contract(
     tested=True,
 )
 
+_OPEN_READ = replace(
+    _OPEN_OUTPUT, qualname="open.read",
+    returns=ReturnSpec("io.TextIOWrapper", "a read-only text file with default buffering", tested=True),
+    effects=Effects(io=True, deterministic=False, may_execute_callback=True,
+                    notes="reads initial file content; OSError and decoding errors can end the path"),
+    notes="SHAPE: builtin open with default mode, 'r' or 'rt', a str path and constant text options. "
+          "Argument validation shares CPython's open implementation with open.output. "
+          "No binary/update/descriptor/buffering/opener calls are admitted by the first world consumer.")
+
 _BY_QUALNAME: dict[str, Contract] = {
-    c.qualname: c for c in (_OPEN_OUTPUT, *_write_side("TextIOWrapper"), *_write_side("BufferedWriter"))}
+    c.qualname: c for c in (_OPEN_OUTPUT, _OPEN_READ, *_write_side("TextIOWrapper"), *_write_side("BufferedWriter"))}
 
 #: the handle class a binary/text output mode produces (the receiver type of the method contracts)
 OUTPUT_HANDLE_TYPES = {False: "io.TextIOWrapper", True: "io.BufferedWriter"}
@@ -215,6 +233,16 @@ class OpenOutput(Rule):
 
     names = ("open.output",)
     CONTRACT = _OPEN_OUTPUT
+
+
+@register_rule
+class OpenRead(Rule):
+    """Read-only text shape used by the world-file abstract interpreter ([internal ref])."""
+
+    SAMPLES = {"open.read": 'f = open("/dev/null")\n'}
+    TWINS = {"open.read": "f = open()\n"}
+    names = ("open.read",)
+    CONTRACT = _OPEN_READ
 
 
 class _HandleMethod(Rule):

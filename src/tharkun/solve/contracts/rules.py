@@ -29,18 +29,27 @@ SOLVING by ``docs/LAYERS.md``'s rule: stdlib and ``tharkun.solve`` only; nothing
 
 from __future__ import annotations
 
+import array
 import bisect
 import builtins
 import collections
 import copy
+import dataclasses
 import functools
 import heapq
+import html
 import io
+import inspect
 import itertools
+import json
 import math
 import operator
 import random
 import re
+import textwrap
+import typing
+import string
+import statistics
 from dataclasses import dataclass
 from typing import Any, ClassVar, Iterator
 
@@ -216,8 +225,8 @@ class Rule:
 #: the standard-library modules whose functions the contracts cover, imported statically (``solve/`` loads no module by
 #: name: ``tests/test_layering.py``).  A module-level qualname's native is looked up here.
 _NATIVE_MODULES = {
-    "bisect": bisect, "collections": collections, "copy": copy, "functools": functools, "heapq": heapq, "io": io,
-    "itertools": itertools, "math": math, "operator": operator, "random": random, "re": re,
+    "array": array, "bisect": bisect, "collections": collections, "copy": copy, "dataclasses": dataclasses, "functools": functools, "heapq": heapq, "html": html, "io": io, "inspect": inspect,
+    "itertools": itertools, "json": json, "math": math, "operator": operator, "random": random, "re": re, "textwrap": textwrap, "string": string, "statistics": statistics, "typing": typing,
 }
 
 

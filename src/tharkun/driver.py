@@ -165,6 +165,40 @@ class _TraceOutcome:
     real_by_path: dict[str, dict[int, list[dict[str, Any]]]] = field(default_factory=dict)
 
 
+def _mangled(owner: str, name: str) -> str:
+    """Python's private-name mangling: ``__m`` written in class ``C`` is stored as ``_C__m``."""
+    stripped = owner.lstrip("_")
+    return f"_{stripped}{name}" if name.startswith("__") and not name.endswith("__") and stripped else name
+
+
+def _entry_callable(mod: Any, entry: str) -> Any:
+    """The callable ``entry`` names in ``mod``: a top-level function, or ``Class.method`` ([internal ref], nested classes
+    ``Outer.Inner.method`` too, a ``__private`` method under its mangled name).  A static or class method is bound as
+    Python binds it; an instance method is the plain function, so a seed names its receiver as ``self``.  ``None``
+    when ``mod`` has no such thing."""
+    if mod is None:
+        return None
+    obj, parts = mod, entry.split(".")
+    for i, part in enumerate(parts):
+        obj = getattr(obj, _mangled(parts[i - 1], part) if i else part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def _def_node(tree: ast.AST, entry: str):
+    """The ``def`` node of a top-level function or of ``Class.method`` (:func:`_entry_callable`'s names), else ``None``."""
+    body, node = getattr(tree, "body", []), None
+    for part in entry.split("."):
+        found = [st for st in body if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                 and st.name == part]
+        if not found:
+            return None
+        node = found[-1]
+        body = node.body
+    return node if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+
+
 def _run_traced(
     source_path: str,
     func_name: str,
@@ -188,10 +222,10 @@ def _run_traced(
 
     rp = os.path.realpath(source_path)
     mod, _ = _load_module_for_execution(rp)
-    if mod is None or not hasattr(mod, func_name):
+    fn = _entry_callable(mod, func_name)
+    if fn is None:
         return _TraceOutcome(set(), {}, ok=False, error=f"cannot load {func_name} from {rp}")
 
-    fn = getattr(mod, func_name)
     watched = {rp} | {os.path.realpath(p) for p in extra_paths}
     snaps = {rp: set(snapshot_lines)}
     for path, lines in (extra_snapshot_lines or {}).items():
@@ -299,9 +333,9 @@ def _target_reached_probe(source_path: str, func_name: str, inputs: dict[str, An
     rp = os.path.realpath(source_path)
     rtp = os.path.realpath(tp)
     mod, _ = _load_module_for_execution(rp)
-    if mod is None or not hasattr(mod, func_name):
+    fn = _entry_callable(mod, func_name)
+    if fn is None:
         return None
-    fn = getattr(mod, func_name)
     tmod = mod if rtp == rp else _load_module_for_execution(rtp)[0]
     if tmod is None:
         return None
@@ -465,6 +499,10 @@ def _flip_static(
                                                         desired_branch=desired))
            if _STORE is not None else
            solve_condition(source_path, branch_line, desired_branch=desired))
+    # A REFUTED arm (owner 1365: every match of a finditer pattern is non-empty, so `if not chunk:` never holds) is a sound
+    # infeasibility vote: the candidate the arm asks for ('' for chunk) is rejected by the pattern's own minimum length.
+    if sol.strategy == "infeasible" and (sol.input_constraints or {}).get("refutation"):
+        return None, "static:refuted", True
     # The static solver infers a type and a set of candidate values for every variable in
     # the guard, and until now that died with the call. Those are exactly what a search
     # needs to build a strategy from — a type to pick the generator and the guard's own
@@ -963,10 +1001,12 @@ def _flip_hypothesis_facts(
     try:
         import hypothesis.strategies as st
         from hypothesis import HealthCheck, find, settings
+        from tharkun.solve import seed as _seed
 
         got = find(st.fixed_dictionaries(strategies), holds,
-                   settings=settings(max_examples=400, deadline=None,
-                                     suppress_health_check=list(HealthCheck)))
+                   settings=settings(max_examples=400, deadline=None, database=None,
+                                     suppress_health_check=list(HealthCheck)),
+                   random=_seed.hypothesis_random(f"driver:hypothesis-facts:{'|'.join(facts)}"))
     except Exception:
         return None, "hypothesis-facts"        # includes NoSuchExample
     return (dict(got) if got else None), "hypothesis-facts"
@@ -1116,7 +1156,7 @@ _AVENGERS_CMP_OPS = {
 _AVENGERS_FLIP_OP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 _AVENGERS_NEGATE_OP = {
     "lt": "ge", "le": "gt", "gt": "le", "ge": "lt", "eq": "ne", "ne": "eq",
-    "truthy": "falsy", "falsy": "truthy",
+    "truthy": "falsy", "falsy": "truthy", "none": "not_none", "not_none": "none",
 }
 
 
@@ -1138,10 +1178,21 @@ def _avengers_field_bounds_from_guard(node: ast.AST, param_name: str) -> "tuple[
     from tharkun.avengers import FieldBound
 
     def is_attr(n: ast.AST) -> str | None:
-        if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
-                and n.value.id == param_name):
-            return n.attr
-        return None
+        # ``param.attr``, and since [internal ref] a PATH of attributes and literal keys below it (``param.options.show_source``,
+        # ``param.config['undefined'].value``): the text after the parameter's name, which ``FieldBound.attr`` reads as steps
+        if not isinstance(n, (ast.Attribute, ast.Subscript)):
+            return None
+        inner = n
+        while isinstance(inner, (ast.Attribute, ast.Subscript)):
+            if isinstance(inner, ast.Subscript) and not (
+                    isinstance(inner.slice, ast.Constant) and isinstance(inner.slice.value, (str, int))
+                    and not isinstance(inner.slice.value, bool)):
+                return None
+            inner = inner.value
+        if not (isinstance(inner, ast.Name) and inner.id == param_name):
+            return None
+        text = ast.unparse(n)[len(param_name):]
+        return text[1:] if text.startswith(".") else text
 
     out: list[Any] = []
     # the WHOLE guard is the bare attribute (``if c.items:``) -- not reached by
@@ -1151,6 +1202,13 @@ def _avengers_field_bounds_from_guard(node: ast.AST, param_name: str) -> "tuple[
         out.append(FieldBound(top_attr, "truthy"))
     for n in ast.walk(node):
         if isinstance(n, ast.Compare) and len(n.ops) == 1 and len(n.comparators) == 1:
+            if isinstance(n.ops[0], (ast.Is, ast.IsNot)):
+                # ``p.attr is None`` / ``is not None`` ([internal ref]; the vocabulary's ``none`` / ``not_none``)
+                attr = is_attr(n.left)
+                other = n.comparators[0]
+                if attr is not None and isinstance(other, ast.Constant) and other.value is None:
+                    out.append(FieldBound(attr, "none" if isinstance(n.ops[0], ast.Is) else "not_none"))
+                continue
             op = _AVENGERS_CMP_OPS.get(type(n.ops[0]))
             if op is None:
                 continue
@@ -1225,7 +1283,7 @@ def _avengers_object_for_bounds(
     import time as _time
 
     from tharkun.avengers import (
-        IsolatedExecutor, ObjectGoal, SaturationBudget, field_bounds_hold, materialize_recipe, synthesize_object,
+        IsolatedExecutor, ObjectGoal, SaturationBudget, materialize_recipe, synthesize_object,
     )
     from tharkun.solve.loader import load_module_for_execution
 
@@ -1252,8 +1310,10 @@ def _avengers_object_for_bounds(
                                        **({"executor": IsolatedExecutor(files=files)} if files is not None else {}))
         except Exception:
             break
+        # the child that replayed each recipe already checked the bounds on the object it built (``ReplayOutcome.bounds_hold``,
+        # ``avengers/_worker.py::_run``, C5); only a recipe it confirmed is materialized here, to hand the caller its object
         candidates = sorted(
-            report.validated,
+            (item for item in report.validated if item.outcome.bounds_hold is True),
             key=lambda item: (
                 len(item.recipe.setup),
                 len(item.recipe.constructor.args) + len(item.recipe.constructor.kwargs),
@@ -1264,17 +1324,37 @@ def _avengers_object_for_bounds(
             with (confine or nullcontext)() as environment:
                 try:
                     obj = materialize_recipe(validated.recipe, class_name, mglobals)
-                    matched = obj is not None and field_bounds_hold(obj, bounds)
                 except Exception:
                     obj = None
                     continue
                 if environment is not None and (environment.flags - {"file_effect"}):
                     obj = None
                     return None
-                if matched:
+                if obj is not None:
                     return obj
                 obj = None
     return None
+
+
+def _avengers_present() -> bool:
+    """Whether :mod:`tharkun.avengers` can be imported.
+
+    Avengers is an optional component of the drive portfolio (owner ruling 2026-11-05: the SV-COMP
+    development branch ships without it, and adding it back is a revert).  This is the one place the
+    portfolio asks: a tier that needs it is skipped, never an error, so ``drive_to_line`` goes on to the
+    next tier (the Hypothesis search) exactly as it does when Avengers finds nothing.  Not cached: an
+    import of a package that is absent costs a path scan per blocked guard, which is nothing next to the
+    guard's own budget.
+    """
+    try:
+        # the names the tier uses, not just the package: a directory left behind by a deleted package (a ``__pycache__``) imports as an
+        # empty namespace package, which is "absent" here
+        from tharkun.avengers import (  # noqa: F401
+            FieldBound, IsolatedExecutor, ObjectGoal, SaturationBudget, materialize_recipe, synthesize_object,
+        )
+    except ImportError:
+        return False
+    return True
 
 
 def _flip_avengers(
@@ -1307,6 +1387,8 @@ def _flip_avengers(
     top of it) -- the guard-to-goal translation above is this module's own
     concern (parsing THIS driver's guard AST), not Avengers'.
     """
+    if not _avengers_present():
+        return None, "avengers"
     try:
         tree = ast.parse(Path(source_path).read_text(encoding="utf-8", errors="ignore"))
     except (OSError, SyntaxError):
@@ -1776,10 +1858,12 @@ def _reach_by_search(
     try:
         import hypothesis.strategies as st
         from hypothesis import HealthCheck, find, settings
+        from tharkun.solve import seed as _seed
 
         got = find(st.fixed_dictionaries(strategies), reaches,
-                   settings=settings(max_examples=max_examples, deadline=None,
-                                     suppress_health_check=list(HealthCheck)))
+                   settings=settings(max_examples=max_examples, deadline=None, database=None,
+                                     suppress_health_check=list(HealthCheck)),
+                   random=_seed.hypothesis_random(f"driver:reach-by-search:{func_name}:{target_path}:{target_line}"))
     except Exception:
         return None                      # includes NoSuchExample
     finally:
@@ -1887,12 +1971,13 @@ def _text_names(text: str) -> set[str]:
 
 
 def _func_params(tree: ast.Module, func_name: str) -> set[str]:
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
-            a = node.args
-            names = [p.arg for p in (a.posonlyargs + a.args + a.kwonlyargs)]
-            return {n for n in names if n not in ("self", "cls")}
-    return set()
+    node = _def_node(tree, func_name) if "." in func_name else next(
+        (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == func_name),
+        None)
+    if node is None:
+        return set()
+    a = node.args
+    return {n for n in (p.arg for p in (a.posonlyargs + a.args + a.kwonlyargs)) if n not in ("self", "cls")}
 
 
 def _enclosing_func_span(tree: ast.Module, line: int) -> tuple[int, int] | None:
@@ -2043,6 +2128,919 @@ def _backward_propagate(
     return proposal or None
 
 
+# ---------------------------------------------------------------------------
+# [internal ref] PR2: the preimage flipper -- backward propagation through str / format / len / set / re operations
+# ---------------------------------------------------------------------------
+#
+# A guard over a LOCAL derived from an entry parameter (python-string-utils is_email:233,
+# ``head.startswith('"') and head.endswith('"')`` where ``head, tail = input_string.split('@')`` then
+# ``head = head.replace('\\ ', '')``) is exactly where every flipper above abstains: they solve the guard for names
+# that are parameters.  ``_flip_preimage`` turns the guard into a demand (``solve/preimage/want.py``) on each local
+# it reads, walks the function's straight-line definitions BACKWARD through the preimage engine
+# (``solve/preimage``, a visitor over the contract rules) until only entry parameters are left, and proposes their
+# values.  Every proposal goes through the same ``_verified`` execution gate as every other flipper's: a wrong
+# candidate costs one verify run, never a commit.  Anything the walk cannot express (a loop or branch assigning a
+# wanted local, a user call, an attribute, an unmodelled expression) makes the flipper abstain for that guard.
+
+_PREIMAGE_PER_STEP = 8
+_PREIMAGE_LIMIT = 16
+
+
+def _function_node_containing(tree: ast.Module, line: int):
+    best = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            lo, hi = node.lineno, getattr(node, "end_lineno", node.lineno) or node.lineno
+            if lo <= line <= hi and (best is None or lo > best.lineno):
+                best = node
+    return best
+
+
+def _stmts_before(body: list[ast.stmt], line: int) -> list[ast.stmt] | None:
+    """The statements executed before the statement at *line* on the way to it, in order (straight-line; the
+    compound statements on the path contribute the statements before the branch that holds *line*), or None when
+    *line* is not in *body*."""
+    out: list[ast.stmt] = []
+    for st in body:
+        lo, hi = st.lineno, getattr(st, "end_lineno", st.lineno) or st.lineno
+        if not lo <= line <= hi:
+            if hi < line:
+                out.append(st)
+            continue
+        if lo == line or isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return out
+        blocks = []
+        if isinstance(st, (ast.If, ast.While, ast.For, ast.AsyncFor)):
+            blocks = [st.body, st.orelse]
+        elif isinstance(st, (ast.With, ast.AsyncWith)):
+            blocks = [st.body]
+        elif isinstance(st, ast.Try):
+            blocks = [st.body, *[h.body for h in st.handlers], st.orelse, st.finalbody]
+        for b in blocks:
+            inner = _stmts_before(b, line)
+            if inner is not None:
+                # a loop around the guard re-runs its own body: the walk stops at the loop (its targets are barriers)
+                return out + ([st] if isinstance(st, (ast.For, ast.AsyncFor, ast.While)) else []) + inner
+        return out
+    return None
+
+
+def _assigned_names(st: ast.stmt) -> set[str]:
+    out: set[str] = set()
+    for node in ast.walk(st):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            out.add(node.id)
+    return out
+
+
+def _preimage_constant(node) -> tuple[bool, Any]:
+    try:
+        return True, ast.literal_eval(node)
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+        return False, None
+
+
+def _preimage_regexes(path: str) -> dict[str, Any]:
+    """The module-level compiled regexes of *path* that are PROVEN constants (``solve/module_namespace.py``)."""
+    import re as _re
+
+    from tharkun.solve.module_namespace import regex_globals
+    out: dict[str, Any] = {}
+    try:
+        recs = regex_globals(path)
+    except Exception:  # noqa: BLE001 -- a hint: no regexes known
+        return out
+    here = os.path.realpath(path)
+    for rec in recs:
+        if not rec.get("proven") or type(rec.get("pattern")) is not str:
+            continue
+        for b in rec.get("bindings", ()):
+            mod = b.get("module", "")
+            if here.endswith(os.sep + mod) or os.path.basename(here) == os.path.basename(mod):
+                try:
+                    out[b["name"]] = _re.compile(rec["pattern"], int(rec.get("flags") or 0))
+                except (_re.error, ValueError, TypeError):
+                    pass
+    return out
+
+
+class _PreimageAbstain(Exception):
+    """The backward walk cannot express this guard or definition (the flipper abstains)."""
+
+
+class _PreimageChoices(Exception):
+    """Separate parameter demands; projecting them to per-name unions would lose their correlation."""
+
+    def __init__(self, choices):
+        self.choices = choices
+
+
+def _preimage_sub_matches(pattern, callback, subject, count, want, env):
+    """Invert bounded copy/group/text templates, then check with native regex semantics (never the target lambda)."""
+    import itertools
+    import re
+
+    from tharkun.solve.contracts.rules import Refused
+    from tharkun.solve.preimage import Eq, HOLE, IsNone, preimages, regex_members as RM
+    from tharkun.solve.preimage.visitor import _case_variants
+
+    args = callback.args
+    params = args.posonlyargs + args.args
+    if count < 0 or len(params) != 1 or args.vararg or args.kwarg or args.kwonlyargs:
+        return []
+    match_name = params[0].arg
+
+    def pieces(node):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return pieces(node.left) + pieces(node.right)
+        if isinstance(node, ast.Constant) and type(node.value) is str:
+            return [("literal", node.value)]
+        if isinstance(node, ast.Name) and node.id != match_name:
+            return [("name", node.id)]
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == match_name
+                and node.func.attr == "group" and len(node.args) == 1 and not node.keywords):
+            known, key = _preimage_constant(node.args[0])
+            if known and ((type(key) is int and 0 <= key <= pattern.groups)
+                          or (type(key) is str and key in pattern.groupindex)):
+                return [("group", key)]
+        raise _PreimageAbstain()
+
+    try:
+        atoms = pieces(callback.body)
+    except _PreimageAbstain:
+        return []
+    if len(atoms) > 8 or not any(kind == "group" for kind, _ in atoms):
+        return []
+
+    def tokens(text):
+        out, end = [], 0
+        for index, match in enumerate(pattern.finditer(text)):
+            if count and index >= count:
+                break
+            if match.start() == match.end():
+                return []
+            if match.start() > end:
+                out.append(("source", (end, match.start())))
+            for kind, value in atoms:
+                if kind == "group":
+                    span = match.span(value)
+                    if span[0] < 0:
+                        return []
+                    out.append(("source", span))
+                else:
+                    out.append((kind, value))
+            end = match.end()
+        if end < len(text):
+            out.append(("source", (end, len(text))))
+        return out
+
+    rows = []
+    samples = RM.samples(((pattern.pattern, pattern.flags),))
+    if not samples:
+        # A trailing lookahead needs context; other proven patterns and literals can supply it.
+        context = RM.samples(tuple((p.pattern, p.flags) for p in env["regexes"].values())) + list(env["pool"])
+        samples = sorted({s for text in context for s in _case_variants(text)
+                          if RM.native_member(pattern.pattern, pattern.flags, "search", s)}, key=lambda s: (len(s), s))[:8]
+    # shortcut: eight sample repetitions and 256 case combinations; extend only with a measured missed template.
+    for seed in itertools.islice(want.seeds(), _PREIMAGE_PER_STEP):
+        if type(seed) is not str or len(seed) > 4096:
+            continue
+        for sample in samples:
+            for repeat in range(1, min(8, len(seed)) + 1):
+                exemplar = sample * repeat
+                if RM.check_cost(pattern.pattern, pattern.flags, len(exemplar), "sub") > RM.WORK_LIMIT:
+                    continue
+                template = tokens(exemplar)
+                if not template or len(template) > 16:
+                    continue
+                shape = "".join(re.escape(value) if kind == "literal" else
+                                "(.*)" if kind == "name" or value[0] == value[1] else "(.+?)"
+                                for kind, value in template)
+                if RM.check_cost(shape, re.DOTALL, len(seed), "fullmatch") > RM.WORK_LIMIT:
+                    continue
+                split = re.fullmatch(shape, seed, re.DOTALL)
+                if split is None:
+                    continue
+                captures = iter(split.groups())
+                copied, names = {}, {}
+                for kind, value in template:
+                    if kind == "literal":
+                        continue
+                    part = next(captures)
+                    target = copied if kind == "source" else names
+                    if value in target and target[value] != part:
+                        break
+                    target[value] = part
+                else:
+                    spans = sorted(copied)
+                    if any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
+                        continue
+                    variants = [tuple(dict.fromkeys(_case_variants(copied[span]))) for span in spans]
+                    for parts in itertools.islice(itertools.product(*variants), 256):
+                        text = exemplar
+                        for (lo, hi), part in reversed(list(zip(spans, parts))):
+                            text = text[:lo] + part + text[hi:]
+                        if len(text) > 4096 or RM.check_cost(pattern.pattern, pattern.flags, len(text), "sub") > RM.WORK_LIMIT:
+                            continue
+                        checked = preimages("re.Pattern.search", IsNone(False), (pattern, HOLE),
+                                            prior=Eq(text), pool=(text,), budget=1)
+                        if isinstance(checked, Refused) or not tuple(checked):
+                            continue
+                        rendered = tokens(text)
+                        if not rendered:
+                            continue
+                        result = "".join(text[value[0]:value[1]] if kind == "source" else
+                                         names[value] if kind == "name" else value for kind, value in rendered)
+                        if not want.holds(result):
+                            continue
+                        try:
+                            back = _preimage_expr(subject, Eq(text), env)
+                        except _PreimageAbstain:
+                            continue
+                        back = _merge_wants(back, {name: Eq(value) for name, value in names.items()})
+                        if back not in rows:
+                            rows.append(back)
+                        if len(rows) >= _PREIMAGE_PER_STEP:
+                            return rows
+    return rows
+
+
+def _preimage_expr(expr, want, env) -> dict[str, Any]:
+    """``{name: Want}`` for the names *expr* reads such that the value of *expr* satisfies *want*."""
+    import itertools
+
+    from tharkun.solve.contracts.rules import Refused
+    from tharkun.solve.preimage import HOLE, IsNone, OneOf, preimages
+
+    if isinstance(expr, ast.Name):
+        return {expr.id: want}
+    pieces = _concat_pieces(expr)
+    if pieces is not None and sum(1 for p in pieces if isinstance(p, ast.Name)) > 1:
+        return _preimage_concat(pieces, want, env)
+    call = None          # (qualname, operand nodes in call order, hole index, op)
+    if isinstance(expr, ast.Call) and not any(isinstance(a, ast.Starred) for a in expr.args):
+        f = expr.func
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in env["regexes"]:
+            if not expr.args:
+                raise _PreimageAbstain()
+            call = (f"re.Pattern.{f.attr}", [env["regexes"][f.value.id], *expr.args], None, None)
+        elif isinstance(f, ast.Attribute):
+            call = (f"str.{f.attr}", [f.value, *expr.args], None, None)
+        elif isinstance(f, ast.Name) and f.id in ("len", "set", "str", "ord", "chr", "repr", "ascii", "format"):
+            call = (f.id, list(expr.args), None, None)
+        if expr.keywords:
+            raise _PreimageAbstain()
+    elif isinstance(expr, ast.Subscript):
+        key = expr.slice
+        if isinstance(key, ast.Slice):
+            parts = []
+            for p in (key.lower, key.upper, key.step):
+                ok, v = (True, None) if p is None else _preimage_constant(p)
+                if not ok or not (v is None or type(v) is int):
+                    raise _PreimageAbstain()
+                parts.append(v)
+            call = ("str.__getitem__", [expr.value, slice(*parts)], None, None)
+        else:
+            ok, v = _preimage_constant(key)
+            if not ok or type(v) is not int:
+                raise _PreimageAbstain()
+            call = ("str.__getitem__", [expr.value, v], None, None)
+    elif isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        call = ("protocol.binary_operator", [expr.left, expr.right], None, "+")
+    elif isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Mult):
+        call = ("protocol.binary_operator", [expr.left, expr.right], None, "*")
+    elif isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Mod):
+        call = ("str.__mod__", [expr.left, expr.right], None, None)
+    if call is None:
+        raise _PreimageAbstain()
+    qualname, operands, _, op = call
+    if (qualname == "re.Pattern.sub" and len(operands) in (3, 4)
+            and isinstance(operands[1], ast.Lambda) and not operands[1].args.defaults
+            and not any(operands[1].args.kw_defaults)):
+        if len(operands) == 4:
+            known, count = _preimage_constant(operands[3])
+            if not known or type(count) is not int:
+                raise _PreimageAbstain()
+        else:
+            count = 0
+        choices = _preimage_sub_matches(operands[0], operands[1], operands[2], count, want, env)
+        # No match leaves the subject unchanged without executing the lambda.
+        pre = preimages("re.Pattern.search", IsNone(True), (operands[0], HOLE), prior=want,
+                        pool=tuple(itertools.islice(want.seeds(), _PREIMAGE_PER_STEP)) + env["pool"],
+                        budget=_PREIMAGE_PER_STEP)
+        got = () if isinstance(pre, Refused) else tuple(pre)
+        if got:
+            choices.append(_preimage_expr(operands[2], OneOf(got), env))
+        if not choices:
+            raise _PreimageAbstain()
+        env.setdefault("rules", []).append("re.Pattern.search")
+        raise _PreimageChoices(choices)
+    values, hole_node = [], None
+    for node in operands:
+        if not isinstance(node, ast.AST):
+            values.append(node)              # an already-resolved operand (a regex constant, a slice)
+            continue
+        ok, v = _preimage_constant(node)
+        if ok:
+            values.append(v)
+        elif hole_node is None:
+            hole_node = node
+            values.append(HOLE)
+        else:
+            raise _PreimageAbstain()         # two unknown operands: not one chain
+    if hole_node is None:
+        raise _PreimageAbstain()
+    if qualname == "str.__getitem__" and env["kinds"].get(_name_of(hole_node)) in (list, tuple):
+        qualname = f"{env['kinds'][_name_of(hole_node)].__name__}.__getitem__"
+    pre = preimages(qualname, want, tuple(values), op=op, pool=env["pool"], budget=_PREIMAGE_PER_STEP)
+    if isinstance(pre, Refused):
+        raise _PreimageAbstain()
+    env.setdefault("rules", []).append(qualname)
+    if pre.transfer is not None:
+        back = _preimage_expr(hole_node, pre.transfer, env)
+        if isinstance(hole_node, ast.Name) and not tuple(itertools.islice(pre.transfer.seeds(), 1)):
+            got = tuple(itertools.islice(pre, _PREIMAGE_PER_STEP))
+            if got:
+                # Keep the exact demand and the rule's checked witnesses as distinct alternatives.
+                raise _PreimageChoices([back, {hole_node.id: OneOf(got)}])
+        return back
+    got = tuple(itertools.islice(pre, _PREIMAGE_PER_STEP))
+    if not got:
+        raise _PreimageAbstain()
+    return _preimage_expr(hole_node, OneOf(got), env)
+
+
+def _concat_pieces(expr):
+    """``a + '@' + b`` as its pieces in order (names and str constants), or None."""
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        left, right = _concat_pieces(expr.left), _concat_pieces(expr.right)
+        return None if left is None or right is None else left + right
+    if isinstance(expr, ast.Name):
+        return [expr]
+    if isinstance(expr, ast.Constant) and type(expr.value) is str:
+        return [expr.value]
+    return None
+
+
+def _preimage_concat(pieces, want, env) -> dict[str, Any]:
+    """A concatenation of SEVERAL unknown names and str constants (``head + '@' + tail``): each seed of the want is
+    split around the constants (a regex member ``a@aa.aa`` gives ``head='a'``, ``tail='aa.aa'``), one ``OneOf`` per
+    name.  Every split is only a proposal: the drive (or the replay) judges the whole input."""
+    import itertools
+    import re as _re
+
+    from tharkun.solve.preimage import Member, OneOf, regex_members
+    names = [p.id for p in pieces if isinstance(p, ast.Name)]
+    if len(set(names)) != len(names):
+        raise _PreimageAbstain()
+    rx = _re.compile("".join("(.*?)" if isinstance(p, ast.Name) else _re.escape(p) for p in pieces) + r"\Z", _re.DOTALL)
+    values: dict[str, list] = {n: [] for n in names}
+    seeds = []
+    if (isinstance(want, Member) and len(pieces) == 3
+            and isinstance(pieces[1], str) and len(pieces[1]) == 1):
+        edges = [env.get("length_boundaries", {}).get(name, [None]) for name in names]
+        for lengths in itertools.islice(itertools.product(*edges), 16):
+            if all(value is None for value in lengths) or sum(value or 0 for value in lengths) + 1 > 4096:
+                continue
+            seeds.extend(seed for seed in regex_members.members(want.pattern, want.flags, how=want.how, limit=1,
+                                                                  split=pieces[1], segments=lengths)
+                         if len(seed) <= 4096)
+    for seed in itertools.chain(seeds, itertools.islice(want.seeds(), 16)):
+        m = rx.match(seed) if type(seed) is str else None
+        if m is None:
+            continue
+        for n, v in zip(names, m.groups()):
+            if v not in values[n]:
+                values[n].append(v)
+    if not all(values.values()):
+        raise _PreimageAbstain()
+    env.setdefault("rules", []).append("protocol.binary_operator")
+    return {n: OneOf(tuple(vs[:_PREIMAGE_PER_STEP])) for n, vs in values.items()}
+
+
+def _name_of(node) -> str | None:
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _merge_wants(a: dict, b: dict) -> dict:
+    from tharkun.solve.preimage import All
+    out = dict(a)
+    for k, w in b.items():
+        out[k] = All.of(out[k], w) if k in out else w
+    return out
+
+
+def _preimage_guard(test, flag: bool, env) -> list[dict]:
+    """The alternatives (a disjunction) of ``{name: Want}`` under which *test* evaluates to *flag*."""
+    from tharkun.solve.preimage import Compare, Eq, IsNone, Truth
+
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return _preimage_guard(test.operand, not flag, env)
+    if isinstance(test, ast.BoolOp):
+        conj = isinstance(test.op, ast.And) == flag     # And wanted true / Or wanted false: every operand
+        parts = [_preimage_guard(v, flag, env) for v in test.values]
+        if conj:
+            # an operand the walk cannot state constrains nothing it proposes (a user call in ``not ok(s) or ...``):
+            # it is left to execution, which judges every proposal anyway; with no operand stated, nothing is
+            alts = [{}]
+            stated = False
+            for p in parts:
+                if not p:
+                    continue
+                stated = True
+                alts = [_merge_wants(a, b) for a in alts for b in p][:8]
+            return alts if stated else []
+        return [a for p in parts for a in p][:8]
+    try:
+        if isinstance(test, ast.Compare) and len(test.ops) == 1:
+            op, right = test.ops[0], test.comparators[0]
+            ok_r, rv = _preimage_constant(right)
+            ok_l, lv = _preimage_constant(test.left)
+            if isinstance(op, (ast.In, ast.NotIn)) and ok_l and type(lv) is str:
+                hit = isinstance(op, ast.In) == flag
+                call = ast.Call(func=ast.Attribute(value=right, attr="__contains__", ctx=ast.Load()),
+                                args=[test.left], keywords=[])
+                return [_preimage_expr(call, Truth(hit), env)]
+            if isinstance(op, (ast.Is, ast.IsNot)) and ok_r and rv is None:
+                none = isinstance(op, ast.Is) == flag
+                return [_preimage_expr(test.left, IsNone(none), env)]
+            sym = {ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">="}.get(type(op))
+            if sym and ok_r and not ok_l:
+                if not flag:
+                    sym = {"==": "!=", "!=": "==", "<": ">=", "<=": ">", ">": "<=", ">=": "<"}[sym]
+                want = Eq(rv) if sym == "==" else Compare(sym, rv)
+                return [_preimage_expr(test.left, want, env)]
+            if sym and ok_l and not ok_r:
+                if not flag:
+                    sym = {"==": "!=", "!=": "==", "<": ">=", "<=": ">", ">": "<=", ">=": "<"}[sym]
+                flipped = {"==": "==", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}[sym]
+                want = Eq(lv) if flipped == "==" else Compare(flipped, lv)
+                return [_preimage_expr(right, want, env)]
+            return []
+        return [_preimage_expr(test, Truth(flag), env)]
+    except _PreimageChoices as choices:
+        return choices.choices
+    except _PreimageAbstain:
+        return []
+
+
+def _preimage_back(wants: dict, stmts: list[ast.stmt], env) -> list[dict]:
+    """Move each correlated alternative back over definitions until only entry names remain."""
+    from tharkun.solve.preimage import Eq, Items
+
+    alts = [dict(wants)]
+    for st in reversed(stmts):
+        nxt = []
+        for original in alts:
+            wants = dict(original)
+            if not _assigned_names(st) & set(wants):
+                nxt.append(wants)
+                continue
+            try:
+                if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                    w = wants.pop(st.targets[0].id)
+                elif (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Tuple)
+                      and all(isinstance(e, ast.Name) for e in st.targets[0].elts)):
+                    names = [e.id for e in st.targets[0].elts]
+                    items = tuple((i, wants.pop(n)) for i, n in enumerate(names) if n in wants)
+                    env["kinds"][_name_of(st.value) or ""] = list
+                    w = Items(Eq(len(names)), items)
+                else:
+                    continue
+                choices = [_preimage_expr(st.value, w, env)]
+            except _PreimageChoices as exc:
+                choices = exc.choices
+            except _PreimageAbstain:
+                continue
+            nxt.extend(_merge_wants(wants, back) for back in choices)
+        alts = nxt[:_PATHS_MAX]
+    return alts
+
+
+def _flip_preimage(source_path: str, func_name: str, blocker_tree: ast.Module, blocker: GuardFrame,
+                   blocker_path: str, params: set[str], inputs: dict[str, Any],
+                   snapshot: dict[str, Any] | None = None, priors: dict[str, Any] | None = None,
+                   rules_out: list | None = None) -> list[dict[str, Any]]:
+    """Entry-parameter proposals that make the blocking guard take ``blocker.desired_branch``, by backward
+    propagation through the str / format / len / set / re operations that derive the guard's locals ([internal ref]).
+    Proposals only: every one is verified by execution before it is committed.
+
+    ``priors`` ([internal ref] PR5) maps an entry parameter to a demand every admissible value satisfies
+    (``solve/preimage/facts.py``: the drive's pins and bounds, absint / FactEnv facts): a proposal outside it is
+    dropped before it is run.  ``rules_out`` receives the qualnames the walk went through (the rule_fact hints)."""
+    import itertools
+
+    from tharkun.solve.preimage import OneOf
+
+    fn = _function_node_containing(blocker_tree, blocker.branch_line)
+    node = _find_branch_node(blocker_tree, blocker.branch_line)
+    if fn is None or node is None:
+        return []
+    test = node.test if isinstance(node, (ast.If, ast.While, ast.Assert)) else node   # the guard expression
+    fparams = {p.arg for p in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+    if os.path.realpath(blocker_path) == os.path.realpath(source_path) and fn.name == func_name.rsplit(".", 1)[-1]:
+        mapping = {p: p for p in fparams & params}
+    else:
+        from tharkun.solve.frontend.call_mapper import find_calls_to
+        mapping = {}
+        for site in find_calls_to(source_path, fn.name):
+            for am in site.args:
+                if am.is_simple_name and am.caller_name in params and am.callee_param in fparams:
+                    mapping.setdefault(am.callee_param, am.caller_name)
+    if not mapping:
+        return []
+    pool = []
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Constant) and type(n.value) is str and n.value and len(n.value) <= 32 \
+                and n.value not in pool and not (isinstance(n, ast.Constant) and n is getattr(fn.body[0], "value", None)):
+            pool.append(n.value)
+    kinds = {k: type(v) for k, v in inputs.items() if type(v) in (list, tuple, str)}
+    for name, value in (snapshot or {}).items():
+        kind = ({"list": list, "tuple": tuple, "str": str}.get(value.get("__type__"))
+                if type(value) is dict else type(value))
+        if kind in (list, tuple, str):
+            kinds[name] = kind
+    env = {"regexes": _preimage_regexes(blocker_path), "pool": tuple(pool[:32]), "kinds": kinds}
+    stmts = _stmts_before(fn.body, blocker.branch_line)
+    if stmts is None:
+        return []
+    alts = [back for alt in _preimage_guard(test, blocker.desired_branch == "then", env)
+            for back in _preimage_back(alt, stmts, env)]
+    if not env.get("rules"):
+        # no str / format / len / set / re step on the way: a comparison on a parameter (or a pass-through of one) is
+        # the static flipper's and call_mapper's question, not a preimage
+        return []
+    out: list[dict[str, Any]] = []
+    priors = priors or {}
+    for back in alts:
+        if not back or not set(back) <= set(mapping):
+            continue
+        per_param = []
+        for local, w in back.items():
+            vals = list(w.values) if isinstance(w, OneOf) else [v for v in itertools.islice(w.seeds(), 8)
+                                                                  if w.holds(v)]
+            prior = priors.get(mapping[local])
+            if prior is not None:
+                vals = [v for v in vals if prior.holds(v)]
+            if not vals:
+                break
+            per_param.append([(mapping[local], v) for v in vals[:_PREIMAGE_PER_STEP]])
+        else:
+            for combo in itertools.product(*per_param):
+                out.append(dict(combo))
+                if len(out) >= _PREIMAGE_LIMIT:
+                    break
+    if rules_out is not None:
+        rules_out.extend(dict.fromkeys(env.get("rules", ())))
+    return out[:_PREIMAGE_LIMIT]
+
+
+def _preimage_priors(context_facts: dict | None, param_bounds: dict | None) -> dict[str, Any]:
+    """The demands a drive's own pins and bounds put on its entry parameters (``solve/preimage/facts.py``)."""
+    from tharkun.solve.preimage.facts import prior_from_bounds, prior_from_pin
+    from tharkun.solve.preimage.want import All
+    out: dict[str, Any] = {}
+    for k, v in (context_facts or {}).items():
+        out[k] = prior_from_pin(v)
+    for k, b in (param_bounds or {}).items():
+        out[k] = All.of(out[k], prior_from_bounds(b)) if k in out else prior_from_bounds(b)
+    return out
+
+
+def _publish_preimage_hints(store, rules: list, path: str, line: int, want_text: str, proposal: dict) -> None:
+    """One ``rule_fact`` hint per rule a committed preimage flip went through ([internal ref] PR5; never certified)."""
+    if store is None or not hasattr(store, "publish"):
+        return
+    from tharkun.solve.preimage.facts import rule_fact
+    site = f"{os.path.basename(path)}:{line}"
+    for q in rules:
+        key, value = rule_fact(q, site, want_text, proposal)
+        try:
+            store.publish("rule_fact", key, value, producer="driver:preimage")
+        except ValueError:
+            pass                       # the same rule at the same site already holds a (different) first hint
+
+
+# ---------------------------------------------------------------------------
+# [internal ref] PR6: preimage candidates for a demand on a function's RESULT (tharkun.inputs' preimage rung)
+# ---------------------------------------------------------------------------
+
+_PATHS_MAX = 16
+
+
+def _exits(body: list[ast.stmt]) -> bool:
+    """Does *body* always leave the function (its last statement a return or raise)?"""
+    return bool(body) and isinstance(body[-1], (ast.Return, ast.Raise))
+
+
+def _path_items(body: list[ast.stmt], target: ast.stmt) -> list[list[tuple]] | None:
+    """The execution paths from the start of *body* to *target* (a statement in it or nested in it), each a list
+    of ``("stmt", st)`` / ``("cond", test, flag)`` in order; None when *target* is not under *body*.  A branch the
+    path does not enter must not exit the function (so its guard takes the other value); a loop on the way, or
+    one before the target that assigns, ends the enumeration (the walk does not unroll)."""
+    paths: list[list[tuple]] = [[]]
+    for st in body:
+        if st is target:
+            return paths
+        lo, hi = st.lineno, getattr(st, "end_lineno", st.lineno) or st.lineno
+        inside = lo <= target.lineno <= hi
+        if isinstance(st, ast.If):
+            if inside:
+                for branch, flag in ((st.body, True), (st.orelse, False)):
+                    sub = _path_items(branch, target)
+                    if sub is not None:
+                        return [p + [("cond", st.test, flag)] + q for p in paths for q in sub][:_PATHS_MAX]
+                return None
+            # a branch before the target: either side, unless it leaves the function
+            sides = []
+            for branch, flag in ((st.body, True), (st.orelse, False)):
+                if _exits(branch):
+                    continue
+                flat = _straight(branch)
+                if flat is None:
+                    continue
+                sides.append([("cond", st.test, flag)] + flat)
+            if not sides:
+                return None
+            paths = [p + s for p in paths for s in sides][:_PATHS_MAX]
+            continue
+        if isinstance(st, ast.Try):
+            if inside:
+                sub = _path_items(st.body, target)
+                if sub is None:
+                    return None                 # the target is in a handler: an exception path, not walked
+                return [p + q for p in paths for q in sub][:_PATHS_MAX]
+            flat = _straight(st.body)
+            if flat is None:
+                return None
+            paths = [p + flat for p in paths]
+            continue
+        if isinstance(st, (ast.With, ast.AsyncWith)) and inside:
+            sub = _path_items(st.body, target)
+            return None if sub is None else [p + q for p in paths for q in sub][:_PATHS_MAX]
+        if isinstance(st, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Match)):
+            if inside or _assigned_names(st):
+                return None
+            continue
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        paths = [p + [("stmt", st)] for p in paths]
+    return None
+
+
+def _straight(body: list[ast.stmt]) -> list[tuple] | None:
+    """A block with no branching, as items (None when it branches or loops)."""
+    out = []
+    for st in body:
+        if isinstance(st, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With, ast.AsyncWith, ast.Match)):
+            return None
+        if isinstance(st, (ast.Return, ast.Raise)):
+            return None
+        out.append(("stmt", st))
+    return out
+
+
+def _world_proposals(tree, target_line, bindings, world, path):
+    """Project existing path items onto file contents; unbound names stay unbound."""
+    import copy
+    from dataclasses import replace
+    from tharkun.lattice import Origin
+    from tharkun.solve.world import WorldRefused
+
+    fn = _function_node_containing(tree, target_line) or tree
+    target = next((n for n in ast.walk(fn) if isinstance(n, ast.stmt) and n.lineno == target_line), None)
+    if target is None:
+        return
+    keys = list(world.objects)
+    subjects = {key: f"world{i}" for i, key in enumerate(keys)}
+    for items in _path_items(fn.body, target) or ():
+        env = {name: ast.Constant(value) for name, value in bindings.items() if type(value) in (str, int, bool)}
+        streams, reads = {}, {}
+        proposed = {key: replace(obj) for key, obj in world.objects.items()}
+
+        def opened(call):
+            if (not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.func.id != "open"
+                    or not call.args or len(call.args) > 2 or call.keywords
+                    or (len(call.args) == 2 and ast.literal_eval(call.args[1]) not in {"r", "rt"})):
+                raise WorldRefused("world drive supports read-only builtin open")
+            expr = project(call.args[0])
+            value = ast.literal_eval(expr)
+            for key in keys:
+                if value == key or (isinstance(value, str) and os.path.abspath(os.path.join(os.path.dirname(path), value))
+                                    == os.path.abspath(os.path.join(os.path.dirname(path), key))):
+                    return key
+            raise WorldRefused("world drive path is not declared in the request")
+
+        class Project(ast.NodeTransformer):
+            def visit_Name(self, node):
+                return copy.deepcopy(env.get(node.id, node))
+
+            def visit_Call(self, node):
+                if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Attribute)
+                        and isinstance(node.func.value.value, ast.Name) and node.func.value.value.id == "sys"
+                        and node.func.value.attr in {"stdin", "__stdin__"}
+                        and "stdin" in proposed and proposed["stdin"].kind == "stream"):
+                    streams["$stdin"] = "stdin"
+                    node = copy.deepcopy(node)
+                    node.func.value = ast.Name("$stdin", ast.Load())
+                if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) \
+                        and node.func.value.id in streams:
+                    handle = node.func.value.id
+                    key = streams[handle]
+                    count = reads.get(handle, 0)
+                    if node.args or node.keywords or node.func.attr not in {"read", "readline"}:
+                        raise WorldRefused("world drive supports unsized read/readline")
+                    if node.func.attr == "read":
+                        if count:
+                            raise WorldRefused("world drive cannot project read after readline yet")
+                        reads[handle] = -1
+                        return ast.Name(subjects[key], ast.Load())
+                    if count < 0:
+                        raise WorldRefused("world drive cannot project readline after read yet")
+                    reads[handle] = count + 1
+                    return ast.Subscript(ast.Name(subjects[key] + "_lines", ast.Load()), ast.Constant(count), ast.Load())
+                return self.generic_visit(node)
+
+        def project(expr):
+            return ast.fix_missing_locations(Project().visit(copy.deepcopy(expr)))
+
+        def add(expr, lineno, polarity=""):
+            names = {n.id for n in ast.walk(expr) if isinstance(n, ast.Name)}
+            affected = [key for key, subject in subjects.items() if names & {subject, subject + "_lines"}]
+            if not affected:
+                return
+            if len(affected) != 1:
+                raise WorldRefused("world drive cannot project a relation between files yet")
+            key = affected[0]
+
+            class Subject(ast.NodeTransformer):
+                def visit_Name(self, node):
+                    return ast.Name({subjects[key]: "content", subjects[key] + "_lines": "lines"}.get(node.id, node.id), ast.Load())
+
+            fact = ast.unparse(ast.fix_missing_locations(Subject().visit(copy.deepcopy(expr))))
+            proposed[key].add(fact, Origin(path, lineno, polarity=polarity))
+
+        try:
+            for node in ast.walk(fn):
+                if isinstance(node, ast.With) and node.lineno < target_line <= node.end_lineno:
+                    for item in node.items:
+                        if not isinstance(item.optional_vars, ast.Name):
+                            raise WorldRefused("world drive needs a named file handle")
+                        streams[item.optional_vars.id] = opened(item.context_expr)
+            for item in items:
+                if item[0] == "cond":
+                    expr = project(item[1])
+                    if not item[2]:
+                        expr = ast.UnaryOp(ast.Not(), expr)
+                    add(expr, item[1].lineno, "then" if item[2] else "else")
+                    continue
+                node = item[1]
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    name = node.targets[0].id
+                    if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == "open":
+                        streams[name] = opened(node.value)
+                        continue
+                    expr = project(node.value)
+                    env[name] = expr
+                    for call in ast.walk(expr):
+                        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "int":
+                            add(ast.Compare(call, [ast.Eq()], [copy.deepcopy(call)]), node.lineno)
+            if any(obj.concrete != world.objects[key].concrete for key, obj in proposed.items()):
+                yield proposed
+        except (WorldRefused, ValueError, TypeError, SyntaxError) as exc:
+            yield WorldRefused(str(exc))
+
+
+def _preimage_walk(items: list[tuple], wants: dict, env) -> list[dict]:
+    """Move *wants* back over a path's items (latest first); guards on the path add their demands."""
+    alts = [dict(wants)]
+    for item in reversed(items):
+        nxt = []
+        for w in alts:
+            if item[0] == "cond":
+                for g in _preimage_guard(item[1], item[2], env) or [{}]:
+                    nxt.append(_merge_wants(w, g))
+            else:
+                nxt.extend(_preimage_back(w, [item[1]], env))
+        alts = nxt[:_PATHS_MAX]
+        if not alts:
+            return []
+    return alts
+
+
+def _return_wants(expr, want, env) -> list[dict] | None:
+    """The demands on locals under which ``return <expr>`` gives a value satisfying *want*: ``None`` for a constant
+    that does not satisfy it; ``[{}]`` (the path's guards only) for an expression the walk cannot state, since
+    reaching that return is still what a result-changing mutant on the path needs."""
+    from tharkun.solve.preimage import Eq, Truth
+    ok, value = _preimage_constant(expr)
+    if ok:
+        return [{}] if want.holds(value) else None
+    flag = None
+    if isinstance(want, Truth):
+        flag = want.flag
+    elif isinstance(want, Eq) and type(want.value) is bool:
+        flag = want.value
+    if flag is not None and isinstance(expr, (ast.Compare, ast.BoolOp, ast.UnaryOp)):
+        alts = _preimage_guard(expr, flag, env)
+        return alts or [{}]
+    try:
+        return [_preimage_expr(expr, want, env)]
+    except _PreimageChoices as choices:
+        return choices.choices
+    except _PreimageAbstain:
+        return [{}]
+
+
+def _passes(items: list[tuple], ret: ast.stmt, line: int) -> bool:
+    """Does the path (its items, then ``ret``) run a statement or test the guard that spans *line*?"""
+    for node in [ret] + [item[1] for item in items]:
+        if node.lineno <= line <= (getattr(node, "end_lineno", None) or node.lineno):
+            return True
+    return False
+
+
+def preimage_candidates(source_path: str, func_name: str, want, *, params: set[str] | None = None,
+                        limit: int = 16, through: int | None = None) -> list[dict[str, Any]]:
+    """Parameter values for which ``func_name`` (a top-level function of *source_path*, or ``Class.method``, [internal ref]) may RETURN a value that
+    satisfies *want* (``solve/preimage/want.py``), by walking each ``return`` statement's paths backward through
+    ``solve/preimage``: the returned expression's demand, the guards on the path, the definitions before it.
+    Proposals only (``tharkun.inputs``' preimage rung replays every one in a fresh child); a path the walk cannot
+    express contributes nothing.  [internal ref] PR6.
+
+    ``through`` ([internal ref]) keeps only the paths that run the statement or test the guard on that line of
+    *source_path* (``tharkun.inputs``' reach rung: the line a drive reached, so the walk proposes the propagation
+    half of a forward kill -- the values that carry what changed at that line to the result)."""
+    import itertools
+
+    from tharkun.solve.preimage import OneOf
+    try:
+        tree = ast.parse(Path(source_path).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return []
+    fn = _def_node(tree, func_name)
+    if not isinstance(fn, ast.FunctionDef):
+        return []
+    fparams = {p.arg for p in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+    params = fparams if params is None else (set(params) & fparams)
+    pool = [n.value for n in ast.walk(fn) if isinstance(n, ast.Constant) and type(n.value) is str
+            and 0 < len(n.value) <= 32]
+    # Boundary ordering is for anchored searches; unanchored callers keep their shortest-first proposals.
+    boundaries = {}
+    for cmp in (node for node in ast.walk(fn) if through is not None and isinstance(node, ast.Compare)):
+        sides = [cmp.left, *cmp.comparators]
+        for left, right in zip(sides, sides[1:]):
+            for call, constant in ((left, right), (right, left)):
+                if (not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name)
+                        or call.func.id != "len" or len(call.args) != 1 or not isinstance(call.args[0], ast.Name)):
+                    continue
+                known, value = _preimage_constant(constant)
+                if known and type(value) is int and 0 <= value <= 4096:
+                    rows = boundaries.setdefault(call.args[0].id, [])
+                    rows.extend(v for v in (value, value + 1, value - 1) if 0 <= v <= 4096 and v not in rows)
+    base_env = {"regexes": _preimage_regexes(source_path), "pool": tuple(dict.fromkeys(pool))[:32]}
+
+    def proposals(lengths):
+        env = dict(base_env, kinds={}, length_boundaries=lengths)
+        for ret in (n for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value is not None):
+            starts = _return_wants(ret.value, want, env)
+            if starts is None:
+                continue
+            for items in _path_items(fn.body, ret) or []:
+                if through is not None and not _passes(items, ret, through):
+                    continue
+                for back in (b for start in starts for b in _preimage_walk(items, start, env)):
+                    if not back or not set(back) <= params:
+                        continue
+                    per = []
+                    for name, w in back.items():
+                        vals = list(w.values) if isinstance(w, OneOf) else [v for v in itertools.islice(w.seeds(), 8)
+                                                                              if w.holds(v)]
+                        if not vals:
+                            break
+                        per.append([(name, v) for v in vals[:_PREIMAGE_PER_STEP]])
+                    else:
+                        for combo in itertools.product(*per):
+                            yield dict(combo)
+
+    streams = (itertools.zip_longest(proposals({}), proposals(boundaries)) if boundaries
+               else ((row,) for row in proposals({})))
+    out: list[dict[str, Any]] = []
+    seen: set = set()
+    for group in streams:
+        for row in group:
+            if row is None:
+                continue
+            key = repr(sorted(row.items()))
+            if key not in seen:
+                seen.add(key)
+                out.append(row)
+                if len(out) >= limit:
+                    return out
+    return out
+
+
 def drive_to_line(
     source_path: str,
     func_name: str,
@@ -2059,6 +3057,7 @@ def drive_to_line(
     minleaf: bool = True,
     avengers_budget_seconds: float = 10.0,
     confine=None,
+    world=None,
     _source_binding: tuple[str, str, str] | None = None,
 ) -> DriveResult:
     """Drive execution of ``func_name`` toward *target_line*, starting from *seed*.
@@ -2121,6 +3120,7 @@ def drive_to_line(
         if refusal:
             return DriveResult(NO_TARGET, dict(seed), target_line=target_line, diagnostics=refusal)
     param_bounds = param_bounds or {}
+    preimage_priors = _preimage_priors(context_facts, param_bounds)
     # Strategies read and write one knowledge base for the drive. Pass a shared store to
     # carry what was learned across drives — a verdict decided for one frontier is still
     # valid for the next one that asks the same question.
@@ -2162,6 +3162,12 @@ def drive_to_line(
         extra_paths = frozenset()
         extra_snaps = {}
         snapshot_lines = guard_lines | {target_line}
+    if world is not None:
+        observed_lines = {n.lineno for n in ast.walk(target_tree) if isinstance(n, ast.stmt) and n.lineno <= target_line}
+        if tp == rp:
+            snapshot_lines |= observed_lines
+        else:
+            extra_snaps[tp] |= observed_lines
 
     from tharkun.lattice import TOP, Origin
 
@@ -2228,7 +3234,7 @@ def drive_to_line(
         for rnd in range(max_rounds):
             # Minleaf mutates the real objects captured at the guard.
             outcome = _run_traced(source_path, func_name, inputs, snapshot_lines,
-                                  capture_real=minleaf,
+                                  capture_real=minleaf or world is not None,
                                   extra_paths=extra_paths, extra_snapshot_lines=extra_snaps)
             if not outcome.ok:
                 return DriveResult(
@@ -2257,6 +3263,39 @@ def drive_to_line(
                     diagnostics="target reached only under accumulated in-process state; it "
                                 "depends on non-parameter (module-level) state, not the inputs",
                 )
+
+            if world is not None:
+                bindings = dict(inputs)
+                snapshots = outcome.real_by_path.get(tp, {})
+                for line in sorted(snapshots):
+                    if snapshots[line]:
+                        bindings.update(snapshots[line][-1])
+                for proposed in _world_proposals(target_tree, target_line, bindings, world, tp):
+                    from tharkun.solve.world import WorldRefused
+                    if isinstance(proposed, WorldRefused):
+                        history.append(DriveStep(rnd, dict(inputs), technique="world", note=str(proposed)))
+                        continue
+                    previous = {key: (obj.concrete, obj.facts, obj.mode) for key, obj in world.objects.items()}
+                    for key, obj in proposed.items():
+                        current = world.objects[key]
+                        current.concrete, current.facts, current.mode = obj.concrete, obj.facts, obj.mode
+                    accepted = False
+                    try:
+                        check = _run_traced(source_path, func_name, inputs, snapshot_lines,
+                                            extra_paths=extra_paths, extra_snapshot_lines=extra_snaps)
+                        executed = check.by_path.get(tp, set()) if tp != rp else check.executed
+                        accepted = target_line in executed and _reaches_in_fresh_state(
+                            source_path, func_name, inputs, target_line, tp, extra_paths, extra_snaps)
+                        if accepted:
+                            history.append(DriveStep(rnd, dict(inputs), technique="world",
+                                                     note="file facts satisfied; target re-executed"))
+                            return DriveResult(REACHED, inputs, rounds=rnd + 1, target_line=target_line,
+                                               reached=True, history=history)
+                    finally:
+                        if not accepted:
+                            for key, (concrete, facts, mode) in previous.items():
+                                current = world.objects[key]
+                                current.concrete, current.facts, current.mode = concrete, facts, mode
 
             # The blocker is the outermost enclosing guard whose target-side did not
             # execute — inner guards aren't even reached until it flips.
@@ -2477,6 +3516,19 @@ def drive_to_line(
                         break
                 if proposal is not None:
                     break
+
+            # [internal ref] PR2: the preimage tier -- a guard over a local DERIVED from an entry parameter through str /
+            # format / len / set / re operations is propagated back to the parameter (solve/preimage).  Cheap and
+            # deterministic, so it runs before minleaf and the searches; every proposal is execution-verified.
+            if proposal is None and blocker is not None:
+                used_rules: list = []
+                for cand in _flip_preimage(source_path, func_name, blocker_tree, blocker, blocker_path, params,
+                                           inputs, snapshot, priors=preimage_priors, rules_out=used_rules):
+                    if _ok(cand) and _verified(blocker, cand, blocker_path):
+                        proposal, technique = cand, "preimage"
+                        _publish_preimage_hints(_STORE, used_rules, blocker_path, blocker.branch_line,
+                                                f"the {blocker.desired_branch} branch of the guard", cand)
+                        break
 
             # Minleaf tier — concrete mutation of the live state.  Runs before the search
             # tier because it needs no modeling at all (it evaluates the real guard), which

@@ -32,9 +32,9 @@ def load_all() -> None:
         return
     # Importing a rule module registers one Rule and its Contract per qualname.
     from tharkun.solve.contracts import (  # noqa: F401
-        rules_bisect, rules_builtins, rules_builtins_more, rules_bytes, rules_collections, rules_copy, rules_dict,
-        rules_fileio, rules_functools, rules_heapq, rules_io, rules_itertools, rules_list, rules_math, rules_operator,
-        rules_protocols, rules_random, rules_re, rules_set, rules_str, rules_strformat, rules_tuple, rules_verifier,
+        rules_array, rules_bisect, rules_builtins, rules_builtins_code, rules_builtins_more, rules_builtins_missing, rules_bytes, rules_bytes_more, rules_collections, rules_copy, rules_dict,
+        rules_factories, rules_fileio, rules_float, rules_functools, rules_heapq, rules_html, rules_io, rules_itertools, rules_itertools_more, rules_json, rules_stdlib_misc, rules_binary, rules_os_path, rules_int, rules_list, rules_math, rules_operator, rules_operator_more,
+        rules_numeric_division, rules_exceptions, rules_protocols, rules_random, rules_range, rules_re, rules_set, rules_str, rules_strformat, rules_string, rules_statistics, rules_textwrap, rules_tuple, rules_typing, rules_verifier,
     )
     _loaded = True
 

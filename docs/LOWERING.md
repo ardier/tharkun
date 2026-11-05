@@ -29,11 +29,27 @@ one, and the five programs are tests here (`tests/test_lowering_comprehension.py
   consumer inside or outside tharkun imports this package and never a copy.
 - `src/tharkun/solve/lowering/comprehension.py`: `lower_comprehensions(tree) -> Lowered`. Imports
   `provenance.py` and `scopes.py`.
+- `src/tharkun/solve/lowering/generator.py`: immediately consumed all/any, list/tuple,
+  exact integer sum and pattern-unpack loops. Generator steps wrap StopIteration;
+  consumer truth tests remain outside those handlers. Unknown inner iterator protocols
+  and declared finalizers are refused.
+- `src/tharkun/solve/lowering/eval_source.py`: `lower_module_code(tree) -> Lowered` expands finite
+  literal-source module `eval` expressions and assignment-only `exec` statements for proof analysis; `solve/static_code.py` checks registry authority
+  and supplies the frontend work budget. Neither executes evaluated code.
 - `src/tharkun/solve/lowering/scopes.py`: `Names` (which names a program binds, which builtins are a
   stable read, fresh names), `rename_names` (scope-aware renaming), `reaches_the_namespace` (the
   reflection rule below), `target_names`. Imports only the standard library.
 - `src/tharkun/solve/lowering/provenance.py`: `annotate`, `stand_for`, `origin_of`, `resolve`: where
   every node of a lowered program came from. Imports only the standard library.
+- `src/tharkun/solve/lowering/walrus.py`: `lower_walrus_loops(Lowered)` extends the analysis tree
+  in place for a sole or final `and`-guard assignment expression in a while without else.
+  Assignment and its truth test stay inside each iteration; existing nodes keep their origins,
+  and no names or scopes are introduced. Only function-local targets without namespace
+  reflection, global/nonlocal declarations or nested-scope mentions are rewritten: a class
+  namespace or a rebinding finalizer can make a target read differ from the assigned value.
+  Programs declaring finalizers are also refused: the original assignment holds an extra
+  RHS reference during the store. Other assignment-expression forms stay unchanged.
+  `absint.prove` calls it only when the source contains `:=`.
 - `src/tharkun/solve/absint/__init__.py::prove` calls `lower_comprehensions` on the sliced program and
   hands the result to `src/tharkun/solve/absint/interp.py::Analyzer(lowered=...)`, which interprets the
   lowered tree and reports on the original one. `interp.py` imports `provenance.py` for the
@@ -41,6 +57,101 @@ one, and the five programs are tests here (`tests/test_lowering_comprehension.py
 - `tests/test_lowering_comprehension.py` (differential execution: 82 hand-written cases and 40
   seeded random differentials), `tests/test_absint_lowering.py` (the seam), `tests/test_absint_lowering_fuzz.py` (a
   soundness fuzz of absint on lowered programs).
+- `tests/test_lowering_walrus.py`: disposable-child native comparisons of loop guard order,
+  assignment visibility, exceptions, break/continue, arbitrary guard arity and scalar/container
+  truth protocols; source-origin and UNKNOWN controls for forms that are left intact.
+
+## Immediately consumed generator expressions
+
+Stable builtin `all` and `any` consume each produced value once and stop every
+nested loop on the first decisive truth value. They return their empty-input
+identity without evaluating an element. The expression is never replaced by an
+eager list before these consumers. `list` and `tuple` drain fully. Generator
+assignment to one tuple/list pattern stops after at most the pattern's arity
+plus one elements; a starred pattern drains fully. The original assignment
+consumes a buffered iterator, preserving CPython's generic-iterator unpack
+messages, target-store order and native too-few/too-many errors. Arity is taken
+from the source pattern, with no fixed limit.
+
+Each generator element, filter and destructuring target has its own
+StopIteration-to-RuntimeError boundary, including the original exception as
+cause. The consumer's truth test runs outside that boundary. Initial outer
+iterator creation also stays outside. Inner iterables must be known builtin
+containers or constructors, whose GET_ITER cannot invoke a custom hook; unknown
+inner protocols remain opaque. The original loop variables are renamed with the
+existing comprehension scope/provenance machinery. Rebound consumer/protocol
+names, assignment/suspension in the generator and declared finalizers refuse the
+new lowering. Implicit-frame super() and escaped super bindings also stay opaque.
+Potentially unbound captured locals also stay opaque: removing a
+generator frame must not turn NameError into UnboundLocalError. Known frame and
+reference-count observations, including imported aliases, are refused. Existing
+unknown runtime/world-effect refusals remain.
+
+`sum` keeps the original CPython builtin, rather than replacing its numeric
+algorithm. Only effect-free integer/bool terms over builtin ranges and a literal
+integer/bool start are materialized. Floating terms, custom addition, dynamic
+start evaluation and unknown element types remain opaque, since moving them can
+change compensation or the first error/effect. Lengths and integer magnitudes
+are unrestricted; analysis work budgets still expire to UNKNOWN.
+
+Absint recognizes only lowering-owned, structurally checked StopIteration
+handlers when permitting primitive power, bool and isinstance through those
+boundaries. All active frames must be such handlers, with no finally/handler
+execution. Other user handlers retain complete exception-routing requirements;
+unknown operands and callbacks gain no exemption. Original AST paths and source
+hashes continue to identify checks. Native boundary, arity, magnitude and unsafe
+twins are in `tests/test_lowering_generator.py`.
+
+## Finite module code sources
+
+Before slicing, `absint.prove` can expand direct, one-argument builtin `eval` and bare `exec` statements in module execution
+scope. Its argument is an exact str/bytes literal or a name whose every syntactic binding resolves
+through literal assignments, aliases and conditional expressions to such sources. There is no bound
+on source length or alternative count: exhausting the frontend CPU budget leaves the call opaque.
+Every alternative must compile without warnings in its own mode. An exec body contains only assignments
+to names and pass statements, with no bound on statement count; an empty body is also supported.
+Assignments that bind any dynamic-source provider, an alias it depends on, or eval/exec/compile stay opaque:
+they could invalidate the original-source binding census. Value-used exec, other statements and assignment
+targets stay opaque because this pass supplies no expression-result or namespace-effect interface.
+Future imports, rebound
+callees, namespace-writing expressions, comprehensions, function/class bodies and custom namespaces
+remain opaque. Existing environment and reflection guards inspect the expanded body before any proof.
+
+Dispatch uses exact source-value comparisons and preserves the initial source-name read, including
+its NameError. Expression evaluation preserves effect order and exception payloads. Inserted nodes
+report at the original code call, while a code-unit digest and inner AST path distinguish allocation
+and call contexts. Comprehension lowering preserves those origins. Original source hashes and witness
+locations remain unchanged. Existing value precision limits, including object identity and shifts,
+remain UNKNOWN; this pass does not add arithmetic or equality rules.
+
+This preparation is proof-only. Native search and replay still execute the original source with the
+existing callee/source observers. Independent witness validation retains its separate syntax boundary;
+a producer TRUE is not a checked witness merely because eval was expanded. Native differential and
+negative controls live in `tests/test_absint_eval_source.py` and `tests/test_absint_exec_source.py`.
+
+### Closed compile-to-exec snapshots
+
+`compiled_source.py::lower_compile_snapshots` handles default three-positional-argument
+`compile(source, literal_filename, 'exec')` stored in module names and used only by bare module
+exec or plain aliases. Each binding must dominate every read; bindings are unconditional module
+assignments from an eligible compile or another code name. Other modes/options, ambiguous scopes,
+metadata reads, code-object escapes and uncertain bindings stay opaque.
+
+The first module-code pass exposes ordinary literal-code accesses before this flow is checked.
+Any remaining dynamic-code operation outside the closed compile/exec flow prevents snapshot
+conversion: its source could observe or overwrite the original code names. Compiled bodies cannot
+refer to those names or perform nested dynamic-code operations. These checks precede alpha-renaming.
+The transformation captures the source value at compile time in collision-free private names,
+then the existing module-code pass expands the saved source at exec time. Source rebinding and
+code aliases therefore preserve their own snapshots; the pass never re-reads the current source.
+
+Every alternative must validate without compiler warnings or errors before this transfer is used;
+failed validation leaves the original compilation opaque, so an error is never moved to exec.
+Private selectors are `Lowered.synthetic`, including after comprehension composition: they must
+not export false str facts about original CodeType values. All original source positions and runtime
+observers remain intact. Native snapshot, namespace-write, exception-payload, size and false controls
+are in `tests/test_absint_compile_snapshots.py`. The frozen compile audit sample uses eval mode and
+remains refused; this closed flow supplies no general CodeType model or checked-witness extension.
 
 ## What `lower_comprehensions` does
 
@@ -79,16 +190,31 @@ right of `and`/`or`, a branch of a conditional expression) becomes an `if` state
 when it would have. A dict comprehension evaluates the key, then the value, then inserts: the lowering
 keeps that order with temporaries (`acc[k] = v` would evaluate `v` first).
 
+### Dict displays with `**` entries
+
+CPython builds a display's dict first and applies each `**` operand the moment it is evaluated
+(`BUILD_MAP 0`, then `DICT_UPDATE` per operand), so unpacking an earlier operand (a `TypeError` for a
+non-mapping, a user mapping's `keys`/`__getitem__`) happens BEFORE a later comprehension is evaluated.
+`comprehension.py::Lowering.dict_unpacking` admits a display with exactly one comprehension-bearing entry,
+that entry a `**` entry following only `**` entries: the entries before it become a statement of their own,
+`t = {**A, **B}` (the same unpacking in the same order, nothing else), the comprehension's statements
+follow, and the display becomes `{**t, **<result>, <entries after>}`; `t` is a fresh builtin dict, so
+unpacking it again has no effect, the same contents and the same order. A `key: value` entry before the
+comprehension is refused (when a pair's key is hashed relative to the operands depends on how CPython chunks
+the display) and so is a second comprehension-bearing entry. `tests/test_lowering_comprehension.py` runs
+native differentials with a logging user mapping, a non-mapping operand and a raising comprehension.
+Measured use: `type-eval-py/dicts_merge_unsafe` (sv-benchmarks f0624a58) dynamic-typing goes from the
+`DictComp` refusal to TRUE; its assertion-safety pair stays UNKNOWN (the equal-values assertions need a
+relation between `merged_dict[k]` and `dict2[k]` that the interval domain does not have).
+
 ### Generator expressions are lazy
 
-Lowering one to an eager loop changes WHEN its elements are evaluated relative to the code that consumes
-them: `any`, `all`, `next`, `sum`, `min`, `max`, `zip`, `dict` and `set` interleave with it and can stop,
-raise or have effects part-way. A generator expression is lowered only as the sole argument of a
-consumer that drains it completely before doing anything else, which makes it identical to the list
-comprehension: `list(g)`, `tuple(g)`, `sorted(g, ...)` (the builtins, not rebound anywhere) and
-`"...".join(g)`. Every other generator expression is refused. `sum(genexp)` cannot be lowered exactly:
-`sum` adds as it goes, so a float or an exception part-way differs. `max`, `min`, `any` and `all` could
-be lowered by an exact loop that mimics their short circuit; that is not built.
+Immediate all/any now use stopping loops, and pattern unpack uses its exact
+consumption limit, as described above. list/tuple materialize with per-step
+exception boundaries. The integer-only sum path retains the native builtin;
+floating/custom arithmetic and dynamic starts remain refused. Stored generators,
+next/min/max/zip/dict/set consumers and unknown inner iterator protocols stay
+opaque. Existing sorted and literal join eager paths are separate.
 
 ### Refused shapes
 
@@ -205,3 +331,34 @@ does not by itself turn any measured task from UNKNOWN to TRUE. Per pair CPU tim
   `while bool(t)`. Stages S1 and S2 of the same module, next.
 - **`max`/`min`/`any`/`all` over a generator** by an exact short-circuit loop.
 - **Eregion migration** onto this lowering (a note on [internal ref]).
+
+## Module copy identity facts
+
+`copy_identity.py::annotate_module_copies` adds private must-identity metadata
+to one-operation `is`/`is not` assertion comparisons of names. It keeps every
+source node, operand read, source position and site key unchanged.
+`compare_split` invokes it lazily once on the actual analysis tree when an
+identity comparison has two name operands. It consumes the fact only in that
+identity branch, independently of value equality. Programs without such an
+operation do not run this pass.
+
+Plain module name assignments preserve the copied object's token; chained
+assignments share one token because the RHS is evaluated once. An effectful
+RHS clears prior facts before its result is bound. Other effects, deletes,
+loops, handlers and nested scopes clear facts and supply no new assertions.
+Conditional branches start without assumptions about globals after their
+truth conversion; only names bound on both branches survive, each with a new
+token. No relation between equal-valued objects is inferred. This deliberately
+loses precision across effects, control joins and other expression contexts.
+
+These facts are consumed only by closed absint execution. Its existing hook
+gates must exclude finalizers: overwriting a name can otherwise release an
+object and invoke `__del__`, a weakref callback or generator cleanup that
+rebinds globals. Dedicated native counterexamples retain UNKNOWN through
+those existing protocol refusals.
+
+Within that admitted model, the proof is independent of value kind, length,
+magnitude and copy-chain size.
+Underlying unsupported Python constructs still produce UNKNOWN before an
+identity check can certify a program. The ordinary CPU deadline bounds the
+pass; no size cutoff or special benchmark name appears in it.

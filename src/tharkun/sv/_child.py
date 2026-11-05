@@ -48,6 +48,14 @@ Draw kinds (the ``sv-py-witness/1`` vector vocabulary):
 A float value is stored as its exact ``float.hex()`` spelling.
 """
 
+import sys as _sys
+
+#: the module names this interpreter had before the model imported anything (``evict_import_cache``, [internal ref]): for a
+#: direct ``python _child.py`` run that IS the native startup set; a forked child is handed the server-measured one
+_STARTUP_MODULES = frozenset(_sys.modules)
+#: ``_forkserver.py`` sets this once per server from its own probe script
+NATIVE_STARTUP = None
+
 import builtins
 import importlib.machinery
 import json
@@ -55,9 +63,11 @@ import io
 _RESULT_FILE_IO = io.FileIO
 import math
 import opcode
+from operator import index as _index
 import os
 import random as _random
 import string
+import _string
 import sys
 import time as _time
 import traceback
@@ -65,7 +75,14 @@ import types
 
 # Capture interpreter identities before any target code can replace them.
 _GETFRAME = sys._getframe
+_PY314 = sys.version_info >= (3, 14)
 _IMPORT_NAME = opcode.opmap["IMPORT_NAME"]
+_LOAD_ATTR = opcode.opmap["LOAD_ATTR"]
+_CALL = opcode.opmap["CALL"]
+#: the builtins whose call sites ``_mapping_observer`` checks by object (``environment.orig_argv_reason``'s ``observed``)
+_VARS, _GETATTR = builtins.vars, builtins.getattr
+_EXEC, _EVAL, _COMPILE = builtins.exec, builtins.eval, builtins.compile
+_CODE_TYPE = types.CodeType
 
 #: the generator's real ``getstate`` (``_patch_random`` replaces the module-level one by a flagging model, [internal ref]): the
 #: stationary probe's snapshot reads the generator state through this one
@@ -111,8 +128,9 @@ def exception_mro(exc) -> list:
 _SOLVE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "solve")
 sys.path.insert(0, _SOLVE)
 try:
-    from environment import (install_files, references_stack, references_stdin, refuse_threads, thread_starters,
-                             THREAD_STARTERS as _THREAD_STARTERS, confined)
+    from environment import (BOX_HOME, _patched_attributes, install_files, orig_argv_reason, references_argv, references_orig_argv, references_stack, references_stdin, refuse_threads, world_record, stdin_bytes, feed_stdin,
+                             thread_starters, THREAD_STARTERS as _THREAD_STARTERS, confined, preload_infrastructure,
+                             reflective_field_attribute)
     from extern import native_import_reason
 finally:
     sys.path.remove(_SOLVE)
@@ -336,7 +354,7 @@ def _draw(kind, n=None, depth=3, default=_UNSET, base=None):
 def initial_argv(program, source):
     """A full-list draw, or an explicitly marked legacy tail, at boot.
 
-    No draw defaults to [program]. A source mentioning argv records that example
+    No draw defaults to [program]. Code naming argv records that example
     without consuming a later per-call draw. Boot entries are unique and first;
     malformed vectors are refused before target code can catch anything.
     """
@@ -350,7 +368,7 @@ def initial_argv(program, source):
     if boot and boot != [0]:
         _State.flags.add("invalid_draw")
         return [program]
-    mentions = b"argv" in source if isinstance(source, bytes) else "argv" in source
+    mentions = references_argv(source)                  # the code only: never a comment ``# argv`` (R2)
     if not boot and not mentions:
         return [program]
     _State.flags.add("argv")
@@ -361,6 +379,22 @@ def initial_argv(program, source):
         return [program]
     value = _draw(kind, default=[] if kind == "argv" else [program])
     return [program] + list(value) if kind == "argv" else list(value)
+
+
+def observable(code, reads) -> bool:
+    """Does every recorded read (``mapping_reads``) sit on an instruction of ``code`` or of its nested code that the
+    observer checks -- a ``LOAD_ATTR`` for a receiver name, a ``CALL`` for a ``(callee, receiver, scope)`` entry?  A
+    read the compiler placed elsewhere would go unchecked, so the run is then no witness."""
+    seen, stack = set(), [code]
+    while stack:
+        c = stack.pop()
+        for word, position in enumerate(c.co_positions()):
+            op = c.co_code[word * 2]
+            if op == _LOAD_ATTR or op == _CALL:
+                seen.add((op, c.co_filename, *position))
+        stack.extend(k for k in c.co_consts if isinstance(k, types.CodeType))
+    return all((_CALL if type(entry) is tuple and not (len(entry) == 4 and entry[2] == 'format') else _LOAD_ATTR, *key) in seen
+               for key, entry in reads.items() if key[0] == code.co_filename)
 
 
 _MAX_RANGES = 4096
@@ -552,7 +586,15 @@ def _patch_random():
         return rng[_draw("rindex", n=n, base=(rng.start, rng.step))]
 
     def randint(a, b):
-        return real["randint"](a, b) if _State.seeded else randrange(a, b + 1)
+        if _State.seeded:
+            return real["randint"](a, b)
+        if not _PY314:
+            return randrange(a, b + 1)
+        a = _index(a)
+        b = _index(b)
+        if b < a:
+            raise ValueError(f"empty range in randint({a}, {b})")
+        return randrange(a, b + 1)
 
     def choice(seq):
         if _State.seeded:
@@ -645,12 +687,24 @@ def native_main_module(program: str) -> types.ModuleType:
     return mod
 
 
-def _watch_resources():
+def _watch_resources(mapping_reads=(), audit_code=False):
     """Observe caught limits too, without replacing native APIs or a line tracer."""
     flags = _State.flags
     tool = None
     owner = "tharkun.sv.resources"
     callbacks = {}
+    local_codes = []
+    audit_active = [False]
+    audit_seen = [False]
+
+    def code_changed(event, args):
+        if event == "tharkun.mapping_observer":
+            audit_seen[0] = True
+        # owner, 2026-10-29 audit: code-object rewriting is unmodelled (``types.CodeType`` and ``code.replace`` raise
+        # ``code.__new__``; ``f.__code__ = ...`` raises ``object.__setattr__``).  ``function.__new__`` (dataclasses and
+        # typing raise it) wraps an UNCHANGED code object, whose positions the observer still sees.
+        if audit_active[0] and (event == "code.__new__" or (event == "object.__setattr__" and args[1] == "__code__")):
+            flags.add("import_state_unmodelled")
 
     def raised(code, offset, exc):
         for base in _TYPE_MRO(_TYPE(exc)):
@@ -659,6 +713,7 @@ def _watch_resources():
                 break
 
     def restore():
+        audit_active[0] = False
         if tool is None:
             return
         try:
@@ -666,6 +721,10 @@ def _watch_resources():
                 flags.add("resource_unobserved")
                 return
             try:
+                for code in local_codes:
+                    if get_local_events(tool, code) != monitoring.events.INSTRUCTION:
+                        flags.add("resource_unobserved")
+                    set_local_events(tool, code, 0)
                 if get_events(tool) != mask:
                     flags.add("resource_unobserved")
                 set_events(tool, 0)
@@ -678,14 +737,30 @@ def _watch_resources():
             flags.add("resource_unobserved")
 
     try:
+        if mapping_reads or audit_code:
+            # Replaced code metadata could hide a receiver from the source-bound instruction observer.
+            sys.addaudithook(code_changed)
+            sys.audit("tharkun.mapping_observer")
+            if not audit_seen[0]:
+                flags.add("resource_unobserved")
+            audit_active[0] = True
         monitoring = sys.monitoring
         get_tool, get_events = monitoring.get_tool, monitoring.get_events
         set_events, register, free = monitoring.set_events, monitoring.register_callback, monitoring.free_tool_id
+        get_local_events, set_local_events = monitoring.get_local_events, monitoring.set_local_events
         # HANDLED sees caught limits; UNWIND sees limits leaving a frame.
         callbacks = {monitoring.events.EXCEPTION_HANDLED: raised, monitoring.events.PY_UNWIND: raised}
+        if mapping_reads:
+            def arm(code):
+                local_codes.append(code)
+                set_local_events(tool, code, monitoring.events.INSTRUCTION)
+            started, instruction = _mapping_observer(mapping_reads, flags, arm)
+            callbacks[monitoring.events.PY_START] = started
+            callbacks[monitoring.events.INSTRUCTION] = instruction
         mask = 0
         for event in callbacks:
-            mask |= event
+            if event != monitoring.events.INSTRUCTION:
+                mask |= event
         # Use only an unclaimed tool; never reset another observer's events.
         for candidate in (4, 3, 5, 2, 1, 0):
             try:
@@ -705,7 +780,217 @@ def _watch_resources():
     return restore
 
 
-def run_as_main(code, mod: types.ModuleType) -> None:
+def _same_native_code(actual, expected):
+    """Compare executable constants and all source/frame metadata, including nested code."""
+    pending = [(actual, expected)]
+    while pending:
+        left, right = pending.pop()
+        if _TYPE(left) is not _CODE_TYPE or _TYPE(right) is not _CODE_TYPE:
+            return False
+        # CPython code equality omits filename/qualname and frame layout.
+        if left != right or (
+                left.co_filename, left.co_qualname, left.co_stacksize, left.co_nlocals,
+                left.co_varnames, left.co_freevars, left.co_cellvars) != (
+                right.co_filename, right.co_qualname, right.co_stacksize, right.co_nlocals,
+                right.co_varnames, right.co_freevars, right.co_cellvars):
+            return False
+        pending.extend((a, b) for a, b in zip(left.co_consts, right.co_consts) if _TYPE(a) is _CODE_TYPE)
+    return True
+
+
+def _mapping_observer(reads, flags, arm):
+    """Check the actual receiver of each runtime-admitted comprehension mapping before LOAD_ATTR, and of each recorded
+    ``vars(name)`` / ``getattr(name, ...)`` call before CALL (an entry ``(callee, receiver, scope)``,
+    ``environment.orig_argv_reason``'s ``observed``): the callee must be the very builtin, else nothing is read; the
+    receiver must not be a module (scope ``"module"``) or ``sys`` itself (scope ``"sys"``).
+    A ``"format"`` entry checks the exact string receiver before LOAD_ATTR saves its bound method."""
+    instructions = {}
+    files = {location[0] for location in reads}
+    missing = object()
+    module_type = types.ModuleType
+    identity = id
+    enumerate_positions = enumerate
+    base_exception = BaseException
+    load_attr, call_op = _LOAD_ATTR, _CALL
+    value_type, type_mro = _TYPE, _TYPE_MRO
+    getframe = _GETFRAME
+    real_vars, real_getattr, real_sys = _VARS, _GETATTR, _sys
+    code_builtins = {"exec": _EXEC, "eval": _EVAL, "compile": _COMPILE}
+    string_types = (str, bytes)
+    string_type = str
+    is_tuple = tuple
+    local_types = (dict, value_type(getframe().f_locals))
+    # Compile inspected alternatives before any target code can install observers or compiler hooks.
+    compiled = {item: _COMPILE(item[0], item[1], item[2], dont_inherit=True)
+                for entry in reads.values() if value_type(entry) is is_tuple and len(entry) == 4 and entry[2] == "code"
+                for item in entry[3] if value_type(item) is is_tuple}
+
+
+    def lookup(frame, name):
+        local = frame.f_locals
+        if value_type(local) not in local_types:
+            flags.add("import_state_unmodelled")  # custom class namespaces can change a value on every read
+            return missing
+        if name in local:
+            return local[name]
+        value = frame.f_globals.get(name, missing)
+        return frame.f_builtins.get(name, missing) if value is missing else value
+
+    type_dict = value_type.__dict__["__dict__"].__get__
+    object_getattribute = object.__getattribute__
+    formatter_parser, field_split = _string.formatter_parser, _string.formatter_field_name_split
+
+    def plain_attribute(obj, attribute):
+        """``obj.attribute`` when reading it runs no program code (an ordinary instance-dict entry or a class value no
+        descriptor wraps, on a type that keeps ``object.__getattribute__``), else ``missing``."""
+        try:
+            found = missing
+            for base in type_mro(value_type(obj)):
+                entries = type_dict(base)
+                if "__getattribute__" in entries and base is not object:
+                    return missing
+                if found is missing and attribute in entries:
+                    found = entries[attribute]
+            if found is not missing:
+                for base in type_mro(value_type(found)):
+                    entries = type_dict(base)
+                    if "__get__" in entries or "__set__" in entries or "__delete__" in entries:
+                        return missing
+            held = object_getattribute(obj, "__dict__")
+            if value_type(held) is not dict:
+                return missing
+            return held[attribute] if attribute in held else found
+        except base_exception:
+            return missing
+
+    def reflective_template(text):
+        """Does this ACTUAL ``str.format`` template select a reflective attribute (``{0.__globals__[_State]}``), or fail
+        to parse?  (the same rule as ``environment._format_selector_reason``, on C parsers the program cannot patch)"""
+        pending = [text]
+        try:
+            while pending:
+                for _, field, spec, _ in formatter_parser(pending.pop()):
+                    if field is not None:
+                        for is_attribute, name in field_split(field)[1]:
+                            if is_attribute and reflective_field_attribute(name):
+                                return True
+                        if spec:
+                            pending.append(spec)
+        except ValueError:
+            return True
+        return False
+
+    def started(code, offset):
+        if code.co_filename not in files:
+            return
+        try:
+            key = identity(code)
+            if key not in instructions:
+                sites = {}
+                instructions[key] = (code, sites)
+                path = code.co_filename
+                if path in files:
+                    positioned = False
+                    for word, position in enumerate_positions(code.co_positions()):
+                        positioned = True
+                        site_offset = word * 2
+                        op = code.co_code[site_offset]
+                        if op == call_op:
+                            name = reads.get((path, *position))
+                            if value_type(name) is is_tuple and not (len(name) == 4 and name[2] == 'format'):
+                                sites[site_offset] = name
+                            continue
+                        if op != load_attr:
+                            continue
+                        if "__dict__" in code.co_names and (position[0] is None or position[2] is None):
+                            flags.add("import_state_unmodelled")
+                        name = reads.get((path, *position))
+                        if name is not None and (value_type(name) is not is_tuple or (
+                                len(name) == 4 and name[2] == 'format')):
+                            sites[site_offset] = name
+                    if not positioned and "__dict__" in code.co_names:
+                        flags.add("import_state_unmodelled")
+                if sites:
+                    arm(code)
+        except base_exception:
+            flags.add("import_state_unmodelled")
+
+    def observe(code, offset):
+        try:
+            key = identity(code)
+            sites = instructions[key][1]
+            if offset not in sites:
+                return
+            name = sites[offset]
+            frame = getframe(1)
+            if name is None or frame.f_code is not code:
+                flags.add("import_state_unmodelled")
+                return
+            if value_type(name) is is_tuple:
+                if len(name) == 4 and name[2] == 'format':
+                    path = name[0]
+                    receiver = lookup(frame, path) if value_type(path) is string_type else lookup(frame, path[0])
+                    if value_type(path) is is_tuple:
+                        for attribute in path[1:]:
+                            receiver = plain_attribute(receiver, attribute)
+                    # name[3] is None: an open template (``self.text.format``) -- its ACTUAL text must not select a
+                    # reflective attribute; a tuple: the scanned alternatives.
+                    if value_type(receiver) is not string_type or (
+                            reflective_template(receiver) if name[3] is None else receiver not in name[3]):
+                        flags.add('import_state_unmodelled')
+                    return
+                if len(name) == 4 and name[2] == "attribute":
+                    callee, receiver, attribute = lookup(frame, name[0]), lookup(frame, name[1]), lookup(frame, name[3])
+                    if callee is real_getattr:
+                        if receiver is real_sys:
+                            flags.add("import_state_unmodelled")
+                        elif value_type(attribute) is string_type:
+                            if attribute == "__dict__":
+                                if module_type in type_mro(value_type(receiver)):
+                                    flags.add("import_state_unmodelled")
+                            elif reflective_field_attribute(attribute):
+                                flags.add("import_state_unmodelled")
+                        elif string_type in type_mro(value_type(attribute)):
+                            flags.add("import_state_unmodelled")
+                    return
+                if len(name) == 4 and name[2] == "code":
+                    callee = lookup(frame, name[0])
+                    source = lookup(frame, name[1]) if name[1] is not None else name[3][0]
+                    matches = (source in name[3] if value_type(source) in string_types else
+                               value_type(source) is _CODE_TYPE and any(
+                                   _same_native_code(source, compiled[item]) for item in name[3]
+                                   if value_type(item) is is_tuple))
+                    if callee is not code_builtins[name[0]] or not matches:
+                        flags.add("import_state_unmodelled")
+                    return
+                callee, receiver = lookup(frame, name[0]), lookup(frame, name[1])
+                if callee is missing or receiver is missing:
+                    flags.add("import_state_unmodelled")
+                elif callee is not real_vars and callee is not real_getattr:
+                    return                                  # the program calls something else: nothing reflective
+                elif name[2] == "sys":
+                    if receiver is real_sys:
+                        flags.add("import_state_unmodelled")
+                else:
+                    for base in type_mro(value_type(receiver)):
+                        if base is module_type:
+                            flags.add("import_state_unmodelled")
+                            break
+                return
+            value = lookup(frame, name)
+            if value is missing:
+                flags.add("import_state_unmodelled")
+            else:
+                for base in type_mro(value_type(value)):
+                    if base is module_type:
+                        flags.add("import_state_unmodelled")
+                        break
+        except base_exception:
+            flags.add("import_state_unmodelled")
+    return started, observe
+
+
+def run_as_main(code, mod: types.ModuleType, *, mapping_reads=(), audit_code=False) -> None:
     """Execute ``code`` in ``mod`` (a :func:`native_main_module`) at NATIVE recursion depth.
 
     The program's module frame is the first Python frame of ``python program`` (depth 1); here it sits on top of this
@@ -729,7 +1014,7 @@ def run_as_main(code, mod: types.ModuleType) -> None:
 
     real_set(base + depth)
     sys.getrecursionlimit, sys.setrecursionlimit = getrecursionlimit, setrecursionlimit
-    restore_resources = _watch_resources()
+    restore_resources = _watch_resources(mapping_reads, audit_code)
     try:
         exec(code, mod.__dict__)
     finally:
@@ -865,6 +1150,178 @@ def _observe_fields(namespace, demands):
     return samples
 
 
+def evict_import_cache(startup) -> None:
+    """Make ``sys.modules`` the native startup set before the target runs ([internal ref]).
+
+    This child is a model process: it imported its own modules (``json``, ``traceback``, ``environment``, ...) before any
+    target code runs, so a target that reads the import cache sees what ``python program.py`` never would.  Every module
+    that is not in ``startup``, not model-held and not a C extension is dropped, so the target's next ``import`` executes
+    the source again.  Model-held: an owner of a patched attribute (``environment._patched_attributes``: the file and
+    spawn model), ``random`` (the draw model), ``_sv_verifier`` and ``_posixsubprocess``.  A builtin, frozen or
+    single-phase extension module stays: re-importing it yields the same object, and its state is never the target's.
+    """
+    held = {owner.__name__ for owner, _ in _patched_attributes()}
+    held.update(("random", "_sv_verifier", "_posixsubprocess", "__main__"))
+    for name, module in list(sys.modules.items()):
+        origin = getattr(getattr(module, "__spec__", None), "origin", None)
+        if name in startup or name in held or not (isinstance(origin, str) and origin.endswith(".py")):
+            continue
+        del sys.modules[name]
+
+
+def _watch_line(program, target):
+    """Observe the original entry call from the replay harness, excluding import-time calls ([internal ref])."""
+    monitoring = sys.monitoring
+    path, entry, line = target["path"], target["entry"], target["line"]
+    root, reached, pending, stores = None, False, False, set()
+    raising_offsets, selected_error, handled_error = set(), None, None
+    raising_frames = set()
+    selected_class = (getattr(builtins, target["raise_site"]["class"], None)
+                      if target.get("raise_site") else None)
+    observed_codes = set()
+    owner, tool = "tharkun.inputs.through", None
+
+    def matches(code, identity):
+        return (code.co_code.hex() == identity["code"] and code.co_linetable.hex() == identity["lines"]
+                and list(code.co_varnames) == identity["varnames"] and list(code.co_cellvars) == identity["cellvars"]
+                and list(code.co_freevars) == identity["freevars"] and code.co_firstlineno == identity["first_line"])
+
+    def in_root(frame):
+        while frame is not None:
+            if frame is root:
+                return True
+            frame = frame.f_back
+        return False
+
+    def start(code, offset):
+        nonlocal root, reached, pending, stores, raising_offsets, selected_error, handled_error, selected_class
+        frame = _GETFRAME(1)
+        if (root is None and code.co_filename == path and code.co_qualname == entry
+                and frame.f_back is not None and frame.f_back.f_code.co_filename == program
+                and (not target.get("caller") or frame.f_back.f_code.co_name == target["caller"])):
+            root, reached, pending = frame, False, False
+            selected_error = None
+            handled_error = None
+            raising_frames.clear()
+            if target.get("local") or target.get("raise_site"):
+                # Disassembly is request data from the parent, before any target import can replace dis helpers.
+                unchanged = matches(code, target)
+                raising_offsets = set(target["raise_site"]["offsets"]) if unchanged and target.get("raise_site") else set()
+                stores = set(target["stores"]) if unchanged and target.get("local") else set()
+                if target.get("raise_site", {}).get("kind") == "raise":
+                    label = target["raise_site"]["class"]
+                    cls = frame.f_globals.get(label, _BUILTIN_CLASSES.get(label))
+                    selected_class = cls if isinstance(cls, type) and issubclass(cls, BaseException) else None
+            if target.get("local"):
+                monitoring.set_local_events(tool, code, monitoring.events.INSTRUCTION)
+                observed_codes.add(code)
+        selected = target.get("raise_site")
+        if (root is not None and selected and code.co_filename == path and code.co_qualname == selected["function"]
+                and in_root(frame) and matches(code, selected)):
+            raising_frames.add(id(frame))
+
+    def visited(code, lineno):
+        nonlocal reached
+        if root is not None and code.co_filename == path and lineno == line:
+            if not target.get("raise_site") or (_GETFRAME(1) is root and selected_error is not None
+                                                and handled_error is selected_error):
+                reached = True
+
+    def instruction(code, offset):
+        nonlocal pending
+        if _GETFRAME(1) is root:
+            capture()
+            pending = offset in stores
+
+    def capture():
+        nonlocal reached, pending
+        if pending:
+            pending = False
+            try:
+                value = root.f_locals[target["local"]]
+                at_site = not target.get("raise_site") or (selected_error is not None and handled_error is selected_error)
+                reached = (at_site and bool(root.f_back.f_globals[target["predicate"]](value))) or reached
+            except Exception:
+                pass                            # a missing local or failed comparison is no observation
+
+    def end(code, offset, value):
+        nonlocal root
+        frame = _GETFRAME(1)
+        raising_frames.discard(id(frame))
+        if frame is root:
+            capture()
+            root = None
+
+    def raised(code, offset, exception):
+        nonlocal pending, selected_error, reached
+        frame = _GETFRAME(1)
+        if frame is root:
+            pending = False                     # an assignment whose RHS raised never produced a local
+        if (id(frame) in raising_frames and in_root(frame) and offset in raising_offsets
+                and type(exception) is selected_class):
+            selected_error = exception
+            if target.get("exception_predicate"):
+                try:
+                    reached = bool(root.f_back.f_globals[target["exception_predicate"]](exception.args)) or reached
+                except Exception:
+                    pass  # A failed argument comparison is no native exception observation.
+
+    def handled(code, offset, exception):
+        nonlocal handled_error, pending
+        if _GETFRAME(1) is root:
+            pending = False
+            handled_error = exception
+
+    def unwind(code, offset, exception):
+        nonlocal root, pending
+        frame = _GETFRAME(1)
+        raising_frames.discard(id(frame))
+        if frame is root:
+            root, pending = None, False
+
+    callbacks = {monitoring.events.PY_START: start, monitoring.events.LINE: visited,
+                 monitoring.events.PY_RETURN: end, monitoring.events.PY_UNWIND: end}
+    if target.get("local"):
+        del callbacks[monitoring.events.LINE]
+        callbacks[monitoring.events.INSTRUCTION] = instruction
+        callbacks[monitoring.events.RAISE] = raised
+        callbacks[monitoring.events.EXCEPTION_HANDLED] = raised
+        callbacks[monitoring.events.PY_UNWIND] = unwind
+    if target.get("raise_site"):
+        callbacks[monitoring.events.RAISE] = raised
+        callbacks[monitoring.events.EXCEPTION_HANDLED] = handled
+    mask = 0
+    for event in callbacks:
+        if event != monitoring.events.INSTRUCTION:
+            mask |= event
+    for candidate in (4, 3, 5, 2, 1, 0):
+        try:
+            monitoring.use_tool_id(candidate, owner)
+            tool = candidate
+            break
+        except ValueError:
+            continue
+    if tool is not None:
+        for event, callback in callbacks.items():
+            monitoring.register_callback(tool, event, callback)
+        monitoring.set_events(tool, mask)
+
+    def finish():
+        if tool is None or monitoring.get_tool(tool) != owner:
+            return False
+        observed = monitoring.get_events(tool) == mask
+        monitoring.set_events(tool, 0)
+        for code in observed_codes:
+            observed = (monitoring.get_local_events(tool, code) == monitoring.events.INSTRUCTION) and observed
+            monitoring.set_local_events(tool, code, 0)
+        for event, callback in callbacks.items():
+            observed = (monitoring.register_callback(tool, event, None) is callback) and observed
+        monitoring.free_tool_id(tool)
+        return reached and observed
+
+    return finish
+
+
 def run(req):
     """Run one request in a disposable child; installed guards remain until exit."""
     program = os.path.abspath(req["program"])
@@ -878,88 +1335,140 @@ def run(req):
     # the same process -- see avengers_seed.py's _sv_verifier_stub_on_path,
     # which crashes on exactly this kind of leftover).
     old_sv = sys.modules.get("_sv_verifier")
-    sys.modules["_sv_verifier"] = _make_sv_verifier()
-    _patch_random()
-    _patch_clock()
-    watch_threads()
-    native_sys_path(program)
-    watch_imports()
+    if not req.get("native"):
+        sys.modules["_sv_verifier"] = _make_sv_verifier()
     saved_main = sys.modules.get("__main__")
     res = {"status": "clean"}
     namespace = None
+    finish_line = None
+    finish_invariants = None
+    if req.get("observe_invariants"):
+        here = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, here)
+        try:
+            from _invariant_observer import watch as watch_invariants
+        finally:
+            sys.path.remove(here)
+    # svaudit 2026-10-29: an exception before the program's own code starts is the harness's, not the
+    # program's ending -- such a run is "crashed", never a complete execution (a TRUE) or a violation
+    started = False
     try:
         with open(program, "rb") as fh:
             source = fh.read()
-        # No stand-in for sys.stdin, ever ([internal ref] owner ruling): a dynamic wrapper
-        # broke .mode/identity/type for target code that checks any of those. A
-        # static, conservative pre-scan flags "stdin touched" (same effect on the
-        # TRUE-disqualifying flags set) without touching the real object at all.
-        if references_stdin(source):
-            _State.flags.add("stdin")
-        if native_import_reason(source, program):
-            _State.flags.add("import_state_unmodelled")
-        if references_stack(source):
-            _State.flags.add("stack_unmodelled")
-        if not isinstance(_State.vector, list) or any(
-                not isinstance(e, dict) or "kind" not in e or "value" not in e
-                for e in _State.vector):
-            _State.flags.add("invalid_draw")
-        if "invalid_draw" in _State.flags:
-            res = {"status": "invalid-draw"}
+        if req.get("native"):
+            if req.get("vector") or req.get("box") or req.get("world") or req.get("observe_line"):
+                raise ValueError("native observation replay does not accept execution models")
+            native_sys_path(program)
+            sys.argv = [program]
+            mod = native_main_module(program)
+            sys.modules["__main__"] = mod
+            namespace = mod.__dict__
+            code = compile(source, program, "exec", dont_inherit=True)
+            started = True
+            run_as_main(code, mod)
         else:
-            argv = initial_argv(program, source)
+            # The generated flat helper declares its metadata preparation before target roots or execution models.
+            if b"tharkun.avengers.flatting" in source:
+                import ast
+                tree = ast.parse(source, filename=program)
+                if any(isinstance(node, ast.ImportFrom) and node.module == "tharkun.avengers.flatting"
+                       and any(name.name == "flat_observation" for name in node.names) for node in tree.body):
+                    preload_infrastructure()
+            _patch_random()
+            _patch_clock()
+            watch_threads()
+            native_sys_path(program)
+            watch_imports()
+            # No stand-in for sys.stdin, ever ([internal ref] owner ruling): a dynamic wrapper
+            # broke .mode/identity/type for target code that checks any of those. A
+            # static, conservative pre-scan flags "stdin touched" (same effect on the
+            # TRUE-disqualifying flags set) without touching the real object at all.
+            if references_stdin(source):
+                _State.flags.add("stdin")
+            # [internal ref]: a static-tier reason is what the native-equivalent child below can execute; only what eviction cannot
+            # repair (a runtime-tier reason) makes this run useless as a witness
+            observing = native_import_reason(source, program)
+            mapping_reads = {}
+            if observing and native_import_reason(source, program, runtime=True, mapping_reads=mapping_reads):
+                _State.flags.add("import_state_unmodelled")
+            if references_stack(source, filename=program, observed=mapping_reads):
+                _State.flags.add("stack_unmodelled")
+            if not isinstance(_State.vector, list) or any(
+                    not isinstance(e, dict) or "kind" not in e or "value" not in e
+                    for e in _State.vector):
+                _State.flags.add("invalid_draw")
             if "invalid_draw" in _State.flags:
                 res = {"status": "invalid-draw"}
             else:
-                if "files" in req:
-                    install_files(req["files"], os.getcwd(), _State.flags)
-                    refuse_threads(_State.flags)
-                # Keep sys.argv a plain list; initial_argv copied and recorded
-                # its original value before any target mutation.
-                # sys.orig_argv ([internal ref], MG review 2026-09-29): real, UNMODELLED CPython
-                # interpreter metadata -- reflects how THIS interpreter process was
-                # actually launched (a fresh subprocess vs. a reused forked "explore"
-                # worker give genuinely DIFFERENT values, since fork() never re-execs;
-                # neither is the real application's argv). _child.py never sets or
-                # could soundly set it. Flagged like stdin/argv (a static, conservative
-                # source scan, never a stand-in object) so a target that reads it can
-                # never contribute a FALSE (unlike plain argv, this channel is not
-                # modelled/replayable at all, not just untyped -- see
-                # Outcome.violated()'s exclusion for the same reasoning file_unmodelled
-                # already gets) or a TRUE (proof_blocker, environment.py).
-                if b"orig_argv" in source:
-                    _State.flags.add("orig_argv")
-                sys.argv = argv
-                # the program runs as ``python program`` runs it (``native_main_module``, ``run_as_main``): not through
-                # ``runpy.run_path``, whose ``__main__`` has ``__package__ == ''``, no loader, a builtins dict, five extra
-                # frames against the recursion limit and a read-and-write of ``sys.argv[0]`` of its own
-                code = compile(source, program, "exec", dont_inherit=True)
-                mod = native_main_module(program)
-                sys.modules["__main__"] = mod
-                namespace = mod.__dict__
-                run_as_main(code, mod)
+                argv = initial_argv(program, source)
+                if "invalid_draw" in _State.flags:
+                    res = {"status": "invalid-draw"}
+                else:
+                    if "files" in req:
+                        install_files(req["files"], os.getcwd(), _State.flags, box=bool(req.get("box")),
+                                      **({"world": req["world"]} if "world" in req else {}))
+                        refuse_threads(_State.flags)
+                        if req.get("box") and references_stdin(source) and stdin_bytes(req.get("world")) is not None:
+                            world_record().touch("stdin", req["world"]["stdin"])
+                    # Keep sys.argv a plain list; initial_argv copied and recorded
+                    # its original value before any target mutation.
+                    # sys.orig_argv ([internal ref]; owner, 2026-10-29 audit): the competition's model sets argv
+                    # in-process and does not define orig_argv -- here it is THIS interpreter's launch line
+                    # (a fresh subprocess and a forked worker even differ) -- so code that reads it, by any
+                    # spelling, is never a witness (Outcome.violated()) nor a TRUE (proof_blocker).  The
+                    # scan reads the code only (environment.orig_argv_reason: never a comment or data);
+                    # the reads it cannot follow by name -- name.__dict__, vars(name), getattr(name, ...)
+                    # -- are checked by object right before they run (mapping_reads, _mapping_observer).
+                    if orig_argv_reason(source, program, observed=mapping_reads):
+                        _State.flags.add("orig_argv")
+                    sys.argv = argv
+                    if observing:
+                        evict_import_cache(NATIVE_STARTUP or _STARTUP_MODULES)
+                    # the program runs as ``python program`` runs it (``native_main_module``, ``run_as_main``): not through
+                    # ``runpy.run_path``, whose ``__main__`` has ``__package__ == ''``, no loader, a builtins dict, five extra
+                    # frames against the recursion limit and a read-and-write of ``sys.argv[0]`` of its own
+                    code = compile(source, program, "exec", dont_inherit=True)
+                    if mapping_reads and not observable(code, mapping_reads):
+                        _State.flags.add("import_state_unmodelled")
+                    mod = native_main_module(program)
+                    sys.modules["__main__"] = mod
+                    namespace = mod.__dict__
+                    if req.get("observe_line"):
+                        finish_line = _watch_line(program, req["observe_line"])
+                    if req.get("observe_invariants"):
+                        finish_invariants = watch_invariants(program, req["observe_invariants"])
+                    started = True
+                    run_as_main(code, mod, mapping_reads=mapping_reads, audit_code=True)
     except SystemExit as e:
-        res = {"status": "exit", "code": repr(e.code)}
+        res = ({"status": "exit", "code": repr(e.code)} if started else
+               {"status": "crashed", "msg": f"before the program started: SystemExit {e.code!r}"})
     except BaseException as e:  # noqa: BLE001 -- classifying how the program ended is the point
-        # [internal ref] hardening (MG review of PR 115, 2026-09-29): only .filename/.lineno/.name
-        # are read below, never .line (the source text) -- so lookup_lines=False, which
-        # skips linecache entirely (the plain traceback.extract_tb(tb) equivalent looks
-        # up every frame's source line eagerly via linecache.checkcache/updatecache,
-        # which os.stat()s each frame's file -- including one outside any declared file
-        # or infrastructure root -- and used to need its own exemption in
-        # environment.py's sandbox). Not needing that exemption at all is safer than
-        # granting it: a target that imports linecache itself and calls it directly on
-        # an arbitrary path is correctly still refused/flagged like any other
-        # undeclared read.
-        frames = traceback.StackSummary.extract(traceback.walk_tb(e.__traceback__), lookup_lines=False)
-        pdir = os.path.dirname(program)
-        user = [f for f in frames if os.path.abspath(f.filename).startswith(pdir)]
-        f = (user or frames or [None])[-1]
-        res = {"status": "raised", "exc": type(e).__name__,
-               "mro": exception_mro(e), "msg": str(e)[:300],
-               "site": ({"file": os.path.basename(f.filename), "line": f.lineno,
-                         "function": f.name} if f is not None else None)}
+        if not started:
+            res = {"status": "crashed", "msg": f"before the program started: {type(e).__name__}: {e}"[:300]}
+        else:
+            # [internal ref] hardening (MG review of PR 115, 2026-09-29): only .filename/.lineno/.name
+            # are read below, never .line (the source text) -- so lookup_lines=False, which
+            # skips linecache entirely (the plain traceback.extract_tb(tb) equivalent looks
+            # up every frame's source line eagerly via linecache.checkcache/updatecache,
+            # which os.stat()s each frame's file -- including one outside any declared file
+            # or infrastructure root -- and used to need its own exemption in
+            # environment.py's sandbox). Not needing that exemption at all is safer than
+            # granting it: a target that imports linecache itself and calls it directly on
+            # an arbitrary path is correctly still refused/flagged like any other
+            # undeclared read.
+            frames = traceback.StackSummary.extract(traceback.walk_tb(e.__traceback__), lookup_lines=False)
+            pdir = os.path.dirname(program)
+            user = [f for f in frames if os.path.abspath(f.filename).startswith(pdir)]
+            f = (user or frames or [None])[-1]
+            res = {"status": "raised", "exc": type(e).__name__,
+                   "mro": exception_mro(e), "msg": str(e)[:(2**20 if req.get("native") else 300)],
+                   "site": ({"file": os.path.basename(f.filename), "line": f.lineno,
+                             "function": f.name} if f is not None else None)}
     finally:
+        if finish_invariants is not None:
+            res["observations"] = finish_invariants()
+        if finish_line is not None:
+            res["reached"] = finish_line()
         if saved_main is None:
             sys.modules.pop("__main__", None)
         else:
@@ -978,6 +1487,13 @@ def run(req):
     res["flags"] = sorted(_State.flags)
     res["invalid_draw"] = bool(_State.invalid_draw or "invalid_draw" in _State.flags)
     res["absent_imports"] = still_absent_imports()
+    world = world_record()
+    if world is not None:
+        if req.get("box") and stdin_bytes(req.get("world")) is not None:
+            # Imported code can read fd 0 even when the main source never names stdin.
+            if not any(path == "stdin" for path, _ in world.entries()) and os.lseek(0, 0, os.SEEK_CUR) > 0:
+                world.touch("stdin", req["world"]["stdin"])
+        res["world"] = world.entries()
     return res
 
 

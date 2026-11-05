@@ -84,6 +84,11 @@ def parse_imports(source_path: str) -> dict[str, str]:
     Imports nested inside ``with`` / ``try`` blocks count: every Atheris harness writes
     ``with atheris.instrument_imports(): from pkg import mod``, so scanning only
     top-level statements missed the imports that matter most.
+
+    So do imports under ``if`` ([internal ref]): ``if TYPE_CHECKING:`` and the Python-2-era ``if False:`` are where code
+    that names its types only in annotations or ``# type:`` comments imports them (flake8 3.9's
+    ``from flake8.style_guide import Violation``), so a class named that way was "not found in any module the
+    file imports".  Both arms of an ``if`` are read; a later import of a name wins, as in a ``try`` / ``except``.
     """
     rp = os.path.realpath(source_path)
     from_dir = os.path.dirname(rp)
@@ -98,7 +103,7 @@ def parse_imports(source_path: str) -> dict[str, str]:
         for node in ast.iter_child_nodes(root):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 yield node
-            elif isinstance(node, (ast.With, ast.AsyncWith, ast.Try)):
+            elif isinstance(node, (ast.With, ast.AsyncWith, ast.Try, ast.If)):
                 yield from _import_stmts(node)
 
     result: dict[str, str] = {}
@@ -159,32 +164,74 @@ def load_function_def(
         tree = ast.parse(source)
     except (OSError, SyntaxError):
         return None
+    return find_function_def(tree, name)[0]
 
+
+def find_function_def(
+    tree: ast.Module,
+    name: str,
+) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef | None, ast.ClassDef | None]:
+    """``(def, its class or None)`` for *name* in *tree*, by :func:`load_function_def`'s rule.
+
+    A top-level function, or a method one level deep named ``method`` or
+    ``Class.method``; the first match in source order wins.
+    """
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.name == name:
-                return node
+                return node, None
         elif isinstance(node, ast.ClassDef):
             for child in node.body:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if child.name == name or f"{node.name}.{child.name}" == name:
-                        return child
-    return None
+                        return child, node
+    return None, None
+
+
+def parse_with_type_comments(source: str) -> ast.Module | None:
+    """``ast.parse`` keeping PEP 484 type comments, or plain when they do not parse.
+
+    ``type_comments=True`` puts ``# type: (A, B) -> R`` on ``FunctionDef.type_comment``
+    and ``# type: A`` on ``arg.type_comment`` -- where code written for Python 2
+    (flake8 3.9: 181 signature comments, no annotations) keeps its types.  It also
+    makes a type comment in a position the grammar does not allow a syntax error,
+    so such a module is parsed again without them rather than lost.
+    """
+    try:
+        return ast.parse(source, type_comments=True)
+    except SyntaxError:
+        pass
+    try:
+        return ast.parse(source)
+    except SyntaxError:
+        return None
 
 
 def load_class_def(
     module_path: str,
     name: str,
 ) -> ast.ClassDef | None:
-    """Load a class definition by *name* from *module_path*."""
+    """Load a class definition by *name* from *module_path*.
+
+    *name* may be a dotted qualified name for a class nested in another class's
+    body (``ProgressBarManager.Proxy``, ``LazyList.LazyListIterator``): each part
+    is looked up in the previous class's body, never anywhere else, so a leaf
+    name that repeats elsewhere in the module cannot be picked by mistake.
+    """
     rp = os.path.realpath(module_path)
     try:
         source = Path(rp).read_text(encoding="utf-8", errors="ignore")
-        tree = ast.parse(source)
-    except (OSError, SyntaxError):
+    except OSError:
+        return None
+    tree = parse_with_type_comments(source)
+    if tree is None:
         return None
 
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef) and node.name == name:
-            return node
-    return None
+    body = tree.body
+    found: ast.ClassDef | None = None
+    for part in name.split("."):
+        found = next((node for node in body if isinstance(node, ast.ClassDef) and node.name == part), None)
+        if found is None:
+            return None
+        body = found.body
+    return found

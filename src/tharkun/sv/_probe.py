@@ -31,6 +31,7 @@ snapshot rather than guessing; a refused snapshot is never "equal".
 """
 
 import ast
+from _io import StringIO as _StringIO, BytesIO as _BytesIO
 import builtins
 import hashlib
 import importlib.machinery
@@ -139,6 +140,10 @@ class _QAbs(int):
 
 
 class _QInt(int):
+
+    def __mod__(self, m):          # ``d % M`` of a quotient draw (drawflow: reaches the program only through the residue)
+        _P.moduli[self.index] = (type(m).__name__, m if isinstance(m, int) else repr(m))
+        return int(self) % m
 
     def __abs__(self):
         a = _QAbs(abs(int(self)))
@@ -366,11 +371,13 @@ def snapshot(frame, dead) -> str:
             tok(f"array {x.typecode}")
             push_seq([O(x.tolist())])
         elif _is_stringio(x):
+            tok("bytesio" if t is _BytesIO else "stringio")
             if x.closed:
-                tok("stringio closed")
+                push_seq([T("closed"), O(x.__dict__)])
             else:
-                tok(f"stringio {x.tell()}")
-                push_seq([O(x.getvalue())])
+                # Native state includes cursor, newline mode and attributes, without an address.
+                state = (_BytesIO.__getstate__(x) if t is _BytesIO else _StringIO.__getstate__(x))
+                push_seq([O(state)])
         else:
             raise Refused(f"object of type {t.__module__}.{t.__qualname__}")
     return h.hexdigest()
@@ -392,8 +399,7 @@ def _is_array(x):
 
 
 def _is_stringio(x):
-    m = sys.modules.get("io")
-    return m is not None and type(x) is m.StringIO
+    return type(x) is _StringIO or type(x) is _BytesIO
 
 
 # --- the loop wrapper ------------------------------------------------------------

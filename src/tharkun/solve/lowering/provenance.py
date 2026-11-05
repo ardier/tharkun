@@ -34,6 +34,8 @@ Path = Tuple[Tuple[str, Optional[int]], ...]
 
 PATH_ATTR = "_lw_path"
 ROLE_ATTR = "_lw_role"
+# A code-unit path distinguishes allocations while reporting at the outer source call.
+EVAL_SITE_ATTR = "_lw_eval_site"
 
 
 @dataclass(frozen=True)

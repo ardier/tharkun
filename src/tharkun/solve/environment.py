@@ -21,7 +21,52 @@ import sys
 import itertools
 import tempfile
 import threading
+import types
 from dataclasses import dataclass
+
+
+def boxed_home() -> dict[str, str]:
+    """Stable HOME/XDG paths for a disposable mocked execution."""
+    return {"HOME": BOX_HOME, "XDG_CONFIG_HOME": BOX_HOME + "/.config",
+            "XDG_DATA_HOME": BOX_HOME + "/.local/share", "XDG_CACHE_HOME": BOX_HOME + "/.cache",
+            "XDG_STATE_HOME": BOX_HOME + "/.local/state"}
+
+
+def stdin_bytes(world):
+    """The boxed stdin stream's bytes, or None (ordinary SV still uses DEVNULL)."""
+    objects = world.objects if hasattr(world, "objects") else (world or {})
+    obj = objects.get("stdin")
+    if obj is None or (obj.kind if hasattr(obj, "kind") else obj.get("kind")) != "stream":
+        return None
+    if hasattr(obj, "concrete"):
+        return obj.concrete
+    if "content_base64" in obj:
+        import base64
+        return base64.b64decode(obj["content_base64"], validate=True)
+    return obj["content"].encode("utf-8")
+
+
+@contextlib.contextmanager
+def feed_stdin(data):
+    """Feed bytes through the real fd 0; never replace sys.stdin or sys.__stdin__."""
+    if data is None:
+        yield
+        return
+    with tempfile.TemporaryFile() as source:
+        source.write(data)
+        source.seek(0)
+        previous = os.dup(0)
+        try:
+            os.dup2(source.fileno(), 0)
+            sys.stdin.seek(0)  # Discard buffered bytes from an earlier boxed input.
+            yield
+        finally:
+            os.dup2(previous, 0)
+            os.close(previous)
+            try:
+                sys.stdin.seek(0)
+            except (OSError, ValueError):
+                pass  # The original fd can be a pipe, restored intact.
 
 
 def subprocess_environment() -> dict[str, str]:
@@ -48,12 +93,15 @@ def subprocess_environment() -> dict[str, str]:
 # reasoning as the existing program-file/infrastructure exemptions just below, just
 # not expressible as a fixed path prefix.
 #
-# os.stat/os.listdir/os.open are NEVER affected by any of this: the loader's own
-# path probing (_path_stat, FileFinder._fill_cache, _write_atomic) calls the raw
-# posix/nt extension module directly (``import posix as _os``), never this
-# process's patched ``os`` module -- confirmed by frame instrumentation finding
-# zero calls into model_stat/model_enumerate/model_os_open for a plain
-# sys.path.insert() + import. (linecache is a SEPARATE, narrower channel onto
+# os.stat/os.listdir are NEVER affected by any of this: the loader's own path
+# probing (_path_stat, FileFinder._fill_cache) calls the raw posix/nt extension
+# module directly (``import posix as _os``), never this process's patched ``os``
+# module -- confirmed by frame instrumentation finding zero calls into
+# model_stat/model_enumerate for a plain sys.path.insert() + import.  The
+# loader's .pyc write (_write_atomic) DOES reach the model since [internal ref] patched
+# ``posix.open`` with model_os_open; it is exempted there by
+# _import_machinery_read, the same mechanical need as the reads above.
+# (linecache is a SEPARATE, narrower channel onto
 # model_stat -- its checkcache/updatecache calls the module-level ``os.stat``,
 # which DOES reach model_stat -- but the fix for that is not an exemption here:
 # _child.py's own traceback.extract_tb(e.__traceback__), the only caller inside
@@ -283,12 +331,14 @@ def _task_file_selectors(lines: list[str]) -> dict[str, list[str]]:
 class TaskEnvironment:
     files: tuple[str, ...]
     language_version: str = "3.14"
+    world: object = None
 
     @classmethod
     def from_task(cls, task: str) -> "TaskEnvironment":
         task = os.path.abspath(task)
         if not task.endswith((".yml", ".yaml")):
-            return cls((task,))
+            from tharkun.solve.extern import _task_import_closure
+            return cls(_task_import_closure(task, _packages=True) or (task,))
         with open(task, encoding="utf-8") as fh:
             lines = fh.readlines()
         try:
@@ -340,14 +390,197 @@ def argv_candidates(strings=()):
         yield ["x"] * n
 
 
-def install_files(files: tuple[str, ...] | list[str], scratch: str, flags: set[str]):
+#: modules the install-time alias sweep leaves alone: CPython's import machinery reads the disk through ``posix``
+#: itself (the module comment above), so rebinding ``posix.stat``/``open``/``listdir`` would flag every import's own
+#: path probe; and the harness -- ``__main__`` (a child script such as ``sv/_child.py``, which runs before any target
+#: code) and Tharkun's own modules, wherever installed -- keeps real primitives ON PURPOSE
+#: (``sv/_child.py::_RESULT_FILE_IO`` writes the result file outside the model).
+_ALIAS_SWEEP_SKIP = frozenset({"posix", "nt", "__main__", *_IMPORT_MACHINERY_MODULES})
+_MODULE_DICT = types.ModuleType.__dict__["__dict__"]
+
+
+def _rebind_aliases(pairs, *, interpreter_only: bool = False) -> None:
+    """Make every module-level alias of an ``old`` object in ``pairs`` the matching ``new`` one ([internal ref]).
+
+    The installers rebind each primitive on the module that owns it (``builtins.open``, ``os.stat``, ``os.remove``,
+    ...), but a module imported EARLIER that bound the same object under its own name kept the real one:
+    ``tokenize``, ``bz2`` and ``tarfile`` do ``from builtins import open as ...``, so ``tokenize.open`` and
+    ``bz2.open`` read an undeclared host file unflagged.  ``interpreter_only`` (the install direction) limits the
+    sweep to the interpreter's own modules -- the stdlib and installed packages, under ``sys.prefix`` /
+    ``sys.base_prefix``, which is where a target's libraries live -- minus :data:`_ALIAS_SWEEP_SKIP` and Tharkun: a
+    module elsewhere (the harness, a test, the program hosting an in-process :func:`confined`) keeps what it bound
+    on purpose.  The restore direction sweeps every module, since no model object may outlive its window.
+    Matched by identity, so no ``__eq__``/``__hash__`` of a target value runs, and read through the module type's
+    own ``__dict__`` slot, so a lazy module stays unloaded.  shortcut: class attributes, default arguments and
+    closures that captured a primitive are not swept (none in the stdlib), nor is a package installed in editable
+    mode outside the prefixes; upgrade when a measured target hides one there."""
+    swap = {id(old): (old, new) for old, new in pairs if old is not new}
+    if not swap:
+        return
+    roots = tuple({os.path.join(sys.prefix, ""), os.path.join(sys.base_prefix, "")})
+    for name, module in list(sys.modules.items()):
+        if not issubclass(type(module), types.ModuleType):
+            continue
+        namespace = _MODULE_DICT.__get__(module)
+        if interpreter_only:
+            path = namespace.get("__file__")
+            if (name in _ALIAS_SWEEP_SKIP or name == "tharkun" or name.startswith("tharkun.")
+                    or not isinstance(path, str) or not path.startswith(roots)):
+                continue
+        for key, value in list(namespace.items()):
+            hit = swap.get(id(value))
+            if hit is not None and hit[0] is value:
+                namespace[key] = hit[1]
+
+
+#: Standard-library modules a confined child imports BEFORE it is confined (:func:`preload_infrastructure`), a fixed list.
+#:
+#: Why this list.  Importing every public standard-library module inside ``install_files`` ([internal ref]) flags exactly one
+#: cause: ``sysconfig``'s import-time ``is_python_build()`` stats the interpreter's own directory, an undeclared path,
+#: and ``model_stat`` flags it ``file_unmodelled``.  ``ctypes``, ``pydoc``, ``trace`` and ``zoneinfo`` flag only because
+#: they import ``sysconfig``; ``platform`` reaches it from its functions (``py_obj_flatting`` records
+#: ``platform.python_version()``).  A target that imports any of them first INSIDE the confinement used to be lost as
+#: ``unmodelled`` for the interpreter's probe, not for anything the target does.  Importing them first, as trusted
+#: preparation, leaves the module cached; the target's own import then reads nothing.
+#:
+#: What it does not do.  It exempts no path and weakens no check: ``model_stat`` flags an undeclared stat exactly as
+#: before (``tests/test_environment_preload.py`` pins it), and a target that stats the interpreter directory itself is
+#: still flagged.  It is a module list, not a path list; add a module (here and in :func:`preload_infrastructure`) only with a measurement like the one above.
+INFRASTRUCTURE_MODULES = ("sysconfig", "platform")
+
+
+def preload_infrastructure() -> tuple[str, ...]:
+    """Import :data:`INFRASTRUCTURE_MODULES` now, finish ``sysconfig``'s lazy preparation, return their names.
+
+    Call it in a child BEFORE :func:`install_files` / :func:`confined`, as the Avengers worker does
+    (``avengers/_worker.py::_prepare_confinement`` and ``sv/_child.py``). The imports are spelled out, not looked up by name, because the
+    core runs no import machinery of its own (``tests/test_layering.py``); the test pins list and imports together.
+
+    ``get_config_vars()`` belongs to the same preparation ([internal ref]): the interpreter's config vars are computed LAZILY,
+    on the first ``sysconfig.get_config_var`` call wherever that happens.  With the [internal ref] metadata model in place, a
+    target's ``import zoneinfo`` (whose module init asks for ``TZPATH``) would run ``_init_config_vars`` inside the
+    window, and its ``_safe_realpath`` walk (``posixpath.realpath``) probes every ancestor of the interpreter prefix
+    with ``os.lstat`` -- undeclared paths that now flag.  Forced HERE, before the confinement, that state is already
+    computed, exactly as for the imports themselves (measured: ``tests/test_environment_preload.py``).
+    """
+    import platform  # noqa: F401
+    import sysconfig
+    sysconfig.get_config_vars()
+
+    return INFRASTRUCTURE_MODULES
+
+
+#: The stdlib modules whose whole job is turning a path into a canonical one.  ``posixpath.realpath`` walks
+#: EVERY component of the path with ``os.lstat``/``os.readlink`` (``pathlib.Path.resolve`` calls it, and the
+#: mutation confinement realpaths a mutator's path): once the [internal ref] metadata model patches those, walking a
+#: path the model does not know is a run of undeclared probes.
+_RESOLUTION_MODULES = frozenset({"posixpath", "ntpath", "pathlib"})
+
+#: The harness's own source tree (``.../src/tharkun``) with its separator: a frame whose file is under it is the
+#: harness's own code whatever name it was imported under -- the package modules, the bare-name copies a confined
+#: child imports (``environment``, ``extern``), and the files that run as ``__main__`` (``sv/_child.py``,
+#: ``avengers/_worker.py``: a script or ``-m`` launch gives them ``__name__ == "__main__"``, so a module-identity
+#: check would miss exactly the frames that must be exempted).  A target's files live in its own directory.
+_HARNESS_SOURCE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
+
+
+def _resolution_probe(frame) -> bool:
+    """True when ``frame`` (the caller of a patched metadata primitive) is the host-resolution machinery of the
+    HARNESS's own code -- ``posixpath.realpath``/``pathlib`` resolution for bookkeeping (a worker resolving the
+    program's own path: ``solve/loader.py::file_path_to_dotted_module``; the mutation confinement resolving a
+    mutator's path to catch a link out of the scratch).  That walk is not something the target observed: the
+    resolution is a mechanical need, like :func:`_import_machinery_read`, and the real functions answer -- the
+    resolution must still SEE the host (a symlinked checkout resolves the same way CPython would).  A call the
+    TARGET itself made into ``realpath`` (or ``Path.resolve``) has the target's own code as the first
+    non-resolution frame and stays modelled: its probes flag exactly as any other undeclared metadata read.
+    Identity is the frame's FILE being inside :data:`_HARNESS_SOURCE_ROOT`, never a module name (the children run
+    as ``__main__``) -- and a real target's file never lives inside the harness's own source tree."""
+    while frame is not None and frame.f_globals.get("__name__") in _RESOLUTION_MODULES:
+        frame = frame.f_back
+    if frame is None:
+        return False
+    filename = frame.f_code.co_filename
+    if not isinstance(filename, str) or filename.startswith("<"):
+        return False
+    return os.path.abspath(filename).startswith(_HARNESS_SOURCE_ROOT)
+
+
+#: The fixed, absent HOME a boxed run gets ([internal ref]): never the random scratch path -- an object built under the
+#: box (a class holding its config directory, say) must carry the same path on every host, or the same draw
+#: vector would replay to different object state elsewhere.  Set by ``sv/engine.py::run_once``'s child
+#: environment and by ``sv/_hybrid_worker.py::_install_environment``; the ``~/...`` form of a
+#: :class:`WorldRecord` path is relative to it.
+BOX_HOME = "/nonexistent/tharkun-home"
+
+#: The touch record of the installed box, one per process like the model itself (:func:`world_record`).
+_BOX_WORLD: list = [None]
+
+
+class WorldRecord:
+    """The undeclared paths a boxed run touched and the answer it got, in touch order ([internal ref]).
+
+    A path under the run's HOME is recorded relative to it (``~/.httpie``): a boxed child's HOME is the fixed
+    :data:`BOX_HOME`, so the record is host-independent and can travel in a witness.  The only answer a C6 box
+    gives an undeclared path is ``"absent"``; the drawn file contents of [internal ref]'s later work extend
+    :meth:`touch`."""
+
+    def __init__(self, home: str | None):
+        self.home = home
+        self.touches: list = []
+
+    def relative(self, path: str) -> str:
+        """``path`` under the run's HOME, as ``~/...``; anything else stays as it is."""
+        if self.home and (path == self.home or path.startswith(self.home + os.sep)):
+            return "~" + path[len(self.home):]
+        return path
+
+    def touch(self, path: str, obj=None) -> None:
+        """Record ONE touch of the undeclared ``path`` and the answer the box gave it."""
+        self.touches.append([self.relative(path), "absent" if obj is None else (
+            obj.record() if hasattr(obj, "record") else dict(obj))])
+
+    def entries(self) -> list:
+        """The record as JSON-ready lists, in touch order."""
+        return [list(entry) for entry in self.touches]
+
+
+def world_record() -> "WorldRecord | None":
+    """The touch record of the installed box, or ``None`` without one."""
+    return _BOX_WORLD[0]
+
+
+def reset_world() -> None:
+    """Start a fresh touch record (the hybrid worker calls this before every input); no-op without a box."""
+    record = _BOX_WORLD[0]
+    if record is not None:
+        record.touches.clear()
+
+
+def install_files(files: tuple[str, ...] | list[str], scratch: str, flags: set[str], *, box: bool = False,
+                  world=None):
     """Install witness-mode open() for target code; return the original open.
 
-    Both builtins.open and io.open are patched so pathlib uses the same state.
+    Both builtins.open and io.open are patched so pathlib uses the same state, and so is every module-level alias
+    an earlier import bound to a patched primitive (:func:`_rebind_aliases`).
     A declared file is copied before mutation; its real bytes never change.
+    ``os.lstat``/``os.readlink``/``os.access``/``os.statvfs`` are modelled exactly as ``os.stat`` is ([internal ref],
+    :func:`stat_like`: an undeclared, non-infrastructure path is answered for real only after ``file_unmodelled``
+    is recorded, and the harness's own resolution machinery -- :func:`_resolution_probe` -- is not charged to the
+    target), and ``posix.open`` -- what ``import posix`` reaches -- is patched with the same ``model_os_open``
+    (the import machinery's own ``.pyc`` write exempted, :func:`_import_machinery_read`).
+
+    ``box`` ([internal ref], the hybrid search's mocked world) makes every undeclared path a MOCKED object:
+    ``stat``/``lstat``/``readlink``/``access``/``statvfs``/``listdir``/``scandir``/``os.open`` answer
+    "absent" for it -- no host call, no ``file_unmodelled`` -- and record the touch in :func:`world_record`
+    (a read still raises the same ``FileNotFoundError`` ``open`` already raised for it, and writes stay exactly
+    as above).  The import roots (the program's own directory, the interpreter's prefixes, every directory on
+    ``sys.path`` -- never ``/`` or an ancestor of HOME or the scratch) answer for real, unflagged, and
+    ``tempfile.tempdir`` points into the scratch.  ``box=False`` is the model above, unchanged.
     """
+    before = [(owner, name, getattr(owner, name)) for owner, name in _patched_attributes() if hasattr(owner, name)]
     real = builtins.open
-    real_stat = os.stat
+    real_stat, real_lstat, real_access = os.stat, os.lstat, os.access
+    real_readlink, real_statvfs = getattr(os, "readlink", None), getattr(os, "statvfs", None)
     real_os_open, real_listdir, real_scandir = os.open, os.listdir, os.scandir
     declared = {os.path.abspath(p): os.path.abspath(p) for p in files}
     by_name = {}
@@ -370,6 +603,7 @@ def install_files(files: tuple[str, ...] | list[str], scratch: str, flags: set[s
     by_dir_abs = set(by_dir.values())
     by_dir_abs.add(base)  # the declared files' own directory is known, not unmodelled
     created = set()
+    scratch_fds = {}
     root = os.path.join(scratch, "sv-files")
     # [internal ref] Bug C follow-on: a custom PYTHONPYCACHEPREFIX (sys.pycache_prefix) relocates
     # EVERY .pyc cache read -- including runpy.run_path's own pkgutil/stdlib imports,
@@ -386,6 +620,52 @@ def install_files(files: tuple[str, ...] | list[str], scratch: str, flags: set[s
     infrastructure = (os.path.dirname(os.path.dirname(__file__)), os.sys.prefix, os.sys.base_prefix,
                       *((os.sys.pycache_prefix,) if os.sys.pycache_prefix else ()))
     os.makedirs(root, exist_ok=True)
+    world_sources = {}
+    objects = world.objects if hasattr(world, "objects") else (world or {})
+    def world_bytes(obj):
+        if hasattr(obj, "concrete"):
+            return obj.concrete
+        if "content_base64" in obj:
+            import base64
+            return base64.b64decode(obj["content_base64"], validate=True)
+        return obj["content"].encode("utf-8")
+
+    for path, obj in objects.items():
+        if (obj.kind if hasattr(obj, "kind") else obj.get("kind", "file")) == "stream":
+            continue
+        source = os.path.join(root, "world-" + hashlib.sha256(path.encode()).hexdigest())
+        data = world_bytes(obj)
+        with real(source, "wb") as stream:
+            stream.write(data)
+        world_sources[source] = (path, obj, data)
+        declared[os.path.abspath(os.path.join(base, path))] = source
+        if not os.path.isabs(path):
+            by_name[os.path.normpath(path)] = source
+    box_world = None
+    box_roots: tuple[str, ...] = ()
+    if box or objects:
+        home = os.environ.get("HOME")
+        box_world = WorldRecord(os.path.abspath(home) if home else None)
+    if box:
+        # Every directory a plain ``python program`` could import from: the program's own directory, the
+        # interpreter's prefixes, and every sys.path entry.  ``/`` and an ancestor of HOME or of the scratch
+        # are dropped: trusting one would make that whole subtree -- the user's home, the run's own temporary
+        # tree -- readable-for-real from a mocked start.
+        candidates = ([os.path.abspath(base)] if files else []) + [sys.prefix, sys.base_prefix]
+        candidates += [os.path.abspath(entry) for entry in sys.path if isinstance(entry, str) and entry]
+        for candidate in candidates:
+            candidate = os.path.abspath(candidate)
+            if candidate == os.sep or candidate in box_roots:
+                continue
+            if os.path.commonpath((candidate, scratch)) == candidate:
+                continue
+            if box_world.home is not None and os.path.commonpath((candidate, box_world.home)) == candidate:
+                continue
+            box_roots += (candidate,)
+        temp = os.path.join(scratch, "tmp")
+        os.makedirs(temp, exist_ok=True)
+        tempfile.tempdir = temp
+    _BOX_WORLD[0] = box_world
 
     def target_for(slot, key, source):
         if source:
@@ -434,26 +714,81 @@ def install_files(files: tuple[str, ...] | list[str], scratch: str, flags: set[s
             source = by_name.get(os.path.normpath(path))
         return path, key, source
 
-    def model_stat(file, *args, **kwargs):
-        if isinstance(file, int):
-            return real_stat(file, *args, **kwargs)
+    def reachable(key):
+        """A path a stat-like probe answers for real in the box: the model's own paths (the scratch
+        bookkeeping, the infrastructure), and any ancestor-or-equal of an import root -- resolving a root
+        means walking its ancestors (``posixpath.realpath``), and those exist wherever the interpreter does.
+        A box answers everything else "absent"."""
+        if any(os.path.commonpath((probe, key)) == probe for probe in (scratch, *infrastructure)):
+            return True
+        return any(os.path.commonpath((root_, key)) == key for root_ in box_roots)
+
+    def refresh_world(source):
+        original_path, obj, previous = world_sources[source]
+        data = world_bytes(obj)
+        if data != previous:
+            with real(source, "wb") as stream:
+                stream.write(data)
+            created.discard(source)
+            world_sources[source] = (original_path, obj, data)
+        box_world.touch(original_path, obj)
+
+    def stat_like(real_fn, file, *args, absent=None, **kwargs):
+        if isinstance(file, int) or _resolution_probe(sys._getframe(2)):
+            return real_fn(file, *args, **kwargs)
         path, key, source = resolve(file)
+        if source in world_sources:
+            refresh_world(source)
         if source is None:
             directory = key if key in by_dir_abs else (
                 by_dir.get(os.path.normpath(path)) if not os.path.isabs(path) else None)
             if directory is not None:
-                return real_stat(directory, *args, **kwargs)
+                return real_fn(directory, *args, **kwargs)
             if key in created:
                 target = target_for(key, key, None)
-                return real_stat(target, *args, **kwargs)
-            # Flag before the real call: an undeclared, non-infrastructure path's
-            # outcome (success, or which OSError) depends on this host's filesystem,
-            # so a raised error must not slip through unflagged as if it were modelled.
-            if all(os.path.commonpath((probe, key)) != probe for probe in (scratch, *infrastructure)):
+                return real_fn(target, *args, **kwargs)
+            if box:
+                # [internal ref]'s box: an undeclared path is a mocked object -- absent, the host never consulted,
+                # no ``file_unmodelled``.  The import roots and their resolution chain answer for real and
+                # unflagged (``reachable``).
+                if not reachable(key):
+                    box_world.touch(key)
+                    if absent is not None:
+                        return absent
+                    raise FileNotFoundError(2, "No such file or directory", path)
+            elif all(os.path.commonpath((probe, key)) != probe for probe in (scratch, *infrastructure)):
+                # Flag before the real call: an undeclared, non-infrastructure path's
+                # outcome (success, or which OSError) depends on this host's filesystem,
+                # so a raised error must not slip through unflagged as if it were modelled.
                 flags.add("file_unmodelled")
-            return real_stat(file, *args, **kwargs)
+            return real_fn(file, *args, **kwargs)
         target = target_for(source, key, source)
-        return real_stat(target if source in created else source, *args, **kwargs)
+        return real_fn(target if source in created else source, *args, **kwargs)
+
+    def model_stat(file, *args, **kwargs):
+        return stat_like(real_stat, file, *args, **kwargs)
+
+    # [internal ref]: the same model for the metadata primitives that used to reach the host unpatched.  A declared file (and
+    # the scratch bookkeeping) answers for real; anything undeclared outside the infrastructure sets ``file_unmodelled``
+    # BEFORE the host call -- success, and which OSError, are this host's own, exactly as for ``stat``.
+    def model_lstat(file, *args, **kwargs):
+        return stat_like(real_lstat, file, *args, **kwargs)
+
+    def model_readlink(file, *args, **kwargs):
+        return stat_like(real_readlink, file, *args, **kwargs)
+
+    def model_access(file, *args, **kwargs):
+        # ``os.access`` ANSWERS for an absent path where the metadata calls raise (in the box and on the host).
+        return stat_like(real_access, file, *args, absent=False, **kwargs)
+
+    def model_statvfs(file, *args, **kwargs):
+        return stat_like(real_statvfs, file, *args, **kwargs)
+
+    def under_roots(key):
+        """A path ``open``/``listdir``/``os.open`` reads for real in the box: the scratch, the infrastructure,
+        or an import root itself -- those trees are readable, statable and listable, unflagged."""
+        return any(os.path.commonpath((probe, key)) == probe
+                   for probe in (scratch, *infrastructure, *box_roots))
 
     def stage_dirs(target_dir):
         """Create scratch-side ancestor directories for staging, without the
@@ -469,10 +804,21 @@ def install_files(files: tuple[str, ...] | list[str], scratch: str, flags: set[s
     def model_open(file, mode="r", *args, **kwargs):
         if isinstance(file, int):
             flags.add("file_effect")
+            if box and file in scratch_fds:
+                try:
+                    info = os.fstat(file)
+                    if (info.st_dev, info.st_ino) == scratch_fds[file]:
+                        return real(file, mode, *args, **kwargs)
+                except OSError:
+                    pass
             flags.add("file_unmodelled")
             raise OSError("file descriptor reads are outside the SV file model")
         path, key, source = resolve(file)
         writing = any(c in mode for c in "wax+")
+        if source in world_sources:
+            refresh_world(source)
+            if writing:
+                flags.add("file_unmodelled")  # world facts describe read-only initial content
         # [internal ref] regression, fixed 2026-09-29 ([internal ref], W65's GUUT-harness evidence):
         # a THIRD exempt read, alongside the two below -- CPython's own import machinery
         # reading a module's source off ANY sys.path entry, however the target set it up
@@ -522,6 +868,8 @@ def install_files(files: tuple[str, ...] | list[str], scratch: str, flags: set[s
                 shutil.copyfileobj(src, dst)
             created.add(slot)
         if not writing and slot not in created:
+            if box:
+                box_world.touch(key)          # [internal ref]: the box's answer for the undeclared read (still absent)
             raise FileNotFoundError(2, "undeclared file", path)
         if writing and known_dir is not None:
             stage_dirs(os.path.dirname(target))
@@ -534,11 +882,35 @@ def install_files(files: tuple[str, ...] | list[str], scratch: str, flags: set[s
         if kwargs.get("dir_fd") is not None or isinstance(file, int):
             flags.add("file_unmodelled")
             raise OSError("unmodelled file descriptor")
+        # [internal ref]: the import machinery writes ``.pyc`` caches through ``posix.open``
+        # (``_bootstrap_external._write_atomic``); that is the harness's own need, exempt
+        # exactly as model_open/model FileIO exempt it, so it is not refused or flagged.
+        if _import_machinery_read():
+            return real_os_open(file, *args, **kwargs)
         _, key, source = resolve(file)
+        if source in world_sources:
+            original_path, obj, _ = world_sources[source]
+            box_world.touch(original_path, obj)
+            flags.add("file_unmodelled")
+            raise OSError("world file descriptors are not modelled")
         if source or os.path.commonpath((scratch, key)) != scratch:
+            # [internal ref]: a WRITE never leaves the scratch, boxed or not -- the one thing the box must not
+            # loosen.  A READ of an import root is real; any other undeclared read is the box's mocked
+            # "absent" (and today's refusal outside the box).
+            opened = (args[0] if args else kwargs.get("flags", 0)) or 0
+            writing = bool(opened & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
+            if box and not writing and under_roots(key):
+                return real_os_open(file, *args, **kwargs)
+            if box and not writing:
+                box_world.touch(key)
+                raise FileNotFoundError(2, "No such file or directory", os.fsdecode(os.fspath(file)))
             flags.add("file_unmodelled")
             raise OSError("unmodelled os.open path")
-        return real_os_open(file, *args, **kwargs)
+        fd = real_os_open(file, *args, **kwargs)
+        if box:
+            info = os.fstat(fd)
+            scratch_fds[fd] = (info.st_dev, info.st_ino)
+        return fd
 
     class ModelFileIO(_io.FileIO):
         def __new__(cls, *args, **kwargs):
@@ -561,14 +933,44 @@ def install_files(files: tuple[str, ...] | list[str], scratch: str, flags: set[s
             return real_fn(*args, **kwargs)
         return run
 
+    def box_enumerate(real_fn):
+        def run(path=None, *args, **kwargs):
+            if isinstance(path, int):
+                return real_fn(path, *args, **kwargs)
+            directory = os.fspath(path) if path is not None else "."
+            key = os.path.abspath(os.fsdecode(directory))
+            if under_roots(key):
+                return real_fn(path, *args, **kwargs) if path is not None else real_fn()
+            box_world.touch(key)
+            raise FileNotFoundError(2, "No such file or directory", directory)
+        return run
+
     install_mutation_confinement(scratch, flags)
     install_spawn_confinement(flags)
+    install_network_confinement(flags)
     builtins.open = io.open = _io.open = model_open
     io.FileIO = _io.FileIO = ModelFileIO
     os.stat = model_stat
+    os.lstat = model_lstat
+    os.access = model_access
+    if real_readlink is not None:
+        os.readlink = model_readlink
+    if real_statvfs is not None:
+        os.statvfs = model_statvfs
     os.open = model_os_open
-    os.listdir = model_enumerate(real_listdir)
-    os.scandir = model_enumerate(real_scandir)
+    try:
+        import posix as _posix_io
+    except ImportError:               # pragma: no cover -- not a POSIX interpreter
+        _posix_io = None
+    if _posix_io is not None and getattr(_posix_io, "open", None) is real_os_open:
+        _posix_io.open = model_os_open
+    if box:
+        os.listdir = box_enumerate(real_listdir)
+        os.scandir = box_enumerate(real_scandir)
+    else:
+        os.listdir = model_enumerate(real_listdir)
+        os.scandir = model_enumerate(real_scandir)
+    _rebind_aliases(((original, getattr(owner, name)) for owner, name, original in before), interpreter_only=True)
     return real
 
 
@@ -734,31 +1136,51 @@ def install_spawn_confinement(flags: set[str]) -> None:
             raise OSError(errno.EPERM, f"Operation not permitted (process spawning is confined: {name})")
         run.__name__ = name.split(".")[-1]
         run.__qualname__ = run.__name__
-        run._spawn_refused = True          # :func:`_unpoison_subprocess` recognises it
         return run
 
     for owner_path, owner, attr_name in _spawn_attributes():
         setattr(owner, attr_name, refuse(f"{owner_path}.{attr_name}"))
 
 
-def _unpoison_subprocess() -> None:
-    """``subprocess`` binds ``_posixsubprocess.fork_exec`` as ``_fork_exec`` when it is first imported.  A first
-    import INSIDE a confined block therefore keeps the refusing function after the block; this puts the original
-    back (the snapshot has already restored ``_posixsubprocess.fork_exec``)."""
-    module = sys.modules.get("subprocess")
-    if getattr(getattr(module, "_fork_exec", None), "_spawn_refused", False):
-        import _posixsubprocess
-        module._fork_exec = _posixsubprocess.fork_exec
+# Audit hooks cannot be removed: keep one dormant hook and restore only its active context.
+_NETWORK = {"flags": None, "installed": False}
+
+
+def install_network_confinement(flags: set[str]) -> None:
+    """Refuse CPython socket events before host access, including captured C aliases."""
+    if not _NETWORK["installed"]:
+        def guard(event, args):
+            active = _NETWORK["flags"]
+            if active is not None and event.startswith("socket."):
+                active.update(("file_effect", "file_unmodelled"))
+                raise OSError(errno.EPERM, f"network access is confined: {event}")
+        sys.addaudithook(guard)
+        _NETWORK["installed"] = True
+    _NETWORK["flags"] = flags
+
+
+def _restore(snapshot) -> None:
+    """Put back every attribute in ``snapshot``, then every module-level alias of what stood in its place: the ones
+    :func:`_rebind_aliases` made at install, and the ones a module first imported INSIDE the window bound itself
+    (``subprocess`` binds ``_posixsubprocess.fork_exec`` as ``_fork_exec``, ``tokenize`` binds ``open``), which
+    would otherwise keep refusing or modelling after the window, against a removed scratch ([internal ref])."""
+    installed = [(getattr(mod, name, original), original) for mod, name, original in snapshot]
+    for mod, name, original in snapshot:
+        setattr(mod, name, original)
+    _rebind_aliases(installed)
 
 
 @dataclass(frozen=True)
 class Confinement:
     """What :func:`confined` yields: the scratch directory the model runs in, the flags it fills (``file_effect`` /
-    ``file_unmodelled`` mean the confined code touched the environment) and the declared files."""
+    ``file_unmodelled`` mean the confined code touched the environment), the declared files, and ([internal ref]) whether
+    the block runs in the box (``box``) with the run's touch record (``world``, ``None`` without one)."""
 
     scratch: str
     flags: set[str]
     files: tuple[str, ...]
+    box: bool = False
+    world: "WorldRecord | None" = None
 
 
 #: every attribute ``install_files``, ``install_mutation_confinement`` and ``install_spawn_confinement`` rewrite,
@@ -769,7 +1191,10 @@ def _patched_attributes():
     except ImportError:               # pragma: no cover -- not a POSIX interpreter
         _posix = None
     attrs = [(builtins, "open"), (io, "open"), (_io, "open"), (io, "FileIO"), (_io, "FileIO"),
-             (os, "stat"), (os, "open"), (os, "listdir"), (os, "scandir")]
+             (os, "stat"), (os, "lstat"), (os, "readlink"), (os, "access"), (os, "statvfs"),
+             (os, "open"), (os, "listdir"), (os, "scandir")]
+    if _posix is not None:
+        attrs.append((_posix, "open"))
     for name in (*_MUTATORS, "symlink"):
         attrs.append((os, name))
         if _posix is not None:
@@ -838,7 +1263,7 @@ _CONFINED: dict = {"depth": 0}
 
 @contextlib.contextmanager
 def confined(files: tuple[str, ...] | list[str] = (), scratch: str | None = None, flags: set[str] | None = None,
-             *, threads: bool = True):
+             *, threads: bool = True, box: bool = False, world=None):
     """Run the block under the environment model and file-system confinement, then put everything back.
 
     The REVERSIBLE form of what ``install_files`` (and, through it, ``install_mutation_confinement``) do for the
@@ -855,7 +1280,7 @@ def confined(files: tuple[str, ...] | list[str] = (), scratch: str | None = None
     The installer is the unchanged ``install_files``: this adds a snapshot of every attribute it rewrites
     (``builtins.open``, ``io.open``, ``_io.open``, ``io.FileIO``, ``_io.FileIO``, ``os.stat/open/listdir/scandir``
     and, for every mutator and ``symlink``, ``os.<name>`` AND ``posix.<name>``), taken before installing and put
-    back in ``finally``.  Re-entrant and thread-safe by a depth counter: a nested ``with`` (same thread or
+    back in ``finally`` together with every module-level alias of what was installed (:func:`_restore`).  Re-entrant and thread-safe by a depth counter: a nested ``with`` (same thread or
     another) shares the outermost context's scratch, flags and Confinement without re-snapshotting, and the LAST
     exit restores -- an already-patched attribute is never snapshotted.  A nested context's ``flags`` argument is
     updated with the model's flags when it exits.
@@ -870,7 +1295,13 @@ def confined(files: tuple[str, ...] | list[str] = (), scratch: str | None = None
     (``os.system``, ``subprocess``, ``os.exec*``, ``os.fork``, ``multiprocessing``) is refused inside the block with
     ``OSError(EPERM)`` (:func:`install_spawn_confinement`) and its attributes are in :func:`_patched_attributes`, so
     the exit puts them back like the rest. ``threads=False`` also refuses new target threads,
-    so no background execution can outlive the protected phase; the generic default is unchanged."""
+    so no background execution can outlive the protected phase; the generic default is unchanged.
+
+    ``box`` ([internal ref], the hybrid search's mocked world) is :func:`install_files`' mode switch: an undeclared path
+    answers "absent" without a host call and without ``file_unmodelled``, the import roots answer for real
+    (unflagged), and ``tempfile.tempdir`` points into the scratch (like every other attribute, restored on
+    exit).  The OUTERMOST context decides; a nested one shares it, and the yielded :class:`Confinement` carries
+    ``box`` and the run's :func:`world_record`."""
     declared = tuple(os.fspath(f) for f in files)
     with _CONFINED_LOCK:
         state = _CONFINED
@@ -884,14 +1315,17 @@ def confined(files: tuple[str, ...] | list[str] = (), scratch: str | None = None
                 previous_cwd = os.getcwd()
             except OSError:
                 previous_cwd = None
+            saved_tempdir = tempfile.tempdir
+            saved_network_flags = _NETWORK["flags"]
             try:
-                install_files(declared, work, model_flags)
+                install_files(declared, work, model_flags, box=box, **({"world": world} if world is not None else {}))
                 os.chdir(work)
                 restore_threads = refuse_threads(model_flags) if not threads else None
             except BaseException:
-                for mod, name, original in snapshot:
-                    setattr(mod, name, original)
-                _unpoison_subprocess()
+                _NETWORK["flags"] = saved_network_flags
+                _restore(snapshot)
+                _BOX_WORLD[0] = None
+                tempfile.tempdir = saved_tempdir
                 if previous_cwd is not None:
                     try:
                         os.chdir(previous_cwd)
@@ -901,7 +1335,9 @@ def confined(files: tuple[str, ...] | list[str] = (), scratch: str | None = None
                     shutil.rmtree(work, ignore_errors=True)
                 raise
             state.update(snapshot=snapshot, scratch=work, owns=owns_scratch, flags=model_flags,
-                         cwd=previous_cwd, files=declared, thread_refusals=int(not threads))
+                         cwd=previous_cwd, files=declared, thread_refusals=int(not threads),
+                         box=box, world=world_record(), tempdir=saved_tempdir,
+                         network_flags=saved_network_flags)
             if restore_threads is not None:
                 state["restore_threads"] = restore_threads
         elif not threads:
@@ -909,7 +1345,7 @@ def confined(files: tuple[str, ...] | list[str] = (), scratch: str | None = None
                 state["restore_threads"] = refuse_threads(state["flags"])
             state["thread_refusals"] = state.get("thread_refusals", 0) + 1
         state["depth"] += 1
-        current = Confinement(state["scratch"], state["flags"], state["files"])
+        current = Confinement(state["scratch"], state["flags"], state["files"], state["box"], state["world"])
     try:
         yield current
     finally:
@@ -922,11 +1358,12 @@ def confined(files: tuple[str, ...] | list[str] = (), scratch: str | None = None
             if flags is not None:
                 flags.update(state["flags"])
             if state["depth"] == 0:
+                _NETWORK["flags"] = state["network_flags"]
                 try:
-                    for mod, name, original in state["snapshot"]:
-                        setattr(mod, name, original)
-                    _unpoison_subprocess()
+                    _restore(state["snapshot"])
                 finally:
+                    _BOX_WORLD[0] = None
+                    tempfile.tempdir = state["tempdir"]
                     try:
                         if state["cwd"] is not None:
                             os.chdir(state["cwd"])
@@ -1007,11 +1444,228 @@ def _fold_str(node):
     return None
 
 
-def stack_reason(source: bytes | str) -> "str | None":
+#: what turns a NAME into an attribute, a global or a module, with the position of the name (``None``: every argument)
+_NAME_RESOLVERS = {"getattr": 1, "hasattr": 1, "getattr_static": 1, "find_class": 1, "attrgetter": None,
+                   "methodcaller": 0, "__import__": 0, "import_module": 0, "resolve_name": 0, "locate": 0}
+#: ``x.__getattribute__(name)`` / ``object.__getattribute__(x, name)``: the name is the last argument
+_GETATTRIBUTE = frozenset({"__getattribute__", "__getattr__"})
+#: what runs a string as code
+_CODE_RUNNERS = frozenset({"eval", "exec", "compile"})
+#: library calls that run a string argument as Python (``timeit.timeit("...")``, ``pdb.run``, ``code.interact``, ...)
+_CODE_CALLS = frozenset({"timeit", "repeat", "Timer", "run", "runctx", "runcall", "runcode", "runsource", "run_path",
+                         "run_module", "interact", "run_docstring_examples"})
+#: library calls that turn string or bytes data into a global lookup (``pickle.loads(b"csys\\norig_argv\\n.")``)
+_NAME_DATA_CALLS = frozenset({"loads", "load", "dictConfig", "fileConfig"})
+#: what reaches a module's attributes, or any object, without naming them
+_ENUMERATORS = frozenset({"vars", "__dict__", "getmembers", "getmembers_static", "get_objects", "get_referents",
+                          "get_referrers", "render_doc", "pydoc"})
+#: the facilities a string may name to reach any of the above (``getattr(builtins, "getattr")``)
+_FORMAT_METHODS = frozenset({"format", "format_map", "vformat"})
+_REFLECTIVE = frozenset(_NAME_RESOLVERS) | _GETATTRIBUTE | _CODE_RUNNERS | _ENUMERATORS | _FORMAT_METHODS
+
+
+def reflective_field_attribute(name):
+    """An attribute selector that can escape into unmodeled interpreter/provider state."""
+    return name.startswith("__") or name in _REFLECTIVE | _STACK_NAMES | {
+        "orig_argv", "f_globals", "f_locals", "gi_frame", "cr_frame", "ag_frame"}
+
+
+def _format_selector_reason(kind, text, node):
+    if kind == "opaque-field":
+        return f"format fields the scan cannot read at line {node.lineno}"
+    if kind == "field":
+        from _string import formatter_field_name_split
+        try:
+            _, accesses = formatter_field_name_split(text)
+            for attribute, name in accesses:
+                if attribute and reflective_field_attribute(name):
+                    return f"reflective format field {name} at line {node.lineno}"
+        except ValueError:
+            return f"format field the scan cannot read at line {node.lineno}"
+    return None
+
+
+def format_field_reason(tree, *, filename=None, observed=None, runtime=False):
+    """Check active format selectors in this file, including escaped formatter methods."""
+    for kind, text, node in _live_strings(tree, filename=filename, observed=observed, runtime=runtime):
+        if reason := _format_selector_reason(kind, text, node):
+            return reason
+    return None
+
+
+def _str_text(node):
+    """The text of a constant ``str`` expression (:func:`_fold_str`) or of a ``bytes`` literal, or ``None``."""
+    import ast
+    if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+        return node.value.decode("latin-1")
+    return _fold_str(node) if isinstance(node, (ast.Constant, ast.BinOp, ast.JoinedStr, ast.Call)) else None
+
+
+def _live_strings(tree, *, filename=None, observed=None, runtime=False) -> list:
+    """The strings ``tree`` EXECUTES or uses as a NAME, as ``(kind, text, node)`` (owner, 2026-10-29 audit: only the code
+    may change a verdict, never a comment or plain string data):
+
+    * ``"code"``: run as Python -- an ``eval`` / ``exec`` / builtin ``compile`` argument, a string annotation (evaluated
+      by ``typing.get_type_hints``), a library runner's argument (:data:`_CODE_CALLS`: ``timeit.timeit("...")``, ...);
+    * ``"name"``: used as an attribute, module or global name -- a resolver's name argument (:data:`_NAME_RESOLVERS`,
+      ``__getattribute__``), a ``__match_args__`` entry, or
+      ``pickle.loads``-style data (:data:`_NAME_DATA_CALLS`).
+    * ``"field"``: an active ``format`` / ``format_map`` / ``vformat`` field selector, without literal or escaped text;
+      ``"opaque-field"``: a template whose selectors cannot be read statically.
+
+    Every other string (data, a message, a docstring) is neither.  A program that imports ``doctest`` runs its
+    docstrings, so there every string is a ``"name"``."""
+    import ast
+    nodes = list(ast.walk(tree))
+    parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+    str_shadowed = any((isinstance(n, ast.Name) and n.id == 'str' and isinstance(n.ctx, (ast.Store, ast.Del)))
+                       or (isinstance(n, ast.arg) and n.arg == 'str')
+                       or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == 'str')
+                       or (isinstance(n, ast.alias) and (n.asname or n.name.split('.')[0]) == 'str') for n in nodes)
+    if any((isinstance(n, ast.Import) and any(a.name.split(".")[0] == "doctest" for a in n.names)) or
+           (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "doctest") for n in nodes):
+        return [("name", t, n) for n in nodes if (t := _str_text(n)) is not None]
+    out = []
+    bindings = None
+
+    def templates(node):
+        # These are alternatives, not reaching-value proofs; runtime reads still check the actual receiver.
+        nonlocal bindings
+        if bindings is None:
+            bindings = {}
+            for n in nodes:
+                if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                    parent = parents.get(n)
+                    value = parent.value if isinstance(parent, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) else None
+                    if isinstance(parent, ast.AnnAssign) and value is None:
+                        continue
+                    bindings.setdefault(n.id, []).append(value)
+                elif isinstance(n, (ast.arg, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+                    name = n.arg if isinstance(n, ast.arg) else n.name
+                    bindings.setdefault(name, []).append(None)
+                elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                    for alias in n.names:
+                        bindings.setdefault(alias.asname or alias.name.split('.')[0], []).append(None)
+        pending, visited, texts = [node], set(), set()
+        while pending:
+            value = pending.pop()
+            text = _str_text(value)
+            if text is not None:
+                texts.add(text)
+            elif isinstance(value, ast.IfExp):
+                pending.extend((value.body, value.orelse))
+            elif isinstance(value, ast.Name):
+                if value.id in visited:
+                    continue
+                values = bindings.get(value.id)
+                if not values or any(v is None for v in values):
+                    return None
+                visited.add(value.id)
+                pending.extend(values)
+            else:
+                return None
+        return texts or None
+
+    def add(kind, node):
+        text = _str_text(node) if node is not None else None
+        if text is not None:
+            out.append((kind, text, node))
+
+    def receiver_path(node):
+        """``("self", "text")`` for ``self.text``, ``("t",)`` for ``t``; ``None`` for any other expression."""
+        names = []
+        while isinstance(node, ast.Attribute):
+            names.append(node.attr)
+            node = node.value
+        return (node.id, *reversed(names)) if isinstance(node, ast.Name) else None
+    def fields(node, access=None):
+        from string import Formatter
+        text = _str_text(node)
+        texts = {text} if text is not None else templates(node)
+        guarded = isinstance(node, ast.Name) and access is not None
+        path = receiver_path(node) if access is not None else None
+        if texts is None and runtime and path and observed is not None and filename is not None:
+            # An open template (``self.text.format(...)``, a name bound elsewhere): the child reads the ACTUAL string
+            # before the call and flags a reflective or unparsable one (``_child.py::_mapping_observer``).  The static
+            # tier still names it (below), so a proof stays withheld: any KeyError/IndexError/ValueError/AttributeError
+            # the template can raise is a FALSE-search matter only, never a TRUE.
+            observed[(os.path.realpath(filename), access.lineno, access.end_lineno,
+                      access.col_offset, access.end_col_offset)] = (path, access.attr, 'format', None)
+            return
+        if texts is None or (runtime and text is None and (not guarded or observed is None or filename is None)):
+            out.append(("opaque-field", "", node))
+            return
+        if guarded and observed is not None and filename is not None:
+            observed[(os.path.realpath(filename), access.lineno, access.end_lineno,
+                      access.col_offset, access.end_col_offset)] = (node.id, access.attr, 'format', tuple(sorted(texts)))
+        pending = list(texts)
+        try:
+            while pending:
+                for _, field, spec, _ in Formatter().parse(pending.pop()):
+                    if field is not None:
+                        out.append(("field", field, node))
+                        if spec:
+                            pending.append(spec)
+        except ValueError:
+            out.append(("opaque-field", "", node))
+
+    for node in nodes:
+        if isinstance(node, ast.Call):
+            f, args = node.func, node.args
+            name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+            if name in _CODE_RUNNERS and args and (name != "compile" or isinstance(f, ast.Name) or (
+                    isinstance(f.value, ast.Name) and f.value.id in ("builtins", "__builtins__"))):
+                add("code", args[0])
+            elif name in _CODE_CALLS:
+                for a in [*args, *(k.value for k in node.keywords)]:
+                    add("code", a)
+            elif name in _NAME_DATA_CALLS:
+                for a in args:
+                    add("name", a)
+            elif name in _NAME_RESOLVERS or name in _GETATTRIBUTE:
+                at = len(args) - 1 if name in _GETATTRIBUTE else _NAME_RESOLVERS[name]
+                for a in (args if at is None else args[at:at + 1]):
+                    add("name", a)
+            elif name in ("format", "format_map") and isinstance(f, ast.Attribute):
+                unbound = isinstance(f.value, ast.Name) and f.value.id == "str" and not str_shadowed and args
+                fields(args[0] if unbound else f.value, None if unbound else f)
+            elif name == "vformat" and args:
+                fields(args[0])
+        elif isinstance(node, (ast.arg, ast.AnnAssign)) and node.annotation is not None:
+            for c in ast.walk(node.annotation):
+                add("code", c)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns is not None:
+            for c in ast.walk(node.returns):
+                add("code", c)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, (ast.Tuple, ast.List)) and any(
+                isinstance(t, ast.Name) and t.id == "__match_args__"
+                for t in (node.targets if isinstance(node, ast.Assign) else [node.target])):
+            for e in node.value.elts:
+                add("name", e)
+        if isinstance(node, ast.Attribute) and node.attr in _FORMAT_METHODS:
+            call = parents.get(node)
+            if not (isinstance(call, ast.Call) and call.func is node):
+                fields(node.value if node.attr != "vformat" else node, node if node.attr != 'vformat' else None)
+    return out
+
+
+def _observed_code(call, filename, observed):
+    """Sources whose actual builtin/argument the child checks immediately before this CALL."""
+    if observed is None or filename is None:
+        return ()
+    entry = observed.get((os.path.realpath(filename), call.lineno, call.end_lineno,
+                          call.col_offset, call.end_col_offset))
+    if type(entry) is tuple and len(entry) == 4 and entry[2] == "code":
+        return tuple(item[0] if type(item) is tuple else item for item in entry[3])
+    return ()
+
+
+def stack_reason(source: bytes | str, *, filename=None, observed=None) -> "str | None":
     """Why ``source`` may observe a stack the child does not give it, or ``None``: it reads the frames above its module
-    frame (``sys._getframe``, ``f_back``, ``inspect.stack``, ``traceback.extract_stack``, ...) however the name is
-    spelled (an attribute, an import, a string, a folded ``"_get" + "frame"``, a computed ``getattr`` next to an import of
-    ``sys`` / ``inspect`` / ``traceback``, ``exec`` / ``eval`` of anything but a literal that does not name them), or it runs
+    frame (``sys._getframe``, ``f_back``, ``inspect.stack``, ``traceback.extract_stack``, ...) however the CODE spells the
+    name (an attribute, an import, a string it runs or uses as a name -- :func:`_live_strings`, so ``getattr(sys, "_get" +
+    "frame")`` but never a comment or the data ``'no _getframe here'`` -- a computed ``getattr`` next to an import of
+    ``sys`` / ``inspect`` / ``traceback``, ``exec`` / ``eval`` of anything but a literal, which is scanned as code), or it runs
     code on a thread (``threading``, ``_thread``, ``concurrent``, ``multiprocessing``, ``asyncio``, ...: a thread starts at
     recursion depth 0, the main thread's limit is raised by the child's frame count).
 
@@ -1066,13 +1720,6 @@ def stack_reason(source: bytes | str) -> "str | None":
         elif isinstance(node, ast.alias):
             if node.name in _STACK_NAMES or (node.name in ("stack", "*") and "inspect" in imported):
                 return f"imports {node.name}"
-        elif isinstance(node, (ast.Constant, ast.BinOp, ast.JoinedStr, ast.Call)):
-            text = _fold_str(node)
-            if text is not None:
-                if word.search(text):
-                    return f"a string that names a frame reader: {text[:40]!r}"
-                if text in _THREAD_MODULES or (text == "stack" and "inspect" in imported):
-                    return f"a string that names {text}"
         if isinstance(node, ast.Call):
             f = node.func
             name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
@@ -1080,7 +1727,12 @@ def stack_reason(source: bytes | str) -> "str | None":
                                                        and f.value.id == "builtins")
             if builtin_call and name in ("exec", "eval", "compile") \
                     and not (node.args and _fold_str(node.args[0]) is not None):
-                return f"{name} of code the scan cannot read"
+                texts = _observed_code(node, filename, observed)
+                if not texts:
+                    return f"{name} of code the scan cannot read"
+                for text in texts:
+                    if inner := stack_reason(text):
+                        return f"{name} of guarded code: {inner}"
             if name in ("__import__", "import_module") and not (node.args and _fold_str(node.args[0]) is not None):
                 return f"{name} of a module the scan cannot name"
             if name == "vars" and len(node.args) == 1 and isinstance(node.args[0], ast.Name) \
@@ -1090,12 +1742,196 @@ def stack_reason(source: bytes | str) -> "str | None":
                 idx = 1 if name != "__getattribute__" or isinstance(f, ast.Name) else 0
                 if len(node.args) <= idx or _fold_str(node.args[idx]) is None:
                     return f"{name} with a computed name next to an import of {sorted(imported & _REFLECTED_MODULES)[0]}"
+    # a string counts only where it runs or is used as a name (owner, 2026-10-29 audit): data never changes a verdict
+    for kind, text, node in _live_strings(tree, filename=filename, observed=observed, runtime=observed is not None):
+        if kind == "opaque-field":
+            return f"format fields the scan cannot read at line {node.lineno}"
+        if kind == "code":
+            inner = stack_reason(text)
+            if inner:
+                return f"code in a string at line {node.lineno} {inner}"
+        elif word.search(text):
+            return f"a name that names a frame reader: {text[:40]!r}"
+        elif text in _THREAD_MODULES or (text == "stack" and "inspect" in imported):
+            return f"a name that names {text}"
     return None
 
 
-def references_stack(source: bytes | str) -> bool:
+def references_stack(source: bytes | str, *, filename=None, observed=None) -> bool:
     """``stack_reason(source) is not None``."""
-    return stack_reason(source) is not None
+    return stack_reason(source, filename=filename, observed=observed) is not None
+
+
+#: ``sys.orig_argv`` ([internal ref]): interpreter metadata the competition's model does not define (:func:`orig_argv_reason`)
+_ORIG_ARGV = "orig_argv"
+
+
+def orig_argv_reason(source, filename: str | None = None, *, observed: dict | None = None,
+                     _depth: int = 0) -> "str | None":
+    """Why the CODE of ``source`` may read ``sys.orig_argv``, or ``None`` ([internal ref]; the 2026-10-29 audit: comments and
+    string data never count -- ``ast``, and :func:`_live_strings`).
+
+    The competition's model (sv-benchmarks ``python/CONVENTIONS.md``) is "``sys.argv`` is assumed to be any list of
+    strings", set IN-PROCESS; it does not define ``sys.orig_argv``.  In the child that is the verifier's own launch line
+    (and a forked worker's differs from a fresh child's), so a FALSE that depends on it cannot be confirmed under the
+    competition's semantics: ANY read makes the run no witness (the ``orig_argv`` flag,
+    ``engine.NEVER_A_WITNESS_FLAGS``) and blocks a static TRUE (:func:`proof_blocker`).
+
+    It counts: the name in code (``x.orig_argv`` on any receiver, a name bound by ``from sys import orig_argv [as y]``,
+    ``getattr(x, "orig_argv")``), ``from sys import *``, a ``case C(orig_argv=a)`` pattern; reflection it cannot
+    follow -- a resolver (``getattr``, ``__getattribute__``, ``attrgetter``, ``__import__``, ``import_module``, ...) given
+    a computed name, used other than by a direct call or imported under another name, ``vars(x)``, ``x.__dict__``,
+    ``inspect.getmembers``, ``gc.get_objects``, ``pydoc``, ``eval`` / ``exec`` / ``compile`` of a non-literal (a literal
+    is scanned as code), a non-literal ``__match_args__``; and a string the program runs or uses as a name that mentions
+    ``orig_argv`` or ``__dict__`` or names a reflective facility.
+
+    ``observed`` (the child, with the program's ``filename``): a read the child checks by OBJECT right before it runs
+    (``_child.py::_mapping_observer``) is recorded there, keyed like ``extern.py::native_import_reason``'s mapping reads,
+    instead of counting: ``name.__dict__``, ``vars(name)`` and ``getattr(name, "__dict__")`` (a module receiver, ``sys``
+    among them, is no witness; a class's mapping keeps its FALSE, R1) and ``getattr(name, <computed>)`` (``sys`` itself
+    is no witness).  A program that does not parse counts (it cannot run either)."""
+    import ast
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return "unreadable program" if _depth == 0 else None
+    nodes = list(ast.walk(tree))
+    parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+    observed = observed if _depth == 0 and filename is not None else None
+    aliases = {a.asname or a.name for n in nodes if isinstance(n, ast.ImportFrom) for a in n.names
+               if a.name == _ORIG_ARGV}
+    handled = set()
+
+    def observe(node, entry):
+        for path in {filename, os.path.abspath(filename), os.path.realpath(filename)}:
+            observed[(path, node.lineno, node.end_lineno, node.col_offset, node.end_col_offset)] = entry
+
+    for node in nodes:
+        line = getattr(node, "lineno", None) or getattr(parents.get(node), "lineno", "?")
+        if ((isinstance(node, ast.Attribute) and node.attr == _ORIG_ARGV) or
+                (isinstance(node, ast.Name) and node.id in aliases)):
+            if isinstance(node.ctx, ast.Load):
+                return f"reads orig_argv at line {line}"
+            continue
+        if isinstance(node, ast.alias) and node.name == _ORIG_ARGV:
+            return f"imports orig_argv at line {line}"
+        if isinstance(node, ast.MatchClass) and _ORIG_ARGV in node.kwd_attrs:
+            return f"a class pattern reads orig_argv at line {line}"
+        if isinstance(node, ast.ImportFrom) and node.module == "sys" and any(a.name == "*" for a in node.names):
+            return f"from sys import * at line {line}"
+        name = (node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute)
+                else node.name if isinstance(node, ast.alias) else None)
+        if name not in _REFLECTIVE and name != "__match_args__":
+            continue
+        if isinstance(node, (ast.Name, ast.Attribute)) and not isinstance(node.ctx, ast.Load) \
+                and name != "__match_args__":
+            continue                                        # binding ``getattr = ...`` reads nothing; its calls are judged by object
+        call = parents.get(node)
+        called = isinstance(call, ast.Call) and call.func is node
+        if isinstance(node, ast.alias):
+            owner = parents.get(node)
+            if name == 'format' and isinstance(owner, ast.ImportFrom) and owner.module == 'builtins':
+                continue                                    # scalar formatting has no template-field traversal
+            if node.asname and node.asname != name:
+                return f"imports {name} as {node.asname} at line {line}"
+            if name in _ENUMERATORS:
+                return f"imports {name} at line {line}: reaches attributes without naming them"
+            continue
+        if name == "__match_args__":
+            # a class pattern reads the attributes it lists by name: only a literal list is a list of names
+            value = call.value if isinstance(call, (ast.Assign, ast.AnnAssign)) else None
+            if not (isinstance(value, (ast.Tuple, ast.List)) and all(_str_text(e) is not None for e in value.elts)):
+                return f"__match_args__ the scan cannot read at line {line}"
+        elif name in _ENUMERATORS:
+            if (name == "vars" and called and not call.args and not call.keywords) or (
+                    name == "__dict__" and not isinstance(node.ctx, ast.Load)):
+                continue                                    # vars() is locals(); a store reads nothing
+            if observed is not None and name == "__dict__" and isinstance(node.value, ast.Name) \
+                    and isinstance(node.ctx, ast.Load):
+                observe(node, node.value.id)
+            elif observed is not None and name == "vars" and called and isinstance(node, ast.Name) \
+                    and len(call.args) == 1 and isinstance(call.args[0], ast.Name) and not call.keywords:
+                observe(call, ("vars", call.args[0].id, "module"))
+            else:
+                return f"{name} at line {line}: reaches attributes without naming them"
+        elif name in _CODE_RUNNERS:
+            if name == "compile" and not (isinstance(node, ast.Name) or (
+                    isinstance(node.value, ast.Name) and node.value.id in ("builtins", "__builtins__"))):
+                continue                                    # re.compile and its kin run no Python
+            if not (called and call.args and _str_text(call.args[0]) is not None):
+                texts = _observed_code(call, filename, observed) if called else ()
+                if not texts:
+                    return f"{name} of code the scan cannot read at line {line}"
+                for text in texts:
+                    if inner := orig_argv_reason(text, _depth=_depth + 1):
+                        return f"{name} of guarded code: {inner}"
+        elif name in _NAME_RESOLVERS or name in _GETATTRIBUTE:
+            if name == "hasattr":
+                handled.update(id(a) for a in (call.args if called else ()))
+                continue                                    # presence only: orig_argv exists natively too
+            if not called or any(isinstance(a, ast.Starred) for a in call.args) or any(
+                    k.arg is None for k in call.keywords):
+                return f"{name} used other than by a direct call at line {line}"
+            at = len(call.args) - 1 if name in _GETATTRIBUTE else _NAME_RESOLVERS[name]
+            named = list(call.args) if at is None else call.args[at:at + 1]
+            named += [k.value for k in call.keywords if k.arg in ("name", "attr")]
+            texts = [_str_text(a) for a in named]
+            handled.update(id(a) for a in named)
+            receiver = call.args[0] if name == "getattr" and call.args else None
+            # the child re-reads these names right before CALL: only names and constants, which run no code in between
+            checkable = (observed is not None and isinstance(node, ast.Name) and isinstance(receiver, ast.Name)
+                         and all(isinstance(a, (ast.Name, ast.Constant)) for a in call.args))
+            if not named or None in texts:
+                if name == "getattr" and checkable:
+                    if len(named) == 1 and isinstance(named[0], ast.Name):
+                        observe(call, ("getattr", receiver.id, "attribute", named[0].id))
+                    else:
+                        observe(call, ("getattr", receiver.id, "sys"))
+                    continue
+                return f"{name} with a computed name at line {line}"
+            if name == "getattr" and texts[0] == "__dict__" and checkable:
+                observe(call, ("getattr", receiver.id, "module"))
+            elif any(_ORIG_ARGV in t or "__dict__" in t or t in _REFLECTIVE or (
+                    name not in {"__import__", "import_module", "resolve_name", "locate"}
+                    and reflective_field_attribute(t)) for t in texts):
+                return f"{name} of {texts[0][:40]!r} at line {line}"
+    for kind, text, node in _live_strings(tree, filename=filename, observed=observed, runtime=observed is not None):
+        if id(node) in handled:
+            continue
+        if kind in {"field", "opaque-field"}:
+            if reason := _format_selector_reason(kind, text, node):
+                return reason
+        elif kind == "code":
+            inner = orig_argv_reason(text, _depth=_depth + 1) if _depth < 4 else "code nested too deep"
+            if inner:
+                return f"code in a string at line {node.lineno} {inner}"
+        elif _ORIG_ARGV in text or "__dict__" in text or text in _REFLECTIVE:
+            return f"a name {text[:40]!r} at line {node.lineno}"
+    return None
+
+
+def references_orig_argv(source: bytes | str) -> bool:
+    """``orig_argv_reason(source) is not None``."""
+    return orig_argv_reason(source) is not None
+
+
+def references_argv(source: bytes | str) -> bool:
+    """Does the CODE of ``source`` name ``sys.argv`` (or ``sys.orig_argv``, which the former text test ``b"argv" in
+    source`` matched too): an attribute, a name, an import, ``from sys import *``, a string it runs or uses as a name
+    (:func:`_live_strings`)?  A comment ``# argv`` or the data ``"argv"`` is not code (2026-10-29 audit, R2).
+    A computed name is left to the child's object checks and to ``determinism.py``'s ``sys`` allowlist."""
+    import ast
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return False
+    words = ("argv", _ORIG_ARGV)
+    for node in ast.walk(tree):
+        if ((isinstance(node, ast.Attribute) and node.attr in words) or (isinstance(node, ast.Name) and node.id in words)
+                or (isinstance(node, ast.alias) and node.name in words)
+                or (isinstance(node, ast.ImportFrom) and node.module == "sys" and any(a.name == "*" for a in node.names))):
+            return True
+    return any(references_argv(text) if kind == "code" else "argv" in text for kind, text, _ in _live_strings(tree))
 
 
 def _forms(base: str) -> frozenset[str]:
@@ -1190,7 +2026,7 @@ def _is_bound(tree, name: str) -> bool:
 
 
 def proof_blocker(source: str, environment: TaskEnvironment | None = None, *,
-                  filename: str = "<program>") -> str | None:
+                  filename: str = "<program>", world_reads: bool = False) -> str | None:
     """Return the first input effect a proof domain must cover explicitly.
 
     A write-only ``open()`` (:func:`open_effect` is ``"output"``) is not an input effect and is
@@ -1200,6 +2036,9 @@ def proof_blocker(source: str, environment: TaskEnvironment | None = None, *,
     non-builtin ``open`` is a blocker as before."""
     import ast
     from tharkun.solve.extern import native_import_reason
+    from tharkun.solve.static_code import prepared_code
+
+    source, _ = prepared_code(source, filename)
 
     native_reason = native_import_reason(source, filename)
     if native_reason:
@@ -1212,19 +2051,21 @@ def proof_blocker(source: str, environment: TaskEnvironment | None = None, *,
     # the proof domains models replacing that mapping; check before any slicing.
     if _is_bound(tree, "__builtins__"):
         return "__builtins__ binding: unmodelled builtin namespace"
+    # sys.orig_argv is real, unmodelled CPython interpreter metadata ([internal ref] MG
+    # review, 2026-09-29): it reflects how THIS interpreter process was actually
+    # launched (fresh subprocess vs. a reused forked "explore" worker give
+    # DIFFERENT values -- neither is the real application argv), never something
+    # _child.py sets or could set soundly -- block a static TRUE the same as argv,
+    # through every spelling the child's flag sees (an alias, getattr, vars, ...).
+    orig = orig_argv_reason(source)
+    if orig:
+        return f"orig_argv: {orig}: unmodelled interpreter metadata"
     open_rebound = None
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr == "argv":
             return f"argv at line {node.lineno}: any list of strings"
         if isinstance(node, ast.ImportFrom) and node.module == "sys" and any(a.name == "argv" for a in node.names):
             return f"argv at line {node.lineno}: any list of strings"
-        # sys.orig_argv is real, unmodelled CPython interpreter metadata ([internal ref] MG
-        # review, 2026-09-29): it reflects how THIS interpreter process was actually
-        # launched (fresh subprocess vs. a reused forked "explore" worker give
-        # DIFFERENT values -- neither is the real application argv), never something
-        # _child.py sets or could set soundly -- block a static TRUE the same as argv.
-        if isinstance(node, ast.Attribute) and node.attr == "orig_argv":
-            return f"orig_argv at line {node.lineno}: unmodelled interpreter metadata"
         if isinstance(node, ast.Attribute) and node.attr in {"stdin", "__stdin__"}:
             return f"stdin at line {node.lineno}: arbitrary bytes or EOF"
         if not isinstance(node, ast.Call):
@@ -1238,6 +2079,8 @@ def proof_blocker(source: str, environment: TaskEnvironment | None = None, *,
                     open_rebound = _is_bound(tree, "open")
                 if not open_rebound and open_effect(node) == "output":
                     continue
+                if not open_rebound and world_reads:
+                    continue
             path = node.args[0] if node.args else None
             if isinstance(path, ast.Constant) and isinstance(path.value, str) and environment:
                 effect = environment.read_effect(path.value)
@@ -1246,6 +2089,8 @@ def proof_blocker(source: str, environment: TaskEnvironment | None = None, *,
         if name in {"read_text", "read_bytes", "readline", "readlines", "exists",
                     "is_file", "is_dir", "stat", "lstat", "listdir", "scandir",
                     "FileIO", "open_code", "fdopen"}:
+            if world_reads and name in {"readline", "readlines"}:
+                continue
             return f"file or stdin read at line {node.lineno}: arbitrary bytes or OSError"
         if name == "read" and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "os":
             return f"file descriptor read at line {node.lineno}: arbitrary bytes or OSError"

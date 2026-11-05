@@ -9,6 +9,7 @@ instead of a ``nonlocal`` pile each call site had to know by name:
   whose children have not been reaped yet and are invisible to ``os.times()``;
 * **remaining** -- ``budget_seconds`` minus what has been spent, and (unless ``cpu_time_only``,
   the [internal ref] test seam) also minus the wall-clock time since the start, whichever is tighter;
+  or purely wall-clock time remaining when ``wall_clock=True`` ([internal ref], ``find_inputs``);
 * **cap** -- the CPU second at which searching stops (:meth:`capped`): a proof's canary or an
   early stop once every site solved to "no modelled violation".  A cap only ever moves earlier.
   :meth:`allowance` is what ONE run may still use (remaining and what the cap leaves);
@@ -58,9 +59,11 @@ class Goal:
 
 class Ledger:
     def __init__(self, budget_seconds: float, *, cpu_time_only: bool = False,
+                 wall_clock: bool = False,
                  say: Callable[[str], None] = lambda msg: None, goal: Goal | None = None) -> None:
         self.budget_seconds = budget_seconds
         self.cpu_time_only = cpu_time_only
+        self.wall_clock = wall_clock
         self.say = say
         self.goal = goal if goal is not None else Goal()
         self.started = _engine.time.monotonic()
@@ -88,6 +91,8 @@ class Ledger:
         return self.cpu_seconds() - self.cpu_started
 
     def remaining(self) -> float:
+        if self.wall_clock:
+            return self.budget_seconds - (_engine.time.monotonic() - self.started)
         cpu_left = self.budget_seconds - self.spent()
         if self.cpu_time_only:
             return cpu_left
@@ -97,12 +102,20 @@ class Ledger:
     def capped(self, seconds: float, why: str) -> None:
         """Stop searching ``seconds`` of CPU from now (at most a tenth of the budget), unless a
         sooner cap is already in force."""
+        if self.wall_clock:
+            end = _engine.time.monotonic() + min(seconds, self.budget_seconds / 10)
+            if self.cap is None or end < self.cap:
+                self.cap = end
+                self.say(f"search capped at {min(seconds, self.budget_seconds / 10):.0f}s: {why}")
+            return
         end = self.cpu_seconds() + min(seconds, self.budget_seconds / 10)
         if self.cap is None or end < self.cap:
             self.cap = end
             self.say(f"search capped at {min(seconds, self.budget_seconds / 10):.0f}s CPU: {why}")
 
     def at_cap(self) -> bool:
+        if self.wall_clock:
+            return self.cap is not None and _engine.time.monotonic() >= self.cap
         return self.cap is not None and self.cpu_seconds() >= self.cap
 
     # --- when to stop ([internal ref]) -----------------------------------------------------------
@@ -123,13 +136,15 @@ class Ledger:
         """What one run may still use: the remaining budget, and what the cap leaves of it."""
         if self.cap is None:
             return self.remaining()
-        return min(self.remaining(), self.cap - self.cpu_seconds())
+        cap_left = self.cap - _engine.time.monotonic() if self.wall_clock else self.cap - self.cpu_seconds()
+        return min(self.remaining(), cap_left)
 
     def share(self, fraction: float) -> float:
         """``fraction`` of what remains, never more than the cap leaves."""
         budget = self.remaining() * fraction
         if self.cap is not None:
-            budget = min(budget, max(0.0, self.cap - self.cpu_seconds()))
+            cap_left = self.cap - _engine.time.monotonic() if self.wall_clock else self.cap - self.cpu_seconds()
+            budget = min(budget, max(0.0, cap_left))
         return budget
 
     @contextmanager
@@ -141,9 +156,11 @@ class Ledger:
             if canary:
                 seconds = min(seconds, max(1.0, self.allowance() - self._reserved))
             granted = max(0.0, min(seconds, left - self._reserved))
-            self._reserved += granted
+            if not self.wall_clock:
+                self._reserved += granted
         try:
             yield granted
         finally:
-            with self._reservation_lock:
-                self._reserved = max(0.0, self._reserved - granted)
+            if not self.wall_clock:
+                with self._reservation_lock:
+                    self._reserved = max(0.0, self._reserved - granted)

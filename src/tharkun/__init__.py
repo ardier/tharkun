@@ -46,7 +46,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-__version__ = "0.2.1"  # keep in sync with pyproject.toml (tests/test_version_sync.py)
+__version__ = "0.2.2"  # keep in sync with pyproject.toml (tests/test_version_sync.py)
 
 # Public name -> home module.  Order mirrors the historical eager import
 # block so ``__all__`` reads the same way the old module did.
@@ -107,6 +107,9 @@ _EXPORTS: dict[str, str] = {
     "map_call_site": "tharkun.solve.frontend.call_mapper",
     "find_calls_to": "tharkun.solve.frontend.call_mapper",
     "map_call_chain": "tharkun.solve.frontend.call_mapper",
+    # inputs -- the one public search entry above DRIVE/FUZZ ([internal ref], docs/INPUTS.md); its Session is
+    # ``tharkun.inputs.Session``
+    "find_inputs": "tharkun.inputs",
 }
 
 __all__ = list(_EXPORTS)

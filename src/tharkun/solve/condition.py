@@ -6,6 +6,7 @@ free variables and computes concrete values that satisfy the guard.
 from __future__ import annotations
 
 import ast
+import copy
 import logging
 import os
 from dataclasses import dataclass, field
@@ -17,12 +18,19 @@ logger = logging.getLogger(__name__)
 from tharkun.solve.constants import BUILTIN_NAMES
 from tharkun.solve.types import CallableInfo, ParamInfo
 from tharkun.solve.guard import (  # #0606: shared guard-AST helpers; old private names kept
+    attr_chain_parts as _attr_chain_parts,
+    attr_chain_root as _attr_chain_root,
+    const_int as _const_int,
     find_branch_at_line as _find_branch_at_line,
     free_names as _free_names,
+    from_bytes_signed as _from_bytes_signed,
+    is_from_bytes_of as _is_from_bytes_of,
+    iter_byte_input_atoms as _iter_byte_input_atoms,
     try_extract_constant as _try_extract_constant,
     unparse as _unparse,
     unwrap_named_expr as _unwrap_named_expr,
 )
+from tharkun.typeinfer.core.usage import usage_type  # [internal ref] A2: the type rules live in typeinfer, condition delegates
 from tharkun.solve.loop_exit import (  # #0606: loop-exit reasoning split out; names kept for callers
     _LOOP_EXIT_UNKNOWN,
     _collect_break_exits,
@@ -93,33 +101,8 @@ class ConditionSolution:
 
 
 # ---------------------------------------------------------------------------
-# Type inference rules
+# Type inference: the usage rules are tharkun/typeinfer/core/usage.py ([internal ref] A2); ``infer_var_type`` below calls them
 # ---------------------------------------------------------------------------
-
-_STR_METHODS = frozenset({
-    "startswith", "endswith", "upper", "lower", "strip", "lstrip", "rstrip",
-    "split", "rsplit", "join", "replace", "find", "rfind", "index", "rindex",
-    "count", "encode", "format", "isdigit", "isalpha", "isalnum", "title",
-    "capitalize", "swapcase", "zfill", "center", "ljust", "rjust",
-})
-_BYTES_METHODS = frozenset({"decode", "hex"})
-_LIST_METHODS = frozenset({"append", "extend", "pop", "insert", "remove", "sort", "reverse", "copy", "clear"})
-_SET_METHODS = frozenset({"add", "discard", "remove", "update", "intersection", "union", "difference"})
-_DICT_METHODS = frozenset({"keys", "values", "items", "get", "setdefault", "update", "pop", "popitem"})
-
-
-def _type_of_constant(v: Any) -> str:
-    if isinstance(v, bool):
-        return "bool"
-    if isinstance(v, int):
-        return "int"
-    if isinstance(v, float):
-        return "float"
-    if isinstance(v, str):
-        return "str"
-    if isinstance(v, bytes):
-        return "bytes"
-    return "Any"
 
 
 def _resolve_int_constant(node: ast.expr, source_path: str) -> int | None:
@@ -263,97 +246,6 @@ def _extract_bitmask_values(name: str, expr: ast.expr, source_path: str = "") ->
     # Preserve order, drop duplicates.
     seen: set[Any] = set()
     return [v for v in values if not (v in seen or seen.add(v))]
-
-
-def _infer_from_bitwise(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Rule: a name used as an operand of a bitwise operator is an int."""
-    for node in ast.walk(expr):
-        if isinstance(node, ast.BinOp) and isinstance(
-            node.op, (ast.BitAnd, ast.BitOr, ast.BitXor, ast.LShift, ast.RShift)
-        ):
-            for side in (node.left, node.right):
-                if isinstance(side, ast.Name) and side.id == name:
-                    return "int", "bitwise_operand"
-    return None
-
-
-def _infer_from_comparison(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Rule 1: Infer type from comparison with literal."""
-    for node in ast.walk(expr):
-        if not isinstance(node, ast.Compare):
-            continue
-        operands = [node.left, *node.comparators]
-        for op in operands:
-            unwrapped = _unwrap_named_expr(op)
-            if isinstance(unwrapped, ast.Name) and unwrapped.id == name:
-                for other in operands:
-                    if other is op:
-                        continue
-                    val, ok = _try_extract_constant(other)
-                    if ok:
-                        return _type_of_constant(val), "comparison_literal"
-        # Subscript comparison: data[:2] == b"\xfe\xff"
-        # The variable is a container (list/bytes/str), NOT the element type.
-        # We return the container type inferred from the comparison value.
-        for op in operands:
-            if isinstance(op, ast.Subscript) and isinstance(op.value, ast.Name) and op.value.id == name:
-                for other in operands:
-                    if other is op:
-                        continue
-                    if isinstance(other, ast.Constant):
-                        val = other.value
-                        if isinstance(val, bytes):
-                            return "bytes", "subscript"
-                        if isinstance(val, str):
-                            return "list", "subscript"
-                        if isinstance(val, int) and not isinstance(val, bool):
-                            # data[k] == <int> → byte indexing; defer to the
-                            # byte-input rule (Rule 4b) so it infers ``bytes``.
-                            continue
-                        return "list", "subscript"
-    return None
-
-
-def _infer_from_isinstance(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Rule 2: Infer type from isinstance() call."""
-    for node in ast.walk(expr):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Name) and func.id == "isinstance"):
-            continue
-        if len(node.args) < 2:
-            continue
-        arg0 = node.args[0]
-        # Direct Name match, or Attribute chain rooted at name.
-        # isinstance(func.value, ast.Name) → root is "func"
-        if isinstance(arg0, ast.Name) and arg0.id == name:
-            pass  # direct match
-        else:
-            root = arg0
-            while isinstance(root, ast.Attribute):
-                root = root.value
-            if not (isinstance(root, ast.Name) and root.id == name):
-                continue
-        # Second arg: single type or tuple of types.
-        arg1 = node.args[1]
-        if isinstance(arg1, ast.Name):
-            return arg1.id, "isinstance"
-        if isinstance(arg1, ast.Attribute):
-            s = _unparse(arg1)
-            return (s or "Any"), "isinstance"
-        if isinstance(arg1, ast.Tuple):
-            types = []
-            for elt in arg1.elts:
-                if isinstance(elt, ast.Name):
-                    types.append(elt.id)
-                else:
-                    s = _unparse(elt)
-                    if s:
-                        types.append(s)
-            if types:
-                return types[0], "isinstance"
-    return None
 
 
 def _build_self_from_guard_constraints(
@@ -1012,51 +904,6 @@ def _find_isinstance_module_refs(expr: ast.expr) -> set[str]:
     return type_refs
 
 
-def _infer_from_method_call(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Rule 3: Infer type from method call on the variable."""
-    for node in ast.walk(expr):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not isinstance(func, ast.Attribute):
-            continue
-        if not (isinstance(func.value, ast.Name) and func.value.id == name):
-            continue
-        method = func.attr
-        # Check for bytes-arg startswith/endswith specifically
-        if method in ("startswith", "endswith") and node.args:
-            arg = node.args[0]
-            if isinstance(arg, ast.Constant) and isinstance(arg.value, bytes):
-                return "bytes", "method_call"
-        if method in _STR_METHODS:
-            return "str", "method_call"
-        if method in _BYTES_METHODS:
-            return "bytes", "method_call"
-        if method in _LIST_METHODS:
-            return "list", "method_call"
-        if method in _SET_METHODS:
-            return "set", "method_call"
-        if method in _DICT_METHODS:
-            return "dict", "method_call"
-    return None
-
-
-def _infer_from_hasattr(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Detect ``hasattr(name, "attr")`` and return ``("object", "hasattr")``."""
-    for node in ast.walk(expr):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Name) and func.id == "hasattr"):
-            continue
-        if len(node.args) < 2:
-            continue
-        arg0 = node.args[0]
-        if isinstance(arg0, ast.Name) and arg0.id == name:
-            return "object", "hasattr"
-    return None
-
-
 def _extract_hasattr_attr_name(name: str, expr: ast.expr) -> str | None:
     """Extract the attribute name from ``hasattr(name, "attr")``."""
     for node in ast.walk(expr):
@@ -1071,63 +918,6 @@ def _extract_hasattr_attr_name(name: str, expr: ast.expr) -> str | None:
         if isinstance(arg0, ast.Name) and arg0.id == name:
             if isinstance(arg1, ast.Constant) and isinstance(arg1.value, str):
                 return arg1.value
-    return None
-
-
-def _infer_from_method_chain(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Rule 3b: Detect method chains like ``obj.method().attr`` or ``obj.method().method2()``.
-
-    Traverses ``Call.func.value`` chains to find if the root is our variable.
-    Returns ``("object", "method_chain")`` if found.
-    """
-    for node in ast.walk(expr):
-        if not isinstance(node, ast.Call):
-            continue
-        # Walk down the chain: func.value might be another Call or Attribute
-        cur: ast.AST = node.func
-        depth = 0
-        while depth < 10:
-            if isinstance(cur, ast.Attribute):
-                if isinstance(cur.value, ast.Name) and cur.value.id == name:
-                    return "object", "method_chain"
-                if isinstance(cur.value, ast.Call):
-                    cur = cur.value.func
-                    depth += 1
-                    continue
-                break
-            break
-    return None
-
-
-def _attr_chain_root(node: ast.AST) -> str | None:
-    """Return the root ``Name.id`` of an attribute chain, or ``None``.
-
-    ``c.kind``          -> ``"c"``
-    ``node.value.id``   -> ``"node"``
-    ``foo()``           -> ``None``
-    """
-    cur = node
-    while isinstance(cur, ast.Attribute):
-        cur = cur.value
-    if isinstance(cur, ast.Name):
-        return cur.id
-    return None
-
-
-def _attr_chain_parts(node: ast.AST) -> list[str] | None:
-    """Return the attribute chain as a list of attribute names (excluding root).
-
-    ``c.kind``        -> ``["kind"]``
-    ``node.value.id`` -> ``["value", "id"]``
-    """
-    parts: list[str] = []
-    cur = node
-    while isinstance(cur, ast.Attribute):
-        parts.append(cur.attr)
-        cur = cur.value
-    if isinstance(cur, ast.Name):
-        parts.reverse()
-        return parts
     return None
 
 
@@ -1213,25 +1003,6 @@ def _build_typed_attr_value(
         return current
     except Exception:
         return _build_attr_satisfying_value(parts, leaf_val)
-
-
-def _infer_from_attr_comparison(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Rule 3c: Infer type from ``obj.attr == literal`` or ``obj.attr in {literals}``.
-
-    Detects patterns where an attribute of the variable is compared with a
-    literal.  Returns ``("object", "attr_comparison")`` so the solver knows
-    *name* is an object whose attribute has a constrained value.
-    """
-    for node in ast.walk(expr):
-        if not isinstance(node, ast.Compare):
-            continue
-        left = node.left
-        if isinstance(left, ast.Attribute) and _attr_chain_root(left) == name:
-            return "object", "attr_comparison"
-        for comp in node.comparators:
-            if isinstance(comp, ast.Attribute) and _attr_chain_root(comp) == name:
-                return "object", "attr_comparison"
-    return None
 
 
 def _extract_attr_comparison_values(
@@ -1399,50 +1170,6 @@ def _extract_field_resolved_attr_values(
     return values
 
 
-def _infer_from_attr_chain_truthiness(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Rule 3e: Detect bare attribute chain truthiness.
-
-    Patterns:
-    - ``obj.a.b`` as standalone (truthiness)
-    - ``obj.a.b`` as a value in ``BoolOp(And/Or)``
-    - ``not obj.a.b`` (negated truthiness)
-
-    Returns ``("object", "attr_truthiness")`` if a multi-level attribute
-    chain rooted at *name* is used for truthiness (not in a comparison).
-    """
-    # Check if the whole expression is an attribute chain
-    if isinstance(expr, ast.Attribute) and _attr_chain_root(expr) == name:
-        parts = _attr_chain_parts(expr)
-        if parts and len(parts) >= 1:
-            return "object", "attr_truthiness"
-
-    # Check UnaryOp(Not, obj.a.b)
-    if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
-        if isinstance(expr.operand, ast.Attribute) and _attr_chain_root(expr.operand) == name:
-            parts = _attr_chain_parts(expr.operand)
-            if parts and len(parts) >= 1:
-                return "object", "attr_truthiness_negated"
-
-    # Check inside BoolOp values
-    for node in ast.walk(expr):
-        if not isinstance(node, ast.BoolOp):
-            continue
-        for value in node.values:
-            if isinstance(value, ast.Attribute) and _attr_chain_root(value) == name:
-                parts = _attr_chain_parts(value)
-                if parts and len(parts) >= 1:
-                    return "object", "attr_truthiness"
-            # not obj.a.b inside BoolOp
-            if (isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.Not)
-                    and isinstance(value.operand, ast.Attribute)
-                    and _attr_chain_root(value.operand) == name):
-                parts = _attr_chain_parts(value.operand)
-                if parts and len(parts) >= 1:
-                    return "object", "attr_truthiness_negated"
-
-    return None
-
-
 def _extract_attr_truthiness_value(
     name: str,
     expr: ast.expr,
@@ -1535,146 +1262,6 @@ def _extract_self_identity_values(
     return values
 
 
-def _infer_from_type_is(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Detect ``type(name) is T`` or ``type(name) is not T`` patterns."""
-    for node in ast.walk(expr):
-        if not isinstance(node, ast.Compare):
-            continue
-        left = node.left
-        for op, comp in zip(node.ops, node.comparators):
-            # type(name) is T
-            if (isinstance(op, (ast.Is, ast.IsNot))
-                    and isinstance(left, ast.Call)
-                    and isinstance(left.func, ast.Name) and left.func.id == "type"
-                    and left.args and isinstance(left.args[0], ast.Name)
-                    and left.args[0].id == name
-                    and isinstance(comp, ast.Name)):
-                type_name = comp.id
-                if type_name in ("tuple", "list", "dict", "set", "str", "int", "float", "bytes", "bool"):
-                    if isinstance(op, ast.Is):
-                        return type_name, "type_is"
-            left = comp
-    return None
-
-
-def _infer_from_membership_target(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Rule 3f: If name is the RHS of `x in name` or `x not in name`, it's a collection.
-
-    Also: if name is the LHS of `name in collection`, infer its type from
-    the collection's known type if possible.
-    """
-    for node in ast.walk(expr):
-        if not isinstance(node, ast.Compare):
-            continue
-        left = node.left
-        for op, comp in zip(node.ops, node.comparators):
-            # x in name / x not in name → name is a set/list
-            if isinstance(op, (ast.In, ast.NotIn)):
-                if isinstance(comp, ast.Name) and comp.id == name:
-                    return "set", "membership_target"
-            # name in x → name needs to match x's element type
-            # (handled elsewhere — skip here)
-            left = comp
-    return None
-
-
-def _infer_from_subscript(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Rule 4: Infer from subscript access.
-
-    Returns ``"dict"`` when the slice is a string constant (``data["key"]``),
-    ``"list"`` otherwise (``data[0]``).
-    """
-    for node in ast.walk(expr):
-        if not isinstance(node, ast.Subscript):
-            continue
-        if isinstance(node.value, ast.Name) and node.value.id == name:
-            # data["key"] → dict; data[0] → list
-            sl = node.slice
-            if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
-                return "dict", "subscript"
-            return "list", "subscript"
-    return None
-
-
-def _iter_byte_input_atoms(name: str, expr: ast.expr):
-    """Yield ``(kind, subscript_node, op, target_int, signed)`` for byte-input atoms.
-
-    A *byte-input atom* is a comparison whose variable operand is either:
-
-    * ``name[k]`` (subscript of the bytes variable) compared to an int, or
-    * ``int.from_bytes(name[i:j], order)`` compared to an int.
-
-    ``kind`` is ``"index"`` or ``"from_bytes"``. ``op`` is the (un-flipped,
-    variable-on-the-left) comparison operator. ``target_int`` is the int the
-    atom is compared against (a plain or *negated* literal), or ``None`` for
-    ``==``/``!=`` without a usable constant. ``signed`` is the ``from_bytes``
-    call's ``signed=`` kwarg (always False for an index atom). Only int
-    comparators are considered — bytes/str literal comparisons are handled by
-    the existing subscript path.
-    """
-    for node in ast.walk(expr):
-        if not isinstance(node, ast.Compare):
-            continue
-        left = node.left
-        for op, comparator in zip(node.ops, node.comparators):
-            left_u = _unwrap_named_expr(left)
-            comp_u = _unwrap_named_expr(comparator)
-            for var_side, other_side, eff_op in (
-                (left_u, comp_u, op),
-                (comp_u, left_u, _flip_compare_op(op)),
-            ):
-                target = _const_int(other_side)   # handles plain and negated literals
-                # name[k] — direct subscript of the bytes variable.
-                if (isinstance(var_side, ast.Subscript)
-                        and isinstance(var_side.value, ast.Name)
-                        and var_side.value.id == name):
-                    yield ("index", var_side, eff_op, target, False)
-                    break
-                # int.from_bytes(name[i:j], order [, signed=...])
-                if _is_from_bytes_of(var_side, name):
-                    yield ("from_bytes", var_side.args[0], eff_op, target,
-                           _from_bytes_signed(var_side))
-                    break
-            left = comparator
-
-
-def _flip_compare_op(op: ast.cmpop) -> ast.cmpop:
-    """Return the operator with operands swapped (``a < b`` ⇔ ``b > a``)."""
-    return {
-        ast.Lt: ast.Gt(), ast.Gt: ast.Lt(),
-        ast.LtE: ast.GtE(), ast.GtE: ast.LtE(),
-        ast.Eq: ast.Eq(), ast.NotEq: ast.NotEq(),
-    }.get(type(op), op)
-
-
-def _is_from_bytes_of(node: ast.expr, name: str) -> bool:
-    """True if *node* is ``int.from_bytes(name[i:j], ...)`` (any byteorder)."""
-    if not (isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "from_bytes"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "int"
-            and node.args):
-        return False
-    arg0 = node.args[0]
-    return (isinstance(arg0, ast.Subscript)
-            and isinstance(arg0.value, ast.Name)
-            and arg0.value.id == name)
-
-
-def _infer_from_byte_input(name: str, expr: ast.expr) -> tuple[str, str] | None:
-    """Rule 4b: ``name`` is ``bytes`` when tested via byte index or from_bytes.
-
-    Recognizes ``name[k] <op> <int>`` and
-    ``int.from_bytes(name[i:j], order) <op> <int>``. Returns ``("bytes",
-    "byte_input")`` so value generation synthesizes a satisfying bytes object.
-    Runs before the generic subscript rule (which would say ``list``).
-    """
-    for _atom in _iter_byte_input_atoms(name, expr):
-        return "bytes", "byte_input"
-    return None
-
-
 def _infer_from_param_hint(
     name: str,
     callable_info: CallableInfo | None,
@@ -1700,6 +1287,13 @@ def infer_var_type(
 
     Returns ``(type_string, inference_source)``.
 
+    The usage rules (isinstance, comparison, method call, attribute, subscript,
+    byte input ...) are ``tharkun.typeinfer.core.usage.usage_type``; the same code
+    types a parameter from its uses in a function body (docs/TYPEINFER.md,
+    source 3).  This function adds what only a guard solver has: the
+    ``self``/``cls`` receivers, the declared hint from *callable_info*, the
+    *facts*, and the ``Any`` fallback.
+
     When *facts* is a ``FactEnv`` (from ``tharkun.minleaf.types``), external
     constraints can bias type inference.  Facts are consulted after all local
     rules but before the fallback.
@@ -1710,64 +1304,8 @@ def infer_var_type(
     if name == "cls":
         return "type", "self_attr"
 
-    # Rule 2: isinstance (highest signal)
-    r = _infer_from_isinstance(name, expr)
-    if r:
-        return r
-
-    # Rule 1: comparison with literal
-    r = _infer_from_comparison(name, expr)
-    if r:
-        return r
-
-    # Rule 1b: bitwise operand — `flags & MASK` makes flags an int
-    r = _infer_from_bitwise(name, expr)
-    if r:
-        return r
-
-    # Rule 3: method call
-    r = _infer_from_method_call(name, expr)
-    if r:
-        return r
-
-    # Rule 3b: method chain (obj.method().attr)
-    r = _infer_from_method_chain(name, expr)
-    if r:
-        return r
-
-    # Rule 3c: hasattr(name, "attr")
-    r = _infer_from_hasattr(name, expr)
-    if r:
-        return r
-
-    # Rule 3d: attribute comparison (obj.attr == literal / obj.attr in {..})
-    r = _infer_from_attr_comparison(name, expr)
-    if r:
-        return r
-
-    # Rule 3e: bare attribute chain truthiness (obj.a.b.c or not obj.a.b)
-    r = _infer_from_attr_chain_truthiness(name, expr)
-    if r:
-        return r
-
-    # Rule 3f: type(x) is T → x is T
-    r = _infer_from_type_is(name, expr)
-    if r:
-        return r
-
-    # Rule 3g: membership target type — `x in name` or `x not in name` → name is a collection
-    r = _infer_from_membership_target(name, expr)
-    if r:
-        return r
-
-    # Rule 4b: byte-input (data[k] / int.from_bytes(data[i:j])) — before the
-    # generic subscript rule, which would mis-infer ``list``.
-    r = _infer_from_byte_input(name, expr)
-    if r:
-        return r
-
-    # Rule 4: subscript
-    r = _infer_from_subscript(name, expr)
+    # Rules 1-4: the usage rules, in priority order
+    r = usage_type(name, expr)
     if r:
         return r
 
@@ -2046,18 +1584,6 @@ def _extract_comparison_values(
 # defers expression inversion to glamdring).
 
 
-def _const_int(node: ast.expr) -> int | None:
-    """Return the int value of a Constant / negated-Constant node, else None."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
-        return node.value
-    if (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
-            and isinstance(node.operand, ast.Constant)
-            and isinstance(node.operand.value, int)
-            and not isinstance(node.operand.value, bool)):
-        return -node.operand.value
-    return None
-
-
 def _slice_bounds(sub: ast.Subscript) -> tuple[int, int, bool] | None:
     """Resolve a subscript slice into ``(start, length, is_single_index)``.
 
@@ -2097,14 +1623,6 @@ def _from_bytes_order(call: ast.Call) -> str:
                 and isinstance(kw.value.value, str):
             return kw.value.value
     return "big"  # Python's default since 3.11
-
-
-def _from_bytes_signed(call: ast.Call) -> bool:
-    """True if an ``int.from_bytes`` call passes ``signed=True`` (default False)."""
-    for kw in call.keywords:
-        if kw.arg == "signed" and isinstance(kw.value, ast.Constant):
-            return bool(kw.value.value)
-    return False
 
 
 def _target_int_for_op(op: ast.cmpop, target: int | None, width: int,
@@ -2420,6 +1938,21 @@ def _resolve_compiled_pattern(
     # to a non-``re.compile`` value, which would import the module to no purpose.
     if assigned_here and not evidence_compiled:
         return None
+    if tree is not None and not assigned_here:
+        # ``from .mod import PAT [as alias]`` or ``from .mod import *``: read the sibling file's definition from its AST (no import, one level)
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.level and node.module:
+                for alias in node.names:
+                    if alias.name != "*" and (alias.asname or alias.name) != pat_name:
+                        continue
+                    base = os.path.dirname(os.path.realpath(source_path))
+                    for _ in range(node.level - 1):
+                        base = os.path.dirname(base)
+                    sibling = os.path.join(base, *node.module.split(".")) + ".py"
+                    if os.path.isfile(sibling) and os.path.realpath(sibling) != os.path.realpath(source_path):
+                        found = _resolve_compiled_pattern(pat_name if alias.name == "*" else alias.name, sibling)
+                        if found is not None:
+                            return found
     try:
         from tharkun.solve.loader import load_module_for_execution
 
@@ -2430,6 +1963,80 @@ def _resolve_compiled_pattern(
     except Exception:
         pass
     return None
+
+
+_JSON_VALUES = ([], {}, [0], {"a": 0}, [[]], [{}], "x")
+
+
+def _body_parses_json(rp: str, lineno: int, name: str) -> bool:
+    """Does the branch taken at ``lineno`` call ``json.loads(name)`` (``loads(name)``) in its body?"""
+    try:
+        tree = ast.parse(Path(rp).read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, SyntaxError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and node.lineno == lineno:
+            for stmt in node.body:
+                for call in ast.walk(stmt):
+                    if (isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Name)
+                            and call.args[0].id == name
+                            and _unparse(call.func) in ("json.loads", "loads")):
+                        return True
+    return False
+
+
+def _regex_guard_witness(pattern, flags: int, is_bytes: bool, const_name, name: str, test_expr: ast.expr, rp: str,
+                         lineno: int):
+    """A str that the regex-membership preimage builds and that satisfies the WHOLE guard, or ``(None, False)``.
+
+    ``None`` when the pattern is outside the member generator (bytes, backreferences, ...: the caller keeps its own route).
+    Candidates are the deterministic members of the pattern (``regex_members.members``) and, when the branch body then calls
+    ``json.loads(name)``, first the texts the ``json.loads`` preimage writes for a few JSON values that ALSO match the
+    pattern, so the witness reaches the parse. Each candidate is checked by evaluating the guard itself with the compiled
+    pattern bound; a candidate that fails is never returned."""
+    if is_bytes or not isinstance(pattern, str):
+        return None
+    import re as _re
+    from tharkun.solve.preimage import regex_members as RM
+    if RM.refusal(pattern, flags):
+        return None
+    try:
+        compiled = _re.compile(pattern, flags)
+    except _re.error:
+        return None
+    guard_src = _unparse(test_expr) or ""
+    candidates: list[str] = []
+    if _body_parses_json(rp, lineno, name):
+        from tharkun.solve.preimage import Eq, HOLE, preimages
+        from tharkun.solve.contracts.rules import Refused
+        for value in _JSON_VALUES:
+            got = preimages("json.loads", Eq(value), (HOLE,), budget=4)
+            if not isinstance(got, Refused):
+                candidates.extend(got)
+    candidates.extend(RM.members(pattern, flags, how="match", limit=12))
+    parses = _body_parses_json(rp, lineno, name)
+    kept: dict[bool, str] = {}          # False: first witness whose parse succeeds (or any, if the body has none); True: first whose parse raises
+    for text in dict.fromkeys(candidates):
+        env: dict[str, Any] = {name: text}
+        if const_name is not None:
+            env[const_name] = compiled
+        if not _verify_guard_satisfaction(guard_src, env):
+            continue
+        kept.setdefault(parses and _json_loads_raises(text), text)
+        if not parses:
+            break
+    # parse witness first, then the one that reaches the handler of the try around json.loads (validation.py 362/363)
+    found = [kept[k] for k in (False, True) if k in kept]
+    return (found, True) if found else (None, False)
+
+
+def _json_loads_raises(text: str) -> bool:
+    import json
+    try:
+        json.loads(text)
+    except (TypeError, ValueError, OverflowError):
+        return True
+    return False
 
 
 def _extract_regex_pattern(
@@ -3450,6 +3057,7 @@ def _solve_single_expr(
         # fails the guard — the guard is unsatisfiable, so the type-default placeholder must
         # NOT be injected below (that would report a non-satisfying b'' as type_inferred).
         byte_unsat = False
+        regex_unsolved = False
         if inferred_type == "bytes" and not direct_values:
             byte_vals = _extract_byte_input_values(name, test_expr)
             single_var = (_free_names(test_expr) - set(builtins_names)) <= {name}
@@ -3503,7 +3111,21 @@ def _solve_single_expr(
             spec = _extract_regex_pattern(name, test_expr, rp)
             if spec is not None:
                 pattern, flags, is_bytes, const_name = spec
-                regex_val = _generate_from_regex(pattern, flags=flags, is_bytes=is_bytes)
+                members = _regex_guard_witness(pattern, flags, is_bytes, const_name, name, test_expr, rp, lineno)
+                if members is not None:
+                    values, solved = members
+                    if solved:
+                        direct_values = values
+                        inferred_type = "bytes" if is_bytes else "str"
+                        source_kind = "regex_pattern"
+                        strategy_hint = f"regex members of {pattern!r}"
+                        if const_name is not None:
+                            import re as _re_
+                            scope_resolved[const_name] = _re_.compile(pattern, flags)
+                    else:
+                        regex_unsolved = True      # a regex we can enumerate, and no member satisfies the guard: refuse
+                regex_val = (None if direct_values or regex_unsolved
+                             else _generate_from_regex(pattern, flags=flags, is_bytes=is_bytes))
                 # A drawn value is only accepted if it actually satisfies the guard — a bad
                 # draw, a negated guard (`if not PAT.match(x)`, where a match is wrong), or a
                 # same-named non-regex PAT is rejected here rather than returned as a false
@@ -3543,7 +3165,7 @@ def _solve_single_expr(
                             break
             satisfying[name] = best_val
         else:
-            len_min = _extract_len_constraint(name, test_expr)
+            len_min = None if regex_unsolved else _extract_len_constraint(name, test_expr)
             if len_min is not None and len_min >= 0:
                 # len_min == 0 is a real answer (a `len(x) == 0` / `<= 0` guard is satisfied
                 # by the EMPTY value), not "no constraint" — build the empty str/bytes/list.
@@ -3560,7 +3182,7 @@ def _solve_single_expr(
                 if direct_values:
                     satisfying[name] = direct_values[0]
 
-            if not direct_values and not byte_unsat:
+            if not direct_values and not byte_unsat and not regex_unsolved:
                 all_direct = False
                 default = _default_value_for_type(inferred_type)
                 if default is None and source_kind == "isinstance":
@@ -3570,7 +3192,7 @@ def _solve_single_expr(
                     default = True
                 if default is not None:
                     satisfying[name] = default
-            elif byte_unsat:
+            elif byte_unsat or regex_unsolved:
                 # The byte guard is unsatisfiable: no placeholder — leave `name` unbound so
                 # `solve_condition` reports strategy "none" rather than a false type_inferred.
                 all_direct = False
@@ -3599,7 +3221,34 @@ def _solve_single_expr(
             concrete_values=direct_values, strategy_hint=strategy_hint,
         ))
 
+    witness = _method_equality_witness(test_expr)
+    if witness is not None:
+        satisfying.update(witness)
+        all_direct = True
     return variables, satisfying, all_direct, scope_resolved
+
+
+def _method_equality_witness(expr: ast.expr) -> dict[str, Any] | None:
+    """``name.method(literal args) == "literal"`` solved by the str preimage engine (``solve/preimage``), not a type default:
+    the generic str default ``'x'`` does not satisfy ``s.strip() == ''`` (the blank-string arm of ``is_full_string``). The
+    candidate is built by the method's preimage and re-checked by evaluating the guard itself; ``None`` when the guard is
+    not that shape or no candidate verifies (the caller keeps its own answer)."""
+    if not (isinstance(expr, ast.Compare) and len(expr.ops) == 1 and isinstance(expr.ops[0], ast.Eq)
+            and isinstance(expr.comparators[0], ast.Constant) and isinstance(expr.comparators[0].value, str)
+            and isinstance(expr.left, ast.Call) and isinstance(expr.left.func, ast.Attribute)
+            and isinstance(expr.left.func.value, ast.Name) and not expr.left.keywords
+            and all(isinstance(a, ast.Constant) for a in expr.left.args)):
+        return None
+    from tharkun.solve.preimage import Eq, HOLE, preimages
+    from tharkun.solve.contracts.rules import Refused
+    name, target = expr.left.func.value.id, expr.comparators[0].value
+    result = preimages("str." + expr.left.func.attr, Eq(target), (HOLE, *(a.value for a in expr.left.args)), budget=1)
+    if isinstance(result, Refused):
+        return None
+    for candidate in result:
+        if _verify_guard_satisfaction(_unparse(expr) or "", {name: candidate}):
+            return {name: candidate}
+    return None
 
 
 def _solve_or_branches(
@@ -3639,6 +3288,11 @@ def _solve_or_branches(
     from tharkun.solve.config import config as _cfg
 
     if satisfying_inputs:
+        # A branch witness that does not satisfy the whole guard is not a witness: when the guard can be evaluated and some
+        # branch's inputs satisfy it, keep exactly those (an unevaluable guard keeps every branch's answer as before).
+        verified = [inp for inp in satisfying_inputs if _verify_guard_satisfaction(guard_source, inp)]
+        if verified:
+            satisfying_inputs, any_direct = verified, True
         # Verification: check if any branch's inputs satisfy the full or-guard
         if not any_direct:
             for inp in satisfying_inputs:
@@ -3661,6 +3315,207 @@ def _solve_or_branches(
     )
 
 
+_INLINE_DEPTH = 4
+_INLINE_MAX_NODES = 400
+
+
+def _pure_helper_table(tree: ast.Module) -> dict[str, ast.FunctionDef]:
+    """Module-level functions whose body is (an optional docstring and) ONE ``return <expr>``: plain positional parameters,
+    no decorators, defaults, ``*args``/``**kwargs``, no lambda/comprehension/walrus in the expression (they would capture
+    or rebind the parameter names the substitution renames)."""
+    table: dict[str, ast.FunctionDef] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.decorator_list:
+            continue
+        a = node.args
+        if a.vararg or a.kwarg or a.kwonlyargs or a.defaults or a.kw_defaults or a.posonlyargs:
+            continue
+        body = list(node.body)
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            body = body[1:]
+        if len(body) != 1 or not isinstance(body[0], ast.Return) or body[0].value is None:
+            continue
+        if any(isinstance(n, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.NamedExpr,
+                              ast.Await, ast.Yield, ast.YieldFrom)) for n in ast.walk(body[0].value)):
+            continue
+        table[node.name] = node
+    return table
+
+
+def _visible_helpers(tree: ast.Module, source_dir: str) -> dict[str, tuple[ast.FunctionDef, dict]]:
+    """Helpers a module can call by name: its own single-``return`` functions, and the ones it imports with a RELATIVE
+    ``from .mod import name [as alias]`` from a sibling file (parsed read-only, one level; that file's own helpers are the
+    scope its bodies are inlined in). Maps name -> (function, the table to inline that function's body with)."""
+    own = _pure_helper_table(tree)
+    visible: dict[str, tuple[ast.FunctionDef, dict]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.level and node.module:
+            base = source_dir
+            for _ in range(node.level - 1):
+                base = os.path.dirname(base)
+            path = os.path.join(base, *node.module.split(".")) + ".py"
+            try:
+                other = _pure_helper_table(ast.parse(Path(path).read_text(encoding="utf-8", errors="ignore")))
+            except (OSError, SyntaxError, ValueError):
+                continue
+            scope = {n: (f, {}) for n, f in other.items()}
+            for alias in node.names:
+                if alias.name in other:
+                    visible[alias.asname or alias.name] = (other[alias.name], scope)
+    for name, fn in own.items():
+        visible[name] = (fn, {})        # own table filled below (it contains itself, cut by the active-set)
+    for name in own:
+        visible[name] = (own[name], visible)
+    return visible
+
+
+def _loop_guard_solution(tree: ast.Module, rp: str, lineno: int, desired_branch: str, guard_source: str) -> ConditionSolution | None:
+    """The guard at *lineno* inside ``for k in range(..)`` solved through its local aliases (``solve/loop_guard.py``), or
+    ``None`` when the shape is not that one (the ordinary route then runs)."""
+    from tharkun.solve.loop_guard import solve_loop_guard
+
+    def solve_guard(line: int, branch: str):
+        sol = solve_condition(rp, line, desired_branch=branch, _loop_guard=False)
+        return sol.satisfying_inputs[0] if sol.strategy.startswith("direct") and sol.satisfying_inputs else None
+
+    def check(expr: ast.expr, env: dict[str, Any]) -> bool:
+        src = _unparse(_inline_pure_helpers(expr, tree, lineno, os.path.dirname(rp)))
+        try:           # plain eval: _verify_guard_satisfaction's guard tracer answers `not x != y` False for x == y
+            return bool(src) and bool(eval(src, _safe_eval_globals(), dict(env)))
+        except Exception:
+            return False
+
+    witnesses = solve_loop_guard(tree, lineno, desired_branch, solve_guard, check)
+    if not witnesses:
+        return None
+    from tharkun.solve.config import config as _cfg
+    return ConditionSolution(
+        guard_source=guard_source, satisfying_inputs=witnesses, strategy="direct", confidence=_cfg.confidence_verified,
+        desired_branch=desired_branch,
+        explanation=f"Guard {guard_source!r} is over loop locals; solved through their aliases to the parameters "
+                    f"(index-affine character relation, minimal length, str-method preimages) and checked natively.",
+    )
+
+
+def _dead_arm_solution(tree: ast.Module, rp: str, lineno: int, desired_branch: str, guard_source: str) -> ConditionSolution | None:
+    """An arm refuted from what the program can and cannot do (``solve/dead_arms.py``: a dict key nothing writes, a callee that
+    cannot raise the exception every iteration would have to raise): ``infeasible`` with the refutation as the proof."""
+    from tharkun.solve.dead_arms import refute_arm
+    refutation = refute_arm(tree, rp, lineno, desired_branch)
+    if refutation is None:
+        return None
+    return ConditionSolution(
+        guard_source=guard_source, strategy="infeasible", confidence=1.0, desired_branch=desired_branch,
+        explanation=f"The {desired_branch} arm of {guard_source!r} is unreachable: {refutation['constraint']}.",
+        input_constraints={"refutation": refutation})
+
+
+def _environment_solution(tree: ast.Module, test_expr: ast.expr, desired_branch: str) -> ConditionSolution | None:
+    """A guard that reads only interpreter constants (``sys.version_info.minor == 6``, ``sys.platform == 'win32'``) is decided by
+    the interpreter this runs on: the arm it takes needs no input (``{}``), the other arm is infeasible, with the constant as
+    the stated reason (``refutation.kind == "environment"``: sound for this interpreter, not for the library's other Pythons)."""
+    from tharkun.solve.path_guard import environment_modules, environment_truth
+    value = environment_truth(test_expr)
+    if value is None:
+        return None
+    imported = {a.asname or a.name for n in tree.body if isinstance(n, ast.Import) for a in n.names}
+    if not environment_modules(test_expr) <= imported:          # `sys`/`os` must be the imported modules, not other names
+        return None
+    guard = _unparse(test_expr) or ""
+    from tharkun.solve.config import config as _cfg
+    if value == (desired_branch == "then"):
+        return ConditionSolution(guard_source=guard, satisfying_inputs=[{}], strategy="direct", confidence=_cfg.confidence_verified,
+                                 desired_branch=desired_branch,
+                                 explanation=f"Guard {guard!r} reads only interpreter constants and holds as asked on this interpreter: any input.")
+    import sys
+    constraint = f"{guard} is {value} on this interpreter (CPython {sys.version.split()[0]})"
+    return ConditionSolution(guard_source=guard, strategy="infeasible", confidence=1.0, desired_branch=desired_branch,
+                             explanation=f"The {desired_branch} arm of {guard!r} is unreachable: {constraint}.",
+                             input_constraints={"refutation": {"kind": "environment", "constraint": constraint, "guard": guard}})
+
+
+def _path_guard_solution(tree: ast.Module, rp: str, lineno: int, desired_branch: str, guard_source: str) -> ConditionSolution | None:
+    """The ``if`` at *lineno* solved path-sensitively over the function's ENTRY inputs (``solve/path_guard.py``), or ``None``
+    when a literal of the path is outside what that module solves (the ordinary route then runs)."""
+    from tharkun.solve.path_guard import Infeasible, Unsupported, solve_path_guard
+
+    fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+           and n.lineno <= lineno <= (n.end_lineno or n.lineno)]
+    if not fns:
+        return None
+    fn = max(fns, key=lambda n: n.lineno)
+    try:
+        witnesses, text = solve_path_guard(fn, lineno, desired_branch, rp)
+    except Unsupported:
+        return None
+    except Infeasible as refuted:        # the arm is refuted (owner 1365): the constraint is the proof; the driver and equivalence read it
+        return ConditionSolution(
+            guard_source=guard_source or str(refuted.detail.get("guard", "")), strategy="infeasible", confidence=1.0,
+            desired_branch=desired_branch,
+            explanation=f"The {desired_branch} arm of {guard_source!r} is unreachable: {refuted.constraint}.",
+            input_constraints={"refutation": {"constraint": refuted.constraint, **{k: str(v) for k, v in refuted.detail.items()}}},
+        )
+    from tharkun.solve.config import config as _cfg
+    variables = [VarConstraint(name=name, inferred_type=type(witnesses[0][name]).__name__, inference_source="path",
+                               concrete_values=[w[name] for w in witnesses])
+                 for name in dict.fromkeys(k for w in witnesses for k in w)]
+    return ConditionSolution(
+        guard_source=guard_source or text, variables=variables, satisfying_inputs=witnesses, strategy="direct",
+        confidence=_cfg.confidence_verified, desired_branch=desired_branch,
+        explanation=f"Guard {guard_source!r} solved along its path (copy-propagated assignments, enclosing branch arms, "
+                    f"early exits) to the entry inputs; every witness satisfies the whole path.",
+    )
+
+
+def _inline_pure_helpers(test_expr: ast.expr, tree: ast.Module, lineno: int, source_dir: str = "") -> ast.expr:
+    """Replace calls to single-``return`` helpers (``is_string``, ``is_full_string``) defined in this module or imported from
+    a sibling by a relative import by their returned expression with the arguments substituted, so the guard is solved
+    over the real predicate instead of an opaque call that the solver would otherwise treat as a free variable (and answer
+    with a value that does not satisfy it).
+
+    Exact for pure expressions: only ``Name``/``Constant`` arguments are substituted (a repeated argument is evaluated
+    again, harmless for these), the call is exact-arity with no keywords, recursion is cut (a helper is not inlined
+    inside itself), the depth and node budget are bounded, and a callee name the enclosing function rebinds as a parameter
+    or local is left alone. A helper with statements, loops, effects or unknown shape stays an opaque call."""
+    table = _visible_helpers(tree, source_dir)
+    if not table:
+        return test_expr
+    rebound: set[str] = set()
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.lineno <= lineno <= (fn.end_lineno or fn.lineno):
+            rebound |= {a.arg for a in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)}
+            rebound |= {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+
+    class Inliner(ast.NodeTransformer):
+        def __init__(self, scope: dict, active: tuple[str, ...]):
+            self.scope, self.active = scope, active
+
+        def visit_Call(self, node: ast.Call):
+            node = self.generic_visit(node)
+            f = node.func
+            if not (isinstance(f, ast.Name) and f.id in self.scope and f.id not in rebound and f.id not in self.active
+                    and len(self.active) < _INLINE_DEPTH and not node.keywords):
+                return node
+            fn, inner_scope = self.scope[f.id]
+            params = [a.arg for a in fn.args.args]
+            if len(node.args) != len(params) or not all(isinstance(x, (ast.Name, ast.Constant)) for x in node.args):
+                return node
+            mapping = dict(zip(params, node.args))
+
+            class Subst(ast.NodeTransformer):
+                def visit_Name(self, name: ast.Name):
+                    return copy.deepcopy(mapping[name.id]) if name.id in mapping else name
+
+            replaced = Subst().visit(copy.deepcopy(fn.body[-1].value))
+            replaced = Inliner(inner_scope, (*self.active, f.id)).visit(replaced)
+            return ast.copy_location(replaced, node)
+
+    out = Inliner(table, ()).visit(copy.deepcopy(test_expr))
+    ast.fix_missing_locations(out)
+    return out if sum(1 for _ in ast.walk(out)) <= _INLINE_MAX_NODES else test_expr
+
+
 def solve_condition(
     source_path: str,
     lineno: int,
@@ -3670,6 +3525,7 @@ def solve_condition(
     facts: Any = None,
     desired_branch: str = "then",
     var_types: dict[str, str] | None = None,
+    _loop_guard: bool = True,
 ) -> ConditionSolution:
     """Solve a branch condition at the given line.
 
@@ -3721,7 +3577,21 @@ def solve_condition(
             guard_source="", strategy="none", confidence=0.0,
             desired_branch=desired_branch,
         )
+    dead = _dead_arm_solution(tree, rp, lineno, desired_branch, _unparse(test_expr) or "")
+    if dead is not None:
+        return dead
+    env_solution = _environment_solution(tree, test_expr, desired_branch)
+    if env_solution is not None:
+        return env_solution
+    if _loop_guard and facts is None:
+        via_loop = _loop_guard_solution(tree, rp, lineno, desired_branch, _unparse(test_expr) or "")
+        if via_loop is not None:
+            return via_loop
+        via_path = _path_guard_solution(tree, rp, lineno, desired_branch, _unparse(test_expr) or "")
+        if via_path is not None:
+            return via_path
 
+    test_expr = _inline_pure_helpers(test_expr, tree, lineno, os.path.dirname(rp))
     guard_source = _unparse(test_expr) or ""
 
     # Literal True/False: always/never reachable — no inputs needed.
@@ -3824,6 +3694,10 @@ def solve_condition(
     )
 
     satisfying_inputs = [satisfying] if satisfying else []
+    # A json.loads regex guard also gets the witness that reaches the handler (every value is guard-verified already).
+    for var in variables:
+        if satisfying and var.inference_source == "regex_pattern" and var.name in satisfying:
+            satisfying_inputs += [{**satisfying, var.name: v} for v in var.concrete_values if v != satisfying[var.name]]
 
     from tharkun.solve.config import config as _cfg
 

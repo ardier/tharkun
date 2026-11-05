@@ -1,10 +1,13 @@
 """Contracts for ``operator`` ([internal ref] batch 3): a representative slice, since most of
-``operator``'s ~50 functions are one-line wrappers around a protocol batch 1 or batch
+``operator``'s functions are one-line wrappers around a protocol batch 1 or batch
 2 already contracts (``operator.add`` is ``protocol.binary_operator``'s ``__add__``
 under another name; ``operator.index`` is ``protocol.numeric_conversion``'s
 ``__index__``). ``itemgetter``/``attrgetter`` are contracted here because they are NOT
 thin one-liners -- they are callables-that-build-callables with their own
 argument-count/dotted-path rules.
+
+The remaining public callable names now have their own admission contracts in
+``rules_operator_more.py`` ([internal ref]); the protocol dispatch remains shared.
 
 Migrated to rules ([internal ref], [internal ref]): one :class:`~tharkun.solve.contracts.rules.Rule` class per qualname (the visitor kind is
 the snake_case of the class name); every ``Contract`` is exactly the one this module held as plain data
@@ -102,7 +105,7 @@ class OperatorAdd(Rule):
         may_raise_other=True,  # REVIEW FIX: __add__/__radd__ is arbitrary user code; may raise ValueError, a custom exception, etc.
         returns=ReturnSpec("whatever a + b returns", tested=True),
         effects=Effects(deterministic=True, may_execute_callback=True),
-        notes="every operator.OP function (sub, mul, lt, contains, getitem, ...) has this exact shape: a thin call to the corresponding protocol dispatch, contracted once each in builtins.py/protocols.py rather than re-contracted per operator-module alias.",
+        notes="native dispatch is shared with the corresponding protocol; each module callable also needs its own name contract for registry lookup and recipe admission (rules_operator_more.py, #1455).",
         source=(f"{_DOCS}#operator.add", "CPython Lib/operator.py::add / Modules/_operator.c"),
         tested=True,
     )

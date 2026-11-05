@@ -71,6 +71,9 @@ class AbsintResult:
     invariants: list = field(default_factory=list)
     #: boolean draws this proof case-split (docs/ABSINT.md "Case splits on a boolean draw"); 0 for a joined run
     draw_splits: int = 0
+    #: Exact imported bytes and finder results read by the proof, for the caller's integrity check.
+    source_closure: list = field(default_factory=list)
+    source_imports: list = field(default_factory=list)
 
     def explain(self) -> str:
         lines = [f"absint: {self.verdict} ({self.component})" + (f" -- {self.reason}" if self.reason else "")]
@@ -96,14 +99,17 @@ def prove(source: str, exc_classes, *, filename: str = "<program>", time_budget:
           invariant_locations=(), split_draws=None) -> AbsintResult:
     """Prove absence for the audited ``PROPERTY_CLASSES``; unsupported class selections return UNKNOWN.
 
-    ``split_draws`` (docs/ABSINT.md "Case splits on a boolean draw"): ``None`` runs the analysis joined and, only if
-    that does not prove TRUE and the source draws a ``nondet_bool``, runs it once more with each such draw case-split
-    on the time that is left (TRUE from either run, UNKNOWN as the joined run reported it otherwise); ``False`` never
-    splits; ``True`` splits in the one run."""
+    ``split_draws`` (docs/ABSINT.md "Case splits on a boolean draw", "List displays nothing observes as a list"): ``None``
+    runs the analysis joined and, only if that does not prove TRUE and the joined run executed a statement that evaluates an input or a program
+    function, a list display or a starred-rest binding (``Analyzer.split_hint``), runs it once more with each two-valued value derived from an input
+    case-split, each small int derived from an input enumerated, and the list
+    displays/rests that nothing observes as a list built per position, on the time that is left (TRUE from either run, UNKNOWN as the joined run reported it
+    otherwise); ``False`` never refines; ``True`` refines in the one run."""
     t0 = time.process_time()
+    ran: dict = {}
     r = _prove_once(source, exc_classes, filename, time_budget, environment, class_hints, obligations,
-                    invariant_locations, bool(split_draws))
-    if (r.verdict == "TRUE" or split_draws is not None or "nondet_bool" not in source
+                    invariant_locations, bool(split_draws), ran)
+    if (r.verdict == "TRUE" or split_draws is not None or not ran.get("hint")
             or r.reason.startswith(("environment:", "unsupported property classes", "syntax error"))
             or "time budget" in r.reason):
         return r
@@ -123,7 +129,7 @@ def prove(source: str, exc_classes, *, filename: str = "<program>", time_budget:
 
 
 def _prove_once(source, exc_classes, filename, time_budget, environment, class_hints, obligations,
-                invariant_locations, split_draws) -> AbsintResult:
+                invariant_locations, split_draws, ran=None) -> AbsintResult:
     from .interp import Analyzer, Unsupported
     from .state import Incompatible
 
@@ -136,31 +142,58 @@ def _prove_once(source, exc_classes, filename, time_budget, environment, class_h
         return AbsintResult("UNKNOWN", comp, [], f"unsupported property classes: {', '.join(sorted(unsupported))}",
                             seconds=time.process_time() - t0, source_sha=sha)
     from tharkun.solve.environment import TaskEnvironment, proof_blocker
-    blocker = proof_blocker(source, environment, filename=filename)
+    blocker = proof_blocker(source, environment, filename=filename, world_reads=True)
     if blocker:
         return AbsintResult("UNKNOWN", comp, [], f"environment: {blocker}",
                             seconds=time.process_time() - t0, source_sha=sha)
+    an = None
     try:
+        from tharkun.solve.static_code import prepared_code
+        prepared, expanded = prepared_code(source, filename, deadline=t0 + time_budget)
         from tharkun.solve.slicing import analysis_slice
-        sliced = analysis_slice(source, exc, filename=filename, obligations=obligations)
+        sliced = analysis_slice(source, exc, filename=filename, obligations=obligations) if expanded is None else None
         # [internal ref]: comprehensions are not modelled here; the exact lowering (solve/lowering) turns
         # them into the loops they are.  The analyzer interprets the lowered tree and reports on
         # the original program's sites and names (docs/LOWERING.md).  A comprehension the lowering
         # refuses stays in the tree, and the analyzer aborts on it as before.
         from tharkun.solve.lowering import lower_comprehensions
-        lowered = lower_comprehensions(ast.parse(sliced.source, filename))
+        analysis_source = sliced.source if sliced is not None else prepared
+        lowered = lower_comprehensions(expanded.tree if expanded is not None else ast.parse(analysis_source, filename),
+                                       preserve_origins=expanded is not None)
+        if ":=" in analysis_source:
+            from tharkun.solve.lowering.walrus import lower_walrus_loops
+            lower_walrus_loops(lowered)
+        if expanded is not None:
+            lowered.lowered += expanded.lowered
+            lowered.synthetic |= expanded.synthetic
         declared_files = ()
         if isinstance(environment, TaskEnvironment) and environment.files and not filename.startswith("<"):
             primary = os.path.realpath(environment.files[0])
             if primary == os.path.realpath(filename):
                 declared_files = environment.files
-        an = Analyzer(sliced.source, filename, time_budget=time_budget,
+        an = Analyzer(source if expanded is not None else analysis_source, filename, time_budget=time_budget,
                        class_hints=class_hints, invariant_locations=invariant_locations,
                        lowered=lowered if lowered.changed else None, site_source=source,
-                       declared_files=declared_files, split_draws=split_draws)
-        an.run()
+                       declared_files=declared_files, split_draws=split_draws, frozen_lists=split_draws,
+                       world=getattr(environment, "world", None))
+        an._property_classes = frozenset(exc)
+        if ran is not None:
+            ran["an"] = an
+        try:
+            an.run()
+        finally:
+            if ran is not None:
+                ran["hint"] = an.split_hint
     except (Unsupported, Incompatible) as e:
-        return AbsintResult("UNKNOWN", comp, [], f"unsupported: {e}", seconds=time.process_time() - t0,
+        # Incomplete safe facts cannot certify anything; observed open sites remain useful diagnostics.
+        sites = []
+        if an is not None:
+            for check in sorted(an.checks.values(), key=lambda c: (c.line, c.col, c.op)):
+                relevant = check.excs & set(exc)
+                if relevant and not check.ok:
+                    sites.append((check.line, check.col, check.op, ','.join(sorted(relevant)),
+                                  'UNPROVEN: ' + '; '.join(check.facts)))
+        return AbsintResult("UNKNOWN", comp, sites, f"unsupported: {e}", seconds=time.process_time() - t0,
                             source_sha=sha)
     except RecursionError:
         return AbsintResult("UNKNOWN", comp, [], "analysis recursion depth", seconds=time.process_time() - t0,
@@ -210,18 +243,18 @@ def _prove_once(source, exc_classes, filename, time_budget, environment, class_h
         # (the actual bug here: attr_load/call_method treated an unresolvable reflective
         # dunder, e.g. object.__repr__, as "this receiver contributes nothing" instead of
         # "unknown", making a live continuation look unreachable). site_census() is an
-        # independent, coarser static scan (docs of tharkun.solve.census) that answers
-        # "can ANY construct in this source raise one of these classes" without relying on
-        # absint's own reachability reasoning; it must confirm there is truly no site before
-        # 0 checks is allowed to mean TRUE.
+        # independent inventory proof (docs of tharkun.solve.census). It excludes
+        # wanted module exits via a complete empty-site or complete exit-summary
+        # certificate, without relying on absint's own reachability reasoning.
         from tharkun.solve.census import site_census
-        census = site_census(source, exc, filename=filename, declared_files=declared_files)
+        census = site_census(analysis_source if expanded is not None else source, exc,
+                             filename=filename, declared_files=declared_files)
         # Narrower than "census disagrees": a census that found a genuine SYNTACTIC site
         # (e.g. a `raise KeyError` under a guard the census itself does not evaluate) is not
         # evidence of THIS bug class -- absint's own, more precise reachability reasoning is
         # allowed to prove that guard infeasible and legitimately record 0 checks (see
         # tests/test_sv_concolic.py::test_every_site_unsat_stops_the_search_early). The
-        # signal this defence targets is specifically a census REFUSAL (site_census hit an
+        # signal this defence targets remains specifically a census REFUSAL (site_census hit an
         # unmodelled construct too, e.g. "does not resolve: ... reflective attribute ...") --
         # when the ONE static scan that could have vetoed 0-checks-TRUE gives up for the same
         # kind of reason absint might have silently swallowed, TRUE is not safe to trust.
@@ -230,8 +263,12 @@ def _prove_once(source, exc_classes, filename, time_budget, environment, class_h
                                 f"0 checks, and the site census also could not resolve this "
                                 f"program: {census.reason}",
                                 sorted(lemmas), dt, len(an.checks), records, True, sha, invariants)
+    scope = getattr(an._ext_resolver, '_source_scope', None) or {"files": {}, "lookups": {}}
     return AbsintResult("TRUE", comp, sites, "", sorted(lemmas), dt, len(an.checks), records, True, sha, invariants,
-                        draw_splits=an.splits_done)
+                        draw_splits=an.splits_done,
+                        source_closure=[dict(path=path, sha256=digest) for path, digest in sorted(scope['files'].items())],
+                        source_imports=[dict(module=module, roots=list(roots), paths=None if paths is None else list(paths))
+                                        for (module, roots), paths in sorted(scope['lookups'].items())])
 
 
 __all__ = ["prove", "AbsintResult", "PROPERTY_CLASSES"]

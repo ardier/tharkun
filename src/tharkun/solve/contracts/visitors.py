@@ -13,6 +13,9 @@ class CensusVisitor(Visitor):
     engine = "census"
 
     def _closed(self, rule: Rule, ctx):
+        if ctx == "admission":
+            contract = rule.contract
+            return contract if contract.tested else None
         if ctx is not None:
             from tharkun.solve.contracts.adapters.obligations import _obligation_for_call_model
             node, kwargs = ctx
@@ -50,6 +53,13 @@ class AvengersVisitor(Visitor):
     engine = "avengers"
     visit_list = visit_tuple = visit_set = _constructor
 
+    def visit_stdlib_factory(self, rule: Rule, ctx):
+        """A value factory Avengers may call ([internal ref]): the :class:`FactorySpec` once the contract is admitted
+        (``adapters/avengers.py::stdlib_admission``), else the named refusal."""
+        from tharkun.solve.contracts.adapters.avengers import stdlib_admission
+        why = stdlib_admission(rule.qualname)
+        return Refused(self.engine, rule.qualname, why) if why is not None else rule.spec()
+
 
 class DrawsVisitor(Visitor):
     engine = "draws"
@@ -69,11 +79,13 @@ class ProductVisitor(Visitor):
     """The exact product proof (``sv/product_proof.py``, allowlist ``sv/exact_subset.py``) admits no call into a library, by design; it
     admits ``abs(x)``, ``int(x)``, ``min(a, b)`` and ``max(a, b)`` on int/bool operands, whose ``_symexec`` semantics were audited exact.  The
     visit answers the audited ARITY of the call, while the contract of the builtin is TESTED ([internal ref] step 2): the allowlist asks the
-    rule instead of keeping a table of names, so an untested or withdrawn contract takes the builtin out of the subset."""
+    rule instead of keeping a table of names, so an untested or withdrawn contract takes the builtin out of the subset.
+    The auditor also asks this visitor for the successful unused int/bool check_type contract and the one-argument type
+    contract used only by direct type(a) is/is not type(b); it proves those argument/context shapes itself."""
 
     engine = "product"
     #: the audited call shapes (``exact_subset.py`` docstring): builtin -> its only accepted positional arity
-    EXACT_ARITY = {"abs": 1, "int": 1, "min": 2, "max": 2}
+    EXACT_ARITY = {"abs": 1, "int": 1, "min": 2, "max": 2, "type": 1}
 
     def _exact_arity(self, rule: Rule, ctx):
         contract = get(rule.qualname)
@@ -81,7 +93,24 @@ class ProductVisitor(Visitor):
             return Refused(self.engine, rule.qualname, "no tested contract")
         return self.EXACT_ARITY[rule.qualname]
 
-    visit_abs = visit_int = visit_min = visit_max = _exact_arity
+    visit_abs = visit_int = visit_min = visit_max = visit_type = _exact_arity
+
+    def visit_verifier_check_type(self, rule: Rule, ctx):
+        """Contract gate for the auditor's unused int/bool success case."""
+        contract = get(rule.qualname)
+        if (contract is None or not contract.tested or contract.returns is None
+                or not contract.returns.tested or contract.returns.type != "None"):
+            return Refused(self.engine, rule.qualname, "no tested check_type success contract")
+        return True
+
+    def _string_edge(self, rule: Rule, ctx):
+        contract = get(rule.qualname)
+        if (contract is None or not contract.tested or contract.returns is None
+                or not contract.returns.tested or contract.returns.type != "bool"):
+            return Refused(self.engine, rule.qualname, "no tested string edge contract")
+        return True
+
+    visit_str_startswith = visit_str_endswith = _string_edge
 
 
 class EregionVisitor(Visitor):
@@ -91,10 +120,12 @@ class EregionVisitor(Visitor):
 # Derive the supported kinds from the existing audited rows, never a second
 # per-qualname visitor registry.
 def _install():
+    from tharkun.solve.exception_sites import _CONTRACT_MODULES
     from tharkun.solve.contracts.reachability import _CLOSED
     from tharkun.solve.contracts.adapters.common import native_raise_condition
     for rule in all_rules():
-        if rule.qualname in _CLOSED or rule.qualname in {"dict", "dict.update", "random.seed"}:
+        if (rule.qualname in _CLOSED or rule.qualname in {"dict", "dict.update", "random.seed"}
+                or rule.qualname.split(".", 1)[0] in _CONTRACT_MODULES):
             setattr(CensusVisitor, "visit_" + rule.kind, CensusVisitor._closed)
         if "." in rule.qualname and rule.qualname.split(".", 1)[0] in {"list", "dict", "set", "tuple", "str", "bytes"}:
             if any(native_raise_condition(rule.contract, exc) is not None for exc in ("IndexError", "KeyError")):

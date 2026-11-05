@@ -16,6 +16,19 @@ eregion-synthesis) pin them. `tests/test_public_surface.py` is the contract.
 
 ### Added
 
+- [internal ref]: pre-synthesis `object_facts.explore_object` and atomic v1 facts writer,
+  preserving constructor/setup portfolios independently of unresolved boundary
+  arguments, full public descriptors/FlatObject records, exact source hashes,
+  typed argument leaves and named failures. Isolated snapshots inventory real
+  stored fields, inherited slots, namedtuple fields and exception arguments
+  without evaluating properties. Shared value
+  encoding preserves the public codec; opaque fields remain explicit gaps.
+  `inputs.describe_object` exports recorded recipes without discovery, and public
+  descriptors now retain executable recipe records and stand-in labels. No runtime
+  acquisition or synthesis consumer is added. Tests: `test_object_facts.py`.
+  Export extraction retains canonical model identity after constructor-default
+  completion, so equivalent recorded requests still publish one knowledge fact.
+
 - [internal ref]: draws inside the function a program ends by calling, and at module level, are lifted into the SV harness, and the exact
   product proof (`symbolic:product`) accepts them. The real Tier A tasks of sv-benchmarks !1787 (`def main(): x = nondet_int();
   if not (lo <= x <= hi): return; assert ...` then `main()`) were all "no harness: no liftable draw", so the symbolic stages
@@ -686,16 +699,21 @@ eregion-synthesis) pin them. `tests/test_public_surface.py` is the contract.
   int_constraints` now computes its interval through `refine`, so the static
   solver and the fact domain share one interval intersection.
 
-## [0.2.1] — 2026-10-20
+## [0.2.2] — 2026-11-05
+
+SV-COMP 2027 archive version (the third version of the Zenodo series, after 0.2.0 and 0.2.1 of the release line).
 
 ### Added
 
-- `python -m tharkun.sv --cpu-limit-seconds S --memory-limit-bytes B`: the CPU-time and memory limits of the whole run,
-  as BenchExec enforces them. The verifier derives its budgets from them (`sv/__main__.py::effective_limits`): without
-  `--budget-seconds` the search stops at `max(5, int(0.9 * S))` CPU seconds, without `--run-memory-mb` the program's runs
-  together get `max(64, int(0.6 * B) // 2**20)` MiB. These are the values the BenchExec tool-info module of 0.2.0 passed,
-  which now passes the full limits instead. `--budget-seconds` and `--run-memory-mb` keep their meaning and take
-  precedence; without limits the defaults stay 600 seconds and no cap.
+- `python -m tharkun.sv --cpu-limit-seconds S --memory-limit-bytes B`, carried over from the 0.2.1 release line: the CPU-time
+  and memory limits of the whole run, as BenchExec enforces them (`sv/__main__.py::effective_limits`). Without `--budget-seconds`
+  the search stops at `max(5, int(0.9 * S))` CPU seconds, without `--run-memory-mb` the program's runs together get
+  `max(64, int(0.6 * B) // 2**20)` MiB; the explicit options keep their meaning and take precedence; without limits the
+  defaults stay 600 seconds and no cap. The BenchExec tool-info module (`benchexec/tools/tharkun.py`) passes these two options.
+
+### Changed
+
+- The package, `tharkun-sv --version` and the witness producers report 0.2.2 (the 0.2.1 release line was never merged here).
 
 ## [0.2.0] — 2026-09-08
 

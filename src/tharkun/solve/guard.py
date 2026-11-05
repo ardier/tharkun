@@ -4,8 +4,10 @@ One home for "find the guard at a line" (#0606, plan #0600): ``extract_frontier`
 (the minleaf frontier extractor, formerly ``tharkun.minleaf.guard_extract``) and
 the lighter ``find_branch_at_line`` / ``free_names`` / ``unparse`` /
 ``unwrap_named_expr`` / ``try_extract_constant`` helpers that lived as private
-names in ``condition_solver``.  ``tharkun.solve.condition`` re-exports the latter
-under their old underscore names for existing callers.
+names in ``condition_solver`` -- and, since [internal ref] A2, the attribute-chain and
+byte-input atom helpers that the solver's value generation and
+``tharkun.typeinfer.core.usage``'s type rules both read.  ``tharkun.solve.condition``
+re-exports the latter under their old underscore names for existing callers.
 
 Supported statement types: ast.If, ast.While, ast.Assert.
 """
@@ -252,3 +254,127 @@ def _fold_pure_call(node: ast.AST) -> tuple[Any, bool]:
     except TypeError:
         return None, False
     return out, True
+
+
+# ---------------------------------------------------------------------------
+# Attribute-chain and byte-input helpers shared by the solver and the type-usage rules
+# (moved from condition.py, [internal ref] A2: typeinfer/core/usage.py reads them too)
+# ---------------------------------------------------------------------------
+
+
+def attr_chain_root(node: ast.AST) -> str | None:
+    """Return the root ``Name.id`` of an attribute chain, or ``None``.
+
+    ``c.kind``          -> ``"c"``
+    ``node.value.id``   -> ``"node"``
+    ``foo()``           -> ``None``
+    """
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        return cur.id
+    return None
+
+
+def attr_chain_parts(node: ast.AST) -> list[str] | None:
+    """Return the attribute chain as a list of attribute names (excluding root).
+
+    ``c.kind``        -> ``["kind"]``
+    ``node.value.id`` -> ``["value", "id"]``
+    """
+    parts: list[str] = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.reverse()
+        return parts
+    return None
+
+
+def const_int(node: ast.expr) -> int | None:
+    """Return the int value of a Constant / negated-Constant node, else None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+        return node.value
+    if (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
+            and isinstance(node.operand, ast.Constant)
+            and isinstance(node.operand.value, int)
+            and not isinstance(node.operand.value, bool)):
+        return -node.operand.value
+    return None
+
+
+def _flip_compare_op(op: ast.cmpop) -> ast.cmpop:
+    """Return the operator with operands swapped (``a < b`` ⇔ ``b > a``)."""
+    return {
+        ast.Lt: ast.Gt(), ast.Gt: ast.Lt(),
+        ast.LtE: ast.GtE(), ast.GtE: ast.LtE(),
+        ast.Eq: ast.Eq(), ast.NotEq: ast.NotEq(),
+    }.get(type(op), op)
+
+
+def is_from_bytes_of(node: ast.expr, name: str) -> bool:
+    """True if *node* is ``int.from_bytes(name[i:j], ...)`` (any byteorder)."""
+    if not (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "from_bytes"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "int"
+            and node.args):
+        return False
+    arg0 = node.args[0]
+    return (isinstance(arg0, ast.Subscript)
+            and isinstance(arg0.value, ast.Name)
+            and arg0.value.id == name)
+
+
+def from_bytes_signed(call: ast.Call) -> bool:
+    """True if an ``int.from_bytes`` call passes ``signed=True`` (default False)."""
+    for kw in call.keywords:
+        if kw.arg == "signed" and isinstance(kw.value, ast.Constant):
+            return bool(kw.value.value)
+    return False
+
+
+def iter_byte_input_atoms(name: str, expr: ast.expr):
+    """Yield ``(kind, subscript_node, op, target_int, signed)`` for byte-input atoms.
+
+    A *byte-input atom* is a comparison whose variable operand is either:
+
+    * ``name[k]`` (subscript of the bytes variable) compared to an int, or
+    * ``int.from_bytes(name[i:j], order)`` compared to an int.
+
+    ``kind`` is ``"index"`` or ``"from_bytes"``. ``op`` is the (un-flipped,
+    variable-on-the-left) comparison operator. ``target_int`` is the int the
+    atom is compared against (a plain or *negated* literal), or ``None`` for
+    ``==``/``!=`` without a usable constant. ``signed`` is the ``from_bytes``
+    call's ``signed=`` kwarg (always False for an index atom). Only int
+    comparators are considered — bytes/str literal comparisons are handled by
+    the existing subscript path.
+    """
+    for node in ast.walk(expr):
+        if not isinstance(node, ast.Compare):
+            continue
+        left = node.left
+        for op, comparator in zip(node.ops, node.comparators):
+            left_u = unwrap_named_expr(left)
+            comp_u = unwrap_named_expr(comparator)
+            for var_side, other_side, eff_op in (
+                (left_u, comp_u, op),
+                (comp_u, left_u, _flip_compare_op(op)),
+            ):
+                target = const_int(other_side)   # handles plain and negated literals
+                # name[k] — direct subscript of the bytes variable.
+                if (isinstance(var_side, ast.Subscript)
+                        and isinstance(var_side.value, ast.Name)
+                        and var_side.value.id == name):
+                    yield ("index", var_side, eff_op, target, False)
+                    break
+                # int.from_bytes(name[i:j], order [, signed=...])
+                if is_from_bytes_of(var_side, name):
+                    yield ("from_bytes", var_side.args[0], eff_op, target,
+                           from_bytes_signed(var_side))
+                    break
+            left = comparator

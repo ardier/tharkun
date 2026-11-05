@@ -18,8 +18,8 @@ denylist version five ways).  A program passes only if:
    computed name, ``vars``/``globals``/``__builtins__``, dunder attributes,
    ``eval``/``exec``/``__import__``).
 2. No builtin or library call outside the deterministic set runs: ``id``,
-   ``hash``, ``input``, ``open`` unless its mode is a literal that only writes;
-   ``sys`` only for :data:`SYS_OK`; ``random.Random`` only with a literal seed,
+   ``hash`` unless its one argument is a number (int, bool, float, complex: numbers hash by value, with no seed), ``input``, ``open`` unless its mode is a literal that only writes;
+   ``sys`` only for :data:`SYS_OK`, and ``sys.stdout``/``sys.stderr`` only written to; ``random.Random`` only with a literal seed,
    ``random.SystemRandom`` never, ``random.seed()`` only with an argument (the
    module-level ``random`` functions are the run's draws or a seeded generator:
    the run controls them); no ``__del__`` finalizer.
@@ -27,7 +27,9 @@ denylist version five ways).  A program passes only if:
    ``frozenset()``, a set operator or method result, a name aliasing one) must
    stay in names whose every use is order-blind (``in``, ``len``, ``==``,
    ``sorted`` without a key, a truth test, the mutating and comparing methods --
-   not ``pop``).  A set display of int literals has a fixed order.
+   not ``pop``).  A set display of int literals has a fixed order, and so does a set of ints that is never changed or aliased (a
+   display of int literals and names bound once to one, read only by builtin readers, iteration, comparison, a truth test or
+   ``check_type``: ints hash to themselves, so its order is a function of the values -- :meth:`_Census.int_only_set`).
 4. No ADDRESS leaks through text: every conversion of a value to text
    (``str``, ``repr``, ``ascii``, ``format``, ``%s`` / ``%r`` / ``%a``, an
    f-string field, ``str.format``) whose result the program can read must be
@@ -45,13 +47,14 @@ from __future__ import annotations
 
 import ast
 import builtins
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass
 
 from tharkun.solve.pyresolve import Resolver, Top
-from tharkun.solve.provenance import Provenance, STRING_CONSTANTS
-from tharkun.solve.check_type_hints import closed_hint_effects
+from tharkun.solve.provenance import Provenance, STRING_CONSTANTS, module_constant, stable_module_name
+from tharkun.solve.check_type_hints import check_type_arguments, check_type_contract, closed_hint_effects
 from tharkun.solve.set_singleton import singleton_receivers
 
 DET_MODULES = frozenset({
@@ -94,10 +97,17 @@ _ENV_READ_SYS_NAMES = frozenset({"argv", "stdin"})
 #   side-effecting/unmodellable or simply not audited yet, and both refuse the same way here.
 OS_CONST_OK = frozenset({"sep", "linesep", "pathsep", "extsep", "curdir", "pardir", "name",
                          "altsep", "devnull"})
-OS_PATH_PURE = frozenset({"join", "dirname", "basename", "splitext", "normpath",
-                          "abspath", "realpath"})
+OS_PATH_PURE = frozenset({"join", "dirname", "basename", "splitext", "normpath"})
 OS_HAVOC = frozenset({"getenv", "getcwd", "listdir", "urandom", "getpid", "cpu_count"})
-OS_PATH_HAVOC = frozenset({"exists", "isfile", "isdir"})
+# svaudit (2026-10-29): ``abspath`` of a relative path reads the cwd (a child runs in its own scratch
+# directory, so the run saw a cwd no native run has) and ``realpath`` reads the filesystem's symlinks --
+# the same split absint's ``m_os_path_abspath``/``m_os_path_realpath`` make.  ``abspath`` stays pure
+# for an absolute literal or an unbound ``__file__`` (``check_os``), which never consult the cwd.
+OS_PATH_HAVOC = frozenset({"exists", "isfile", "isdir", "abspath", "realpath"})
+#: the only uses of ``sys.stdout``/``sys.stderr`` a run reproduces: writing to them.  Anything else
+#: (``isatty()``, ``fileno()``, ``encoding``, ...) reads how the process was started -- a pipe in the
+#: child, a terminal or a file natively (svaudit 2026-10-29).
+_STREAM_WRITES = frozenset({"write", "writelines", "flush"})
 
 _DENIED_BUILTINS = frozenset({"id", "hash", "input", "open", "exit", "quit", "help", "copyright",
                               "credits", "license"})
@@ -180,11 +190,24 @@ def determinism_census(source: str, filename: str = "<program>", *,
     except (SyntaxError, ValueError) as e:
         return Determinism(False, f"parse: {e}")
     try:
+        task_root = None
+        if declared_files and not filename.startswith("<") and (
+                os.path.realpath(filename) == os.path.realpath(os.fspath(declared_files[0]))):
+            complete = len(declared_files) == 1
+            if not complete:
+                from .extern import _task_import_closure
+                closure = _task_import_closure(filename, _packages=True)
+                complete = closure is not None and set(closure) == {
+                    os.path.realpath(os.fspath(path)) for path in declared_files}
+            if complete:
+                task_root = os.path.dirname(os.path.realpath(filename))
         res = Resolver(tree, DET_MODULES, filename=filename, absent_imports=absent_imports,
-                       _declared_files=declared_files)
+                       _declared_files=declared_files, _task_root=task_root, _value_reflection=True)
         class_only = class_only_exceptions and observer_reason(res.all_resolvers()) is None
+        plain_isinstance = class_only and isinstance_hook_reason(res.all_resolvers()) is None
         for sub in res.all_resolvers():
-            _Census(sub, env_reads_ok=env_reads_ok, class_only=class_only).run()
+            _Census(sub, env_reads_ok=env_reads_ok, class_only=class_only,
+                    plain_isinstance=plain_isinstance).run()
     except Top as e:
         return Determinism(False, f"does not resolve: {e}")
     except _No as e:
@@ -237,6 +260,33 @@ def observer_reason(resolvers) -> str | None:
     return None
 
 
+#: names that make ``check_type(value, hint)`` run program code on SOME value.  ``isinstance`` falls back to the
+#: value's ``__class__`` attribute, so a user ``__getattribute__`` / ``__class__`` (or a hint class's metaclass'
+#: ``__instancecheck__`` / ``__subclasscheck__`` / ``__subclasshook__``) is then called; a MISMATCH formats
+#: ``{value!r}`` into its TypeError, which calls a user ``__repr__``.  Both harness stand-ins format ONLY on a
+#: mismatch (never on success), but user code running there is refused anyway.
+_ISINSTANCE_HOOKS = frozenset({"__getattribute__", "__getattr__", "__class__", "__instancecheck__",
+                               "__subclasscheck__", "__subclasshook__", "__repr__"})
+
+
+def isinstance_hook_reason(resolvers) -> str | None:
+    """Why ``check_type(value, hint)`` could run program code for some value, or None.
+
+    Raw trees of every file: no def, class, assignment, annotation or attribute store of a name in
+    :data:`_ISINSTANCE_HOOKS` anywhere (``obj.__class__ = X`` included).  Then ``isinstance`` on any value
+    the program can produce consults only types, and the failure message calls no program code."""
+    for resolver in resolvers:
+        for node in ast.walk(resolver.tree):
+            where = getattr(node, "lineno", "?")
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in _ISINSTANCE_HOOKS:
+                return f"line {where}: {node.name} is an isinstance hook"
+            if isinstance(node, ast.Name) and node.id in _ISINSTANCE_HOOKS and not isinstance(node.ctx, ast.Load):
+                return f"line {where}: {node.id} is an isinstance hook"
+            if isinstance(node, ast.Attribute) and node.attr in _ISINSTANCE_HOOKS and not isinstance(node.ctx, ast.Load):
+                return f"line {where}: .{node.attr} is an isinstance hook"
+    return None
+
+
 def _int_literal_set(node: ast.AST) -> bool:
     def lit(e):
         if isinstance(e, ast.Constant):
@@ -264,10 +314,12 @@ def _literal_check_type_data(node: ast.AST) -> bool:
 
 
 class _Census:
-    def __init__(self, res: Resolver, env_reads_ok: bool = False, class_only: bool = False):
+    def __init__(self, res: Resolver, env_reads_ok: bool = False, class_only: bool = False,
+                 plain_isinstance: bool = False):
         self.r = res
         self.env_reads_ok = env_reads_ok
         self.class_only = class_only
+        self.plain_isinstance = plain_isinstance
         # print invokes these methods without an explicit attribute reference.
         res.dead.difference_update(id(n) for n in ast.walk(res.tree)
             if isinstance(n, ast.FunctionDef) and n.name in {"write", "flush"})
@@ -275,13 +327,17 @@ class _Census:
         self.parent = res.parent
         self.user_classes = {n.name for n in ast.walk(self.tree) if isinstance(n, ast.ClassDef)}
         self.check_type_hint_nodes = set()
+        self.hash_calls = []        # calls of the builtin ``hash`` whose argument is judged once provenance exists (check_text)
         for candidate in ast.walk(self.tree):
             if (isinstance(candidate, ast.Call) and
                     self.r.call_name(candidate) == "_sv_verifier.check_type" and
-                    len(candidate.args) == 2 and not candidate.keywords and
-                    not any(isinstance(arg, ast.Starred) for arg in candidate.args) and
-                    closed_hint_effects(candidate.args[1], self.r) is not None):
-                self.check_type_hint_nodes.update(ast.walk(candidate.args[1]))
+                    (bound := check_type_arguments(candidate)) is not None and
+                    closed_hint_effects(bound[1], self.r, self._hint_class) is not None):
+                self.check_type_hint_nodes.update(ast.walk(bound[1]))
+
+    def _hint_class(self, node):
+        """A hint ``Name`` the class-only mode may treat as a plain user class (else it is not a closed hint)."""
+        return self.plain_isinstance and self.plain_user_class(node)
 
     def class_body(self, node):
         child, parent = node, self.parent.get(node)
@@ -321,7 +377,9 @@ class _Census:
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and \
                     node.id in _CONVERT and r.is_builtin(node):
                 call = self.parent.get(node)
-                if node not in self.check_type_hint_nodes and not (isinstance(call, ast.Call) and call.func is node):
+                if (node not in self.check_type_hint_nodes and not self.classinfo_argument(node)
+                        and not self.class_comparison(node) and not self.parameter_annotation(node)
+                        and not (isinstance(call, ast.Call) and call.func is node)):
                     # ``key=repr``, ``map(str, xs)``: converts values we cannot see
                     raise _No(f"line {node.lineno}: {node.id} used as a value may show an address")
             if isinstance(node, ast.Attribute) and node.attr in ("format", "format_map"):
@@ -330,16 +388,23 @@ class _Census:
                     raise _No(f"line {node.lineno}: .{node.attr} used as a value")
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and \
                     node.id in _DENIED_BUILTINS and r.is_builtin(node):
+                call = self.parent.get(node)
                 if node.id == "open":
                     self.check_open(node)
+                elif (node.id == "hash" and isinstance(call, ast.Call) and call.func is node and len(call.args) == 1
+                      and not call.keywords and not isinstance(call.args[0], ast.Starred)):
+                    self.hash_calls.append(call)        # deterministic for numbers; judged in check_text
                 elif not (self.env_reads_ok and node.id == "input"):
                     raise _No(f"line {node.lineno}: uses {node.id}")
             if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and \
                     r.imports.modules.get(node.value.id) == "sys" and node.attr not in SYS_OK and \
                     not (self.env_reads_ok and node.attr in _ENV_READ_SYS_NAMES):
                 raise _No(f"line {node.lineno}: uses sys.{node.attr}")
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and \
+                    r.imports.modules.get(node.value.id) == "sys" and node.attr in ("stdout", "stderr"):
+                self.check_stream(node)
             if isinstance(node, ast.ImportFrom) and node.module == "sys":
-                allowed = SYS_OK | (_ENV_READ_SYS_NAMES if self.env_reads_ok else frozenset())
+                allowed = (SYS_OK - {"stdout", "stderr"}) | (_ENV_READ_SYS_NAMES if self.env_reads_ok else frozenset())
                 bad = [a.name for a in node.names if a.name not in allowed]
                 if bad:
                     raise _No(f"line {node.lineno}: from sys import {bad[0]}")
@@ -369,6 +434,20 @@ class _Census:
 
         if open_effect(call) != "output":
             raise _No(f"line {node.lineno}: open() that may read")
+
+    def check_stream(self, node: ast.Attribute) -> None:
+        """``sys.stdout``/``sys.stderr`` only written to: ``.write``/``.writelines``/``.flush`` called on it
+        directly, or the ``file=`` of a builtin ``print``."""
+        up = self.parent.get(node)
+        call = self.parent.get(up)
+        if isinstance(up, ast.Attribute) and up.attr in _STREAM_WRITES and isinstance(call, ast.Call) \
+                and call.func is up:
+            return
+        if isinstance(up, ast.keyword) and up.arg == "file" and isinstance(call, ast.Call) and \
+                isinstance(call.func, ast.Name) and call.func.id == "print" and self.r.is_builtin(call.func):
+            return
+        raise _No(f"line {node.lineno}: sys.{node.attr} used other than for writing (it shows how the "
+                  f"process was started)")
 
     def check_random(self, node: ast.AST) -> None:
         r = self.r
@@ -449,6 +528,15 @@ class _Census:
             raise _No(f"line {node.lineno}: uses os.{name}")
         else:
             if name in OS_PATH_PURE:
+                return
+            from tharkun.solve.environment import _is_bound
+            call = self.parent.get(node)
+            if name == "abspath" and isinstance(call, ast.Call) and call.func is node and \
+                    len(call.args) == 1 and not call.keywords and (
+                    isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
+                    and call.args[0].value.startswith("/")
+                    or isinstance(call.args[0], ast.Name) and call.args[0].id == "__file__"
+                    and not _is_bound(self.tree, "__file__")):
                 return
             if name in OS_PATH_HAVOC:
                 raise _No(f"line {node.lineno}: uses os.path.{name} (queries the filesystem)")
@@ -823,7 +911,150 @@ class _Census:
             elif self.is_tracked(node) and isinstance(getattr(node, "ctx", None), ast.Load):
                 self.check_set_use(node, f"set {ast.unparse(node)}")
 
+    def _int_constant_name(self, name: str) -> bool:
+        """``name`` is bound once, at module level, to an int or bool literal and nowhere else (no loop, augmented or other store)."""
+        stores = [n for n in ast.walk(self.tree) if isinstance(n, ast.Name) and n.id == name and not isinstance(n.ctx, ast.Load)]
+        if len(stores) != 1 or any(isinstance(n, (ast.arg, ast.Global, ast.Nonlocal)) and (getattr(n, "arg", None) == name or name in getattr(n, "names", ()))
+                                    for n in ast.walk(self.tree)):
+            return False
+        parent = self.parent.get(stores[0])
+        return (isinstance(parent, ast.Assign) and parent.targets == [stores[0]] and self.parent.get(parent) is self.tree
+                and isinstance(parent.value, ast.Constant) and type(parent.value.value) in (int, bool))
+
+    def int_valued_params(self) -> frozenset:
+        """``{(function name, parameter)}`` that hold an ``int`` at EVERY call, proved by induction on the call depth.
+
+        A top-level undecorated function that is bound once, takes no ``*args``/``**kwargs`` and is named only as the callee of plain positional calls
+        (never as a value); the parameter is never stored to in the function.  Start by assuming every such parameter is an int and drop one
+        when some call passes it a value that is not (:meth:`int_valued`) or omits it without an int-literal default; the fixpoint left holds, because
+        the first call of each function comes from outside it with an int and every call inside passes ints by the hypothesis on its caller.
+        (QuixBugs ``hanoi``: ``start``/``end`` come from two draws and from the ``pop`` of a set of ints.)"""
+        cached = getattr(self, "_int_params", None)
+        if cached is not None:
+            return cached
+        funcs = {}
+        for n in self.tree.body:
+            if isinstance(n, ast.FunctionDef):
+                funcs.setdefault(n.name, []).append(n)
+        info = {}
+        for name, defs in funcs.items():
+            fn = defs[0]
+            a = fn.args
+            if (len(defs) != 1 or fn.decorator_list or a.vararg or a.kwarg or a.kwonlyargs or a.posonlyargs
+                    or any(isinstance(n, ast.Name) and n.id == name and not isinstance(n.ctx, ast.Load) for n in ast.walk(self.tree))):
+                continue
+            params = [x.arg for x in a.args]
+            stored = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load)}
+            defaults = dict(zip(params[len(params) - len(a.defaults):], a.defaults))
+            info[name] = (fn, params, stored, defaults)
+        calls = {name: [] for name in info}
+        for n in ast.walk(self.tree):
+            if isinstance(n, ast.Name) and n.id in info and isinstance(n.ctx, ast.Load):
+                par = self.parent.get(n)
+                if isinstance(par, ast.Call) and par.func is n and not par.keywords and not any(isinstance(x, ast.Starred) for x in par.args):
+                    calls[n.id].append(par)
+                else:
+                    info.pop(n.id, None)                  # used as a value: calls we cannot see
+        live = {(f, p) for f, (fn, params, stored, defaults) in info.items() for p in params if p not in stored}
+        self._int_params = frozenset(live)               # the hypothesis the argument checks below are made under
+        changed = True
+        while changed:
+            changed = False
+            for f, (fn, params, stored, defaults) in info.items():
+                for call in calls.get(f, ()):
+                    for i, p in enumerate(params):
+                        if (f, p) not in live:
+                            continue
+                        arg = call.args[i] if i < len(call.args) else defaults.get(p)
+                        if arg is None or not self.int_valued(arg):
+                            live.discard((f, p))
+                            self._int_params = frozenset(live)
+                            changed = True
+        self._int_params = frozenset(live)
+        return self._int_params
+
+    def int_valued(self, e: ast.AST) -> bool:
+        """``e`` is an ``int`` (or ``bool``) whatever the draws: a literal, a draw, a name bound once to one, a parameter of
+        :meth:`int_valued_params`, ``+ - *`` of such values, or the ``pop`` of a set of ints."""
+        if isinstance(e, ast.Constant):
+            return type(e.value) in (int, bool)
+        if isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.USub, ast.UAdd)):
+            return self.int_valued(e.operand)
+        if isinstance(e, ast.BinOp) and isinstance(e.op, (ast.Add, ast.Sub, ast.Mult)):
+            return self.int_valued(e.left) and self.int_valued(e.right)
+        if isinstance(e, ast.Call):
+            if self.r.call_name(e) == "_sv_verifier.nondet_int" and not e.args and not e.keywords:
+                return True
+            f = e.func
+            return (isinstance(f, ast.Attribute) and f.attr == "pop" and not e.args and not e.keywords and self.int_only_set(f.value))
+        if isinstance(e, ast.Name):
+            fn = e.id
+            scope = self.parent.get(e)
+            while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.Module)):
+                scope = self.parent.get(scope)
+            if isinstance(scope, ast.FunctionDef):
+                if (scope.name, e.id) in getattr(self, "_int_params", frozenset()) or (scope.name, e.id) in self.int_valued_params():
+                    return True
+            # a name bound once, in this scope, to an int value; the scope is the function (or the module) the use is in, so a parameter of another
+            # function that happens to share the name does not count
+            if any(isinstance(n, (ast.Global, ast.Nonlocal)) and e.id in n.names for n in ast.walk(self.tree)):
+                return False
+            if isinstance(scope, ast.FunctionDef) and any(x.arg == e.id for x in ast.walk(scope.args) if isinstance(x, ast.arg)):
+                return False
+            stores = [n for n in ast.walk(scope if scope is not None else self.tree)
+                      if isinstance(n, ast.Name) and n.id == e.id and not isinstance(n.ctx, ast.Load)]
+            if len(stores) != 1:
+                return False
+            par = self.parent.get(stores[0])
+            return isinstance(par, ast.Assign) and par.targets == [stores[0]] and self.int_valued(par.value)
+        return False
+
+    def int_only_set(self, node: ast.AST) -> bool:
+        """``node`` is a set display of int literals and names bound once to one, or a Name every binding of which is such a display
+        (the set is never changed: no store but its assignments, no method call on it)."""
+        def literal(e):
+            if isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.USub, ast.UAdd)):
+                e = e.operand
+            return isinstance(e, ast.Constant) and type(e.value) in (int, bool)
+        def display(n):
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Sub):
+                return display(n.left) and display(n.right)        # a difference of sets of ints is a set of ints (union stays refused: tests/test_sv_prove.py)
+            return isinstance(n, ast.Set) and all(literal(e) or (isinstance(e, ast.Name) and self._int_constant_name(e.id))
+                                                  or (isinstance(e, ast.Name) and self.int_valued(e)) for e in n.elts)
+        if display(node):
+            return True
+        if not isinstance(node, ast.Name):
+            return False
+        stores = [n for n in ast.walk(self.tree) if isinstance(n, ast.Name) and n.id == node.id and not isinstance(n.ctx, ast.Load)]
+        if not stores or any(isinstance(n, (ast.arg, ast.Global, ast.Nonlocal)) and (getattr(n, "arg", None) == node.id or node.id in getattr(n, "names", ()))
+                              for n in ast.walk(self.tree)):
+            return False
+        for st in stores:
+            parent = self.parent.get(st)
+            if not (isinstance(parent, ast.Assign) and parent.targets == [st] and display(parent.value)):
+                return False
+        # never mutated or aliased: every read of the name is a direct argument of check_type or of a builtin reader, an iteration
+        # source, a comparison or a truth test
+        readers = {"len", "sorted", "sum", "min", "max", "any", "all", "list", "tuple", "bool", "set", "frozenset"}
+        for n in ast.walk(self.tree):
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == node.id:
+                return False
+            if isinstance(n, ast.Name) and n.id == node.id and isinstance(n.ctx, ast.Load):
+                par = self.parent.get(n)
+                ok = ((isinstance(par, ast.Call) and n in par.args and not par.keywords
+                       and (self.r.call_name(par) == "_sv_verifier.check_type"
+                            or (isinstance(par.func, ast.Name) and par.func.id in readers and self.r.is_builtin(par.func))))
+                      or (isinstance(par, (ast.comprehension, ast.For)) and par.iter is n)
+                      or isinstance(par, ast.Compare)
+                      or (isinstance(par, (ast.If, ast.While, ast.IfExp)) and par.test is n)
+                      or (isinstance(par, ast.UnaryOp) and isinstance(par.op, ast.Not)))
+                if not ok:
+                    return False
+        return True
+
     def check_set_use(self, node: ast.AST, what: str) -> None:
+        if self.int_only_set(node):
+            return          # ints hash to themselves: the order is a function of the values and the insertion history, never of a seed
         par = self.parent.get(node)
         line = getattr(node, "lineno", "?")
         if isinstance(par, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and par.value is node:
@@ -882,12 +1113,21 @@ class _Census:
                 return
         if isinstance(par, ast.Expr):
             return
+        if (isinstance(par, ast.Call) and self.plain_isinstance and self.r.call_name(par) == "_sv_verifier.check_type"
+                and (bound := check_type_arguments(par)) is not None and bound[0] is node
+                and closed_hint_effects(bound[1], self.r, self._hint_class) == frozenset()):
+            return          # a hint with no iterate/items effect only asks isinstance(value, hint): the set is not iterated
         raise _No(f"line {line}: {what} is used where its order can matter "
                   f"({ast.unparse(par)[:60]!r})")
 
     # -- addresses through text --------------------------------------------------------
     def check_text(self) -> None:
         self.provenance = Provenance(self.r, class_only=self.class_only)
+        for call in self.hash_calls:
+            values = self.provenance.value(call.args[0])
+            if self.provenance.unsafe or not values or not all(v in {("int",), ("float",), ("bool",), ("complex",)} for v in values):
+                # numbers hash by value with no seed; a str, bytes, object or None may not
+                raise _No(f"line {call.lineno}: uses hash")
         if self.provenance.deque_calls and not self.provenance.closed_deques():
             raise _No("deque transport or callback effects are not closed")
         counter_calls = {n for n in self.provenance.nodes if self.provenance.empty_counter(n)}
@@ -911,9 +1151,17 @@ class _Census:
                 raise _No(reason)
         defaultdict_funcs = {n.func for n in defaultdict_calls}
         convs = []
+        # an imported undecorated source def of a bundled module: called (``f()``, ``mod.f()``) OR, for a from-imported
+        # name, used as a value (``a = f if c else g``).  In provenance the name is UNKNOWN either way -- nothing
+        # address-safe is ever claimed from it, a set, id/hash or text use of it still refuses on its own, and the
+        # callee's body is censused as program code.  A module ATTRIBUTE used as a value (``saved = mod.f``) stays
+        # refused (tests/test_absint_declared_siblings.py pins it)
         source_call_funcs = {
             node.func for node in ast.walk(self.tree)
             if isinstance(node, ast.Call) and self._source_function_call(node.func)
+        } | {
+            node for node in ast.walk(self.tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and self._source_function_call(node)
         }
         for node in ast.walk(self.tree):
             if not self.r.live(node):
@@ -923,10 +1171,16 @@ class _Census:
             entry = None
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
                 entry = self.r.imports.names.get(node.id)
-            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-                module = self.r.imports.modules.get(node.value.id)
-                if module:
-                    entry = module, node.attr
+            elif isinstance(node, ast.Attribute):
+                source = self.r.source_module(node.value)
+                if source is not None:
+                    if self.r.source_module(node) is not None:
+                        continue  # an intermediate package hop, checked by Resolver.check
+                    entry = f"$extern:{source.filename}", node.attr
+                elif isinstance(node.value, ast.Name):
+                    module = self.r.imports.modules.get(node.value.id)
+                    if module:
+                        entry = module, node.attr
             if entry == ("_sv_verifier", "check_type"):
                 par = self.parent.get(node)
                 if not (isinstance(par, ast.Call) and par.func is node):
@@ -942,6 +1196,18 @@ class _Census:
             deque_constructor = (entry == ("collections", "deque")
                 and isinstance(parent, ast.Call) and parent.func is node
                 and parent in self.provenance.deque_calls)
+            if entry is not None and entry[0].startswith("$extern:"):
+                # a name of a SOURCE module of the task (read-and-recurse) that is KNOWN to be a program entity -- an
+                # undecorated function or class bound once, a literal constant, a submodule (``_source_export_kind``): its
+                # code is program code, censused with every other file, and what it exports reaches this file as a value of
+                # UNKNOWN provenance, so a text conversion, set order, id / hash or text use of it refuses on its own, as for
+                # any other unknown value.  A name rebound to a builtin or a library object (``func = print``) or wrapped by a
+                # decorator stays refused: library behaviour would hide behind it.
+                child = (self.r.source_module(node.value) if isinstance(node, ast.Attribute)
+                         else self.r.externs.get(node.id))
+                if child is not None and (isinstance(node, ast.Attribute) or entry[0] == f"$extern:{child.filename}") \
+                        and self._source_export_kind(child, entry[1], set()) is not None:
+                    entry = None
             if node not in source_call_funcs | defaultdict_funcs | counter_funcs and not deque_constructor and entry and entry not in STRING_CONSTANTS and (
                     entry[0] not in _ADDRESS_MODULES | {"heapq"} or
                     entry[0] == "io" and entry[1] not in _ADDRESS_IO):
@@ -983,10 +1249,9 @@ class _Census:
             child = self.r.externs.get(func.id)
             if child is not None and module == f"$extern:{child.filename}":
                 return self._source_export_function(child, exported, set())
-        elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-            child = self.r.externs.get(func.value.id)
-            imported_module = self.r.imports.modules.get(func.value.id)
-            if child is not None and imported_module is not None:
+        elif isinstance(func, ast.Attribute):
+            child = self.r.source_module(func.value)
+            if child is not None:
                 return self._source_export_function(child, func.attr, set())
         return False
 
@@ -1016,20 +1281,169 @@ class _Census:
             return False
         return cls._source_export_function(child, name, seen)
 
+    def _source_export_kind(self, resolver: Resolver, exported: str, seen: set) -> str | None:
+        """What a source module exports under ``exported`` when that is a plain program entity: ``"function"`` (an undecorated
+        ``def`` bound once), ``"class"`` (an undecorated ``class`` bound once), ``"constant"`` (bound once at the top level to a
+        literal scalar, no ``global`` / ``del`` / attribute store anywhere), ``"module"`` (a submodule), or ``None``."""
+        key = (id(resolver), exported)
+        if key in seen or exported not in resolver.public_names():
+            return None
+        seen.add(key)
+        if exported in resolver.submodules:
+            return "module"
+        if self._source_export_function(resolver, exported, set()):
+            return "function"
+        classes = [n for n in resolver.tree.body if isinstance(n, ast.ClassDef) and n.name == exported]
+        if classes:
+            extra = any((isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef)) and n.name == exported) or
+                        (isinstance(n, ast.ExceptHandler) and n.name == exported) or
+                        (isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name == exported) or
+                        (isinstance(n, ast.MatchMapping) and n.rest == exported) or
+                        (isinstance(n, (ast.Global, ast.Nonlocal)) and exported in n.names)
+                        for n in ast.walk(resolver.tree))
+            return "class" if (len(classes) == 1 and not classes[0].decorator_list and not extra
+                               and not resolver._rebound(exported)) else None
+        if module_constant(resolver, exported, self.r.all_resolvers()) is not None:
+            return "constant"
+        alias = stable_module_name(resolver, exported, self.r.all_resolvers())
+        if alias is not None:                    # ``func = to_import2.func`` / ``func = other``: an alias of another export
+            value = alias.value
+            if isinstance(value, ast.Attribute):
+                inner = resolver.source_module(value.value)
+                return self._source_export_kind(inner, value.attr, seen) if inner is not None else None
+            if isinstance(value, ast.Name) and value.id not in resolver.imports.names:
+                return self._source_export_kind(resolver, value.id, seen)
+            if isinstance(value, ast.Name):
+                inner = resolver.externs.get(value.id)
+                module, name = resolver.imports.names.get(value.id, (None, None))
+                if inner is not None and module == f"$extern:{inner.filename}":
+                    return self._source_export_kind(inner, name, seen)
+            return None
+        module, name = resolver.imports.names.get(exported, (None, None))
+        child = resolver.externs.get(exported)
+        if child is None or module != f"$extern:{child.filename}":
+            return None
+        return self._source_export_kind(child, name, seen)
+
     def check_type_call(self, node: ast.Call) -> None:
         """Certify only direct, closed-hint calls whose possible callbacks are absent."""
-        if (len(node.args) != 2 or node.keywords or
-                any(isinstance(arg, ast.Starred) for arg in node.args)):
+        if check_type_contract() is None:
+            raise _No(f"line {node.lineno}: check_type has no tested return contract")
+        bound = check_type_arguments(node)
+        if bound is None:
             raise _No(f"line {node.lineno}: check_type call shape is not closed")
-        effects = closed_hint_effects(node.args[1], self.r)
+        value, hint = bound
+        effects = closed_hint_effects(hint, self.r, self._hint_class)
         if effects is None:
             raise _No(f"line {node.lineno}: check_type hint is not closed")
-        value = node.args[0]
+        if self.plain_isinstance and not effects:
+            # class-only: no program code runs in ``isinstance(value, hint)`` for any value (isinstance_hook_reason)
+            # and the text of its TypeError, repr of the value included, can only reach stderr
+            return
         literal_data = _literal_check_type_data(value)
-        if not literal_data and (effects or not self.provenance.scalar(self.provenance.value(value))):
+        if not literal_data and not self.provenance.scalar_container(self.provenance.value(value)) and (
+                effects or not self.provenance.scalar(self.provenance.value(value))):
             raise _No(f"line {node.lineno}: check_type value effects are not closed")
         if not literal_data and not self.provenance.safe(value, "repr"):
             raise _No(f"line {node.lineno}: check_type value repr may run user code or expose an address")
+
+    def class_comparison(self, node: ast.Name) -> bool:
+        """A builtin str class used only as data in an immediate comparison cannot convert a value."""
+        if node.id != "str" or not self.r.is_builtin(node):
+            return False
+        value, parent = node, self.parent.get(node)
+        while isinstance(parent, (ast.List, ast.Tuple, ast.Set)) and value in parent.elts:
+            value, parent = parent, self.parent.get(parent)
+        if isinstance(parent, ast.Subscript) and parent.value is value:
+            value, parent = parent, self.parent.get(parent)
+        return (isinstance(parent, ast.Compare)
+                and (parent.left is value or value in parent.comparators)
+                and all(isinstance(op, (ast.Is, ast.IsNot, ast.Eq, ast.NotEq)) for op in parent.ops))
+
+    def parameter_annotation(self, node: ast.Name) -> bool:
+        """``node`` sits inside the annotation of a function parameter or return (``def f(x: str)``): evaluated once and stored, it
+        converts nothing -- unless the program reads annotations back (``typing.get_type_hints``, ``__annotations__``, ``inspect``,
+        ``signature``) and could call what it finds.  Variable annotations are not covered: ``dataclasses.fields`` hands them out."""
+        reads = {"get_type_hints", "get_annotations", "__annotations__", "annotations", "signature", "inspect", "__signature__"}
+        if any((isinstance(n, ast.Name) and n.id in reads) or (isinstance(n, ast.Attribute) and n.attr in reads)
+               or (isinstance(n, ast.alias) and n.name.split(".")[-1] in reads) for n in ast.walk(self.tree)):
+            return False
+        child, par = node, self.parent.get(node)
+        while par is not None:
+            if isinstance(par, ast.arg) and par.annotation is child:
+                return True
+            if isinstance(par, (ast.FunctionDef, ast.AsyncFunctionDef)) and par.returns is child:
+                return True
+            if isinstance(par, (ast.stmt, ast.arguments)):
+                return False
+            child, par = par, self.parent.get(par)
+        return False
+
+    def classinfo_argument(self, node: ast.Name) -> bool:
+        """``node`` is the class argument -- alone or in a flat tuple of classes -- of a direct call of the builtin
+        ``isinstance`` / ``issubclass`` with exactly two positional arguments.  ``isinstance(x, str)`` names the class
+        and converts nothing.  Both ``node`` and the callee must resolve to builtins (``is_builtin``: not shadowed,
+        rebound, imported under another name or a parameter), or the exemption does not apply."""
+        if not self.r.is_builtin(node):
+            return False
+        parent = self.parent.get(node)
+        if isinstance(parent, ast.Tuple) and isinstance(parent.ctx, ast.Load) and node in parent.elts:
+            node, parent = parent, self.parent.get(parent)
+        return (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
+                and parent.func.id in {"isinstance", "issubclass"} and self.r.is_builtin(parent.func)
+                and not parent.keywords and len(parent.args) == 2 and parent.args[1] is node)
+
+    def _binding_scope(self, n):
+        """The scope node a binding ``n`` (a store, def, parameter, import alias, ``except ... as``, ``case ... as``) writes into: the
+        nearest enclosing function, lambda or class (a comprehension target is local to it, but an assignment expression's is
+        not and binds further out), else the module tree.  A ``global`` statement is the only way out of it, and any use of
+        the name in one refuses (:meth:`plain_user_class`)."""
+        walrus = isinstance(self.parent.get(n), ast.NamedExpr)
+        p = self.parent.get(n)
+        while p is not None and p is not self.tree:
+            if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                return p
+            if isinstance(p, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)) and not walrus:
+                return p
+            p = self.parent.get(p)
+        return self.tree
+
+    def plain_user_class(self, node: ast.AST, _seen=()) -> bool:
+        """``node`` is a bare name of one module-level class that nothing rebinds or shadows anywhere in the file
+        (a parameter, a local, an import, ... of that spelling refuses), with no metaclass, no decorator and no base
+        but ``object`` or another such class of this file (single or multiple inheritance): ``isinstance(x, node)``
+        is ``type.__instancecheck__``.  A variable holding the class is not a name of it."""
+        if not isinstance(node, ast.Name) or node.id in _seen:
+            return False
+        tree = self.tree
+        classes = [c for c in ast.walk(tree) if isinstance(c, ast.ClassDef) and c.name == node.id]
+        if len(classes) != 1 or self.parent.get(classes[0]) is not tree:
+            return False
+        cls = classes[0]
+        # the scopes the hint itself is read in: a parameter or local of the same spelling in one of them IS the hint
+        enclosing, p = set(), self.parent.get(node)
+        while p is not None and p is not tree:
+            if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.ListComp, ast.SetComp,
+                              ast.DictComp, ast.GeneratorExp)):
+                enclosing.add(p)
+            p = self.parent.get(p)
+        for n in ast.walk(tree):
+            if ((isinstance(n, ast.Name) and n.id == node.id and not isinstance(n.ctx, ast.Load))
+                    or (isinstance(n, ast.arg) and n.arg == node.id)
+                    or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == node.id)
+                    or (isinstance(n, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and n.name == node.id)
+                    or (isinstance(n, ast.alias) and node.id in {n.asname, n.name.partition(".")[0]})):
+                scope = self._binding_scope(n)
+                if scope is tree or scope in enclosing:
+                    return False
+            elif isinstance(n, (ast.Global, ast.Nonlocal)) and node.id in n.names:
+                return False
+        if cls.keywords or cls.decorator_list:
+            return False
+        # no base but ``object`` or a plain class of this file: an ABC, ``Protocol`` or any other base can bring a metaclass
+        # (``register``, ``__subclasshook__``, runtime protocol checks) whose ``__instancecheck__`` runs program code
+        return all(isinstance(b, ast.Name) and ((b.id == "object" and self.r.is_builtin(b))
+                                                or self.plain_user_class(b, (*_seen, node.id))) for b in cls.bases)
 
     def conversions(self, node: ast.AST):
         """(operand, what) for each value ``node`` turns into text."""

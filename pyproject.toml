@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tharkun"
-version = "0.2.1"  # keep in sync with tharkun.__version__ (tests/test_version_sync.py)
+version = "0.2.2"  # keep in sync with tharkun.__version__ (tests/test_version_sync.py)
 description = "Python branch guard solver and analysis toolkit"
 readme = "README.md"
 requires-python = ">=3.10"  # PEP 604 unions and `match` are used unguarded (#0605)
-license = {text = "EUPL-1.2"}
+license = {text = "MIT"}
 
 dependencies = ["hypothesis>=6.0", "z3-solver>=4.12", "PyYAML>=6.0"]
 
@@ -16,22 +16,45 @@ dependencies = ["hypothesis>=6.0", "z3-solver>=4.12", "PyYAML>=6.0"]
 # Layer-named extras (0.2.0; the layer table is docs/LAYERS.md).  The core,
 # tharkun.solve, needs nothing beyond the stdlib.
 search     = ["hypothesis>=6.0"]   # property search
-avengers   = ["hypothesis>=6.0"]                              # object recipes + boundary search
-# Live object-synthesis backends. Each is availability-gated at runtime, so the
-# portfolio degrades to whatever is installed rather than failing; black is
-# ghostwriter's formatter and pynguin needs it too.
-backends   = ["hypothesis>=6.0", "pynguin>=0.46", "black"]
+kb         = ["egglog>=13"]                                   # e-graph canonicalization shadow (Python >=3.11)
+# Object recipes + boundary search, with what the default portfolio's recipe
+# derivers need IN THIS environment (owner ruling 2026-10-19, [internal ref]): Hypothesis'
+# from_type, and Ghostwriter.  Ghostwriter formats with black, so the `avengers`/`backends`/`bench`
+# extras list it again (owner 2026-10-28: the object initializer uses Ghostwriter); never the SV path.
+# Each stays availability-gated at runtime.
+#
+# py_obj_flatting is REQUIRED by Avengers, not optional (owner ruling 2026-10-21, [internal ref]: "object fields being
+# different is observable"): it is the description of object state -- the replay's state digest, the field-level
+# effect of each boundary call, the state-coverage objective.  Without it Avengers reports the named refusal
+# `flattening-unavailable` and the GUUT harness stops (docs/AVENGERS.md "Flattening"); nothing stands in for it.
+# It is a private companion (ardier/py_obj_flatting; v0.5.0 plus its MIT-licence merge), so it is pinned by commit
+# over SSH, the transport the manager's other private installs use.  Only `tharkun/avengers/` imports it; the SOLVE
+# core stays stdlib-only (tests/test_layering.py).
+avengers   = ["hypothesis>=6.0", "black>=24", "py_obj_flatting @ git+ssh://git@github.com/ardier/py_obj_flatting.git@c27c3823229435cebbadd19cf73de9bc26cdc2c6"]
+# The same set under its older name.
+backends   = ["hypothesis>=6.0", "black>=24", "py_obj_flatting @ git+ssh://git@github.com/ardier/py_obj_flatting.git@c27c3823229435cebbadd19cf73de9bc26cdc2c6"]
+# Pynguin, the third default deriver, for its OWN tool venv only: pynguin 0.48.0
+# pins pytest<9 and black<26, so it cannot share the admitted test environment
+# (pytest 9).  Point THARKUN_PYNGUIN_PYTHON at that venv's python
+# (requirements/pynguin-tool.txt, docs/AVENGERS.md).
+pynguin    = ["pynguin==0.48.0"]
+# The object-synthesis benchmark: the backends plus the case-study subject.
+bench      = ["hypothesis>=6.0", "black>=24", "pynguin>=0.48", "codetiming", "py_obj_flatting @ git+ssh://git@github.com/ardier/py_obj_flatting.git@c27c3823229435cebbadd19cf73de9bc26cdc2c6"]
 # fuzz: Atheris 3.1.0 and the FDP codec are verified on CPython 3.14.4.
 # Hypothesis supplies regex and property search.
 fuzz       = ["atheris>=3.0,<4", "hypothesis>=6.0"]
+tools      = ["mcp>=1.0"]                                     # the MCP server
 # Pre-0.2.0 extra names: kept for one release as aliases of the above.
 hypothesis = ["hypothesis>=6.0"]
+mcp        = ["mcp>=1.0"]
+egglog     = ["egglog>=13"]
 hybrid     = ["atheris>=3.0,<4", "hypothesis>=6.0"]
-all        = ["hypothesis>=6.0"]
+all        = ["hypothesis>=6.0", "mcp>=1.0"]
 dev        = ["pytest>=7.0", "hypothesis>=6.0"]
 
 [project.scripts]
-tharkun = "tharkun.cli:main"
+tharkun     = "tharkun.cli:main"
+tharkun-mcp = "tharkun.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

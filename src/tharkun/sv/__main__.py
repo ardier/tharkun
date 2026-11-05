@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -30,7 +31,15 @@ from tharkun.sv.spec import read_property
 #: the package version (pyproject.toml, ``tharkun.__version__``), as the witness producer names it too;
 #: a literal because ``tharkun.sv`` may not import the top-level package (tests/test_layering.py);
 #: tests/test_version_sync.py keeps the three in step
-VERSION = "tharkun-sv 0.2.1"
+VERSION = "tharkun-sv 0.2.2"
+_VERDICT_TOKEN = re.compile(r"\b(?:TRUE|FALSE|UNKNOWN|ERROR)\b", re.IGNORECASE)
+
+
+def _log(message, *, prefix="tharkun-sv: "):
+    # BenchExec scans physical lines, including continuations in exception text.
+    for line in str(message).splitlines():
+        tag = "tharkun-sv: log: " if _VERDICT_TOKEN.search(line) else prefix
+        print(tag + line, flush=True)
 
 #: without --budget-seconds: the search stops at this share of --cpu-limit-seconds (at least
 #: MIN_BUDGET_SECONDS), so the verdict is printed in time; without either, DEFAULT_BUDGET_SECONDS
@@ -155,7 +164,7 @@ def main(argv=None) -> int:
         witness_out.unlink(missing_ok=True)
     if metadata_error:
         if a.replay:
-            print(f"tharkun-sv: replay -> {metadata_error}")
+            _log(f"replay -> {metadata_error}")
             print("NOT CONFIRMED")
             return 1
         print(f"UNKNOWN({metadata_error})")
@@ -184,12 +193,12 @@ def main(argv=None) -> int:
             w = json.load(fh)
         ok, out = replay(program, w, classes, python=a.python, timeout=a.run_timeout, task=a.task,
                          language_version=language_version)
-        print(f"tharkun-sv: replay -> {out.status} {out.msg or out.exc or ''} at {out.site}")
+        _log(f"replay -> {out.status} {out.msg or out.exc or ''} at {out.site}")
         print("CONFIRMED" if ok else "NOT CONFIRMED")
         return 0 if ok else 1
     budget_seconds, run_memory_mb = effective_limits(a.budget_seconds, a.run_memory_mb,
                                                      a.cpu_limit_seconds, a.memory_limit_bytes)
-    print(f"{VERSION}: {program} ! uncaught({', '.join(classes)})", flush=True)
+    _log(f"{VERSION}: {program} ! uncaught({', '.join(classes)})", prefix="")
     v = verify(program, classes, prop_name=prop_name, python=a.python,
                budget_seconds=budget_seconds, canary_seconds=a.canary_seconds, run_timeout=a.run_timeout,
                max_runs=a.max_runs,
@@ -198,24 +207,21 @@ def main(argv=None) -> int:
                prove=not a.no_prove,
                stages=_stage_names(a), task=a.task, specification=specification, witness_dir=a.proof_dir,
                language_version=language_version, store_witness=not a.no_store_witness,
-               log=lambda m: print(f"tharkun-sv: {m}", flush=True))
-    print(f"tharkun-sv: {v.runs} runs in {v.seconds:.1f}s; {v.reason}")
+               log=_log)
+    _log(f"{v.runs} runs in {v.seconds:.1f}s; {v.reason}")
     if v.witness is not None:
-        print(f"tharkun-sv: witness {json.dumps(v.witness)}")
+        _log(f"witness {json.dumps(v.witness)}")
         if a.witness_out:
             with open(a.witness_out, "w") as fh:
                 json.dump(v.witness, fh, indent=1)
     if "proof_checked" in v.detail:
-        # Tagged "proof: " (not "checked_witness=...") so the SV harness's
-        # diagnostic-line grammar recognizes this line as non-verdict output;
-        # otherwise "checked=False" reads as an embedded FALSE verdict token.
-        print(f"tharkun-sv: proof: checked_witness={v.detail['proof_checked']} "
+        _log(f"proof: checked_witness={v.detail['proof_checked']} "
               f"open_obligations={len(v.detail.get('open_obligations', []))} "
               f"witness={v.detail.get('witness_path', '')}")
         if v.detail.get("witness_write_error"):
-            print(f"tharkun-sv: proof: witness not written: {v.detail['witness_write_error']}")
+            _log(f"proof: witness not written: {v.detail['witness_write_error']}")
     calls = v.detail.get("solver_calls")
-    print(f"tharkun-sv: component={v.component}" + (f" solver_calls={calls}" if calls is not None else ""))
+    _log(f"component={v.component}" + (f" solver_calls={calls}" if calls is not None else ""))
     print(v.line(), flush=True)
     return 0
 

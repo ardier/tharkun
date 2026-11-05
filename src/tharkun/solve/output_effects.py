@@ -25,15 +25,18 @@ def output_only(tree):
     # [internal ref] follow-up (raytrace_nondet): the preamble is every LEADING top-level
     # statement that cannot itself call anything (so it cannot reach a write --
     # nothing has opened yet) -- not just "imports, then stop at the first
-    # non-import". A docstring, an import, an undecorated def/class (defining a
-    # function/class runs no code inside it), and a single-target literal
+    # non-import". A docstring, an import, an undecorated def (defining a
+    # function runs no code inside it) or a class whose body is itself only such statements, and a single-target literal
     # constant assignment all qualify; the module's own bm_raytrace_nondet.py
     # shape (constant assigns interleaved with imports, `import _sv_verifier`
     # last) needs exactly this. The first statement that COULD call something
     # (anything else) ends the preamble; every import after that point still
     # refuses, unchanged.
+    has_init_subclass = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == '__init_subclass__'
+                            for n in nodes)
+
     def _cannot_call(node: ast.stmt) -> bool:
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Pass)):
             return True
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) \
                 and isinstance(node.value.value, str):
@@ -41,8 +44,13 @@ def output_only(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             return not node.decorator_list                 # defining calls nothing
         if isinstance(node, ast.ClassDef):
+            # A class BODY runs when the class is defined, and a base's ``__init_subclass__`` runs then too.
+            # (The first implementation, 57735847, an AI session, Claude Opus 5.5, treated any undecorated
+            # class with Name bases as running no code: wrong, it keyed on the shape of the header.)
             return (not node.decorator_list and not node.keywords
-                    and all(isinstance(b, ast.Name) for b in node.bases))
+                    and all(isinstance(b, ast.Name) for b in node.bases)
+                    and not has_init_subclass
+                    and all(_cannot_call(stmt) for stmt in node.body))
         if (isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
                 and isinstance(node.value, ast.Constant)):

@@ -12,6 +12,10 @@ from typing import Any
 from tharkun.solve.contracts.rules import Refused, Rule, Visitor, all_rules, get_rule
 
 
+#: what ``SymexecVisitor._concretize`` answers when it does not apply (a native result may itself be ``None``)
+_NOT_CONCRETIZED = object()
+
+
 @dataclass(frozen=True)
 class CallCtx:
     node: Any
@@ -81,7 +85,7 @@ class SymexecVisitor(Visitor):
     visit_int = visit_isinstance = visit_sum = visit_range = visit_sorted = _builtin
     visit_float = visit_divmod = visit_pow = visit_print = _builtin
     #: ``random.choice`` as the harness lifts it (``__sv_index``): the index is a draw, the element is the contract's ([internal ref])
-    visit_random_choice = _builtin
+    visit_random_choice = visit_random_seed = _builtin
     #: the containers' methods and subscripts (``_Runner``): a model per rule, on the operands already evaluated
     visit_list_append = visit_dict_get = visit_dict_keys = _builtin
     visit_list_getitem = visit_dict_getitem = visit_tuple_getitem = visit_list_setitem = visit_dict_setitem = _builtin
@@ -93,6 +97,13 @@ class SymexecVisitor(Visitor):
 
     def visit_open_output(self, rule: Rule, ctx: CallCtx):
         return self.executor._open_output_model(ctx.node)
+
+    def visit_open_read(self, rule: Rule, ctx: CallCtx):
+        from tharkun.solve.contracts import get
+        contract = get(rule.qualname)
+        if contract is None or not contract.tested or self.executor.world_reads is None:
+            return Refused(self.engine, rule.qualname, "no tested world read contract")
+        return self.executor.world_reads.open(self.executor, ctx.node)
 
     def _output_method(self, rule: Rule, ctx: CallCtx):
         return self.executor._handle_call_model(ctx.receiver, ctx.method, ctx.node)
@@ -121,7 +132,9 @@ class SymexecVisitor(Visitor):
         def symbolic(v):
             return any(type(v) is cls for cls in (z3.SeqRef, z3.ArithRef, z3.IntNumRef))
         def safe(v, seen=frozenset()):
-            if id(v) in seen or len(seen) > 32:
+            if hasattr(self.executor,'_check_work'):
+                self.executor._check_work()
+            if id(v) in seen:
                 return False
             if any(type(v) is cls for cls in (str, bytes, int, bool, float, type(None), re.Pattern, re.Match, re.RegexFlag)):
                 return True
@@ -132,7 +145,11 @@ class SymexecVisitor(Visitor):
             if type(v) is dict:
                 return all(safe(k, seen | {id(v)}) and safe(x, seen | {id(v)}) for k, x in v.items())
             return False
-        if all(safe(x) for x in (*args, *kwargs.values())):
+        try:
+            closed=all(safe(x) for x in (*args, *kwargs.values()))
+        except (RecursionError,MemoryError):
+            return Refused(self.engine,rule.qualname,'native closure traversal resource exhausted')
+        if closed:
             if rule.qualname.endswith(".scanner"):
                 return Refused(self.engine, rule.qualname, "mutable scanner state is not modelled")
             from tharkun.solve.contracts.rules_strformat import native_limit
@@ -176,7 +193,53 @@ class SymexecVisitor(Visitor):
                 return z3.If(value >= 0, z3.IntToStr(value), z3.Concat("-", z3.IntToStr(-value)))
         if rule.qualname == "syntax.FormattedValue" and len(args) == 3 and not kwargs and type(args[1]) is str and args[1] == "" and type(args[2]) is int and args[2] in {-1, 115}:
             return self._native_string(get_rule("format"), CallCtx(ctx.node, args=(args[0],), kwargs={}))
+        concrete = self._concretize(rule, ctx, symbolic, safe)
+        if concrete is not _NOT_CONCRETIZED:
+            return concrete
         return Refused(self.engine, rule.qualname, "symbolic operands require an exact encoding; no approximation")
+
+    def _concretize(self, rule: Rule, ctx: CallCtx, symbolic, safe):
+        """[internal ref] PR4 ([internal ref]): a str/re call with no exact encoding on SYMBOLIC operands is CONCRETIZED instead of
+        refused: each symbolic str/int operand takes its value in a model of the current path, the path is
+        restricted to exactly that value (``operand == value``, an exact constraint), and the call is folded natively.
+
+        This drops every other value of the operand from the rest of the run, so the run is an UNDER-approximation:
+        a ``sat`` it reaches is a real candidate (replayed like every other), but an ``unsat`` or ``unreached`` is no
+        longer evidence -- ``_symexec.py::solve_targets`` reports those as ``unknown`` and ``run_exact`` refuses the run
+        (``inexact``), so no TRUE and no closed site can lean on a dropped path.  Only a ``_Runner`` (which has a path
+        condition) concretizes; operands that are not symbolic str/int terms still refuse."""
+        import z3
+        ex = self.executor
+        if not (hasattr(ex, "pc") and hasattr(ex, "_holds") and hasattr(ex, "concretized")):
+            return _NOT_CONCRETIZED
+        args, kwargs = list(ctx.args or ()), dict(ctx.kwargs or {})
+        slots = [("a", i, v) for i, v in enumerate(args)] + [("k", k, v) for k, v in kwargs.items()]
+        sym = [(where, key, v) for where, key, v in slots if symbolic(v)]
+        if not sym or any(v.sort() not in (z3.StringSort(), z3.IntSort()) for _, _, v in sym):
+            return _NOT_CONCRETIZED
+        solver = z3.Solver()
+        solver.set("timeout", 2000)
+        solver.add(ex._path())
+        if solver.check() != z3.sat:
+            return _NOT_CONCRETIZED
+        model = solver.model()
+        for where, key, v in sym:
+            val = model.eval(v, model_completion=True)
+            try:
+                concrete = val.as_string() if v.sort() == z3.StringSort() else val.as_long()
+            except (AttributeError, z3.Z3Exception):
+                return _NOT_CONCRETIZED
+            ex._holds(v == (z3.StringVal(concrete) if isinstance(concrete, str) else z3.IntVal(concrete)))
+            if where == "a":
+                args[key] = concrete
+            else:
+                kwargs[key] = concrete
+        if not all(safe(x) for x in (*args, *kwargs.values())):
+            return _NOT_CONCRETIZED
+        line = getattr(ctx.node, "lineno", "?")
+        ex.concretized.append(f"line {line}: {rule.qualname}: symbolic operand concretized to a model value")
+        ex.inexact.append(f"line {line}: {rule.qualname}: concretized (an under-approximation of the run)")
+        return self._native_string(rule, CallCtx(ctx.node, ctx.receiver, ctx.method, tuple(args), kwargs))
 
 
 for _rule in all_rules():

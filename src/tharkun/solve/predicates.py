@@ -62,13 +62,15 @@ def exact_test(n: ast.expr) -> tuple[str, str] | None:
 
 
 def check_predicate(value: str, types: Mapping[str, str], *,
-                    builtin_names=BUILTINS) -> ast.expr:
+                    builtin_names=BUILTINS, dict_lookup: bool = False) -> ast.expr:
     """Check total Boolean evaluation under verified bindings and builtin identities.
 
     ``object`` permits type tests only. Conjunctions can refine it by exact-type
     guards. Unknown overloads, attributes, indexing, division and mixed float/int
     arithmetic are refused. Membership needs primitive elements/keys: exact dict
-    alone does not exclude a user-defined key's __eq__ or __hash__.
+    alone does not exclude a user-defined key's __eq__ or __hash__. ``dict_lookup`` is
+    the one exception: the caller renders `key in d` as the very lookup `d[key]` performs
+    (the `dict.__getitem__` KeyError condition), which runs the same callbacks.
     """
     tree = parse_predicate(value)
     for name, kind in types.items():
@@ -136,7 +138,8 @@ def check_predicate(value: str, types: Mapping[str, str], *,
                 if isinstance(op, (ast.In, ast.NotIn)):
                     # Builtin primitive keys/elements have no user callbacks. Cross-kind
                     # primitive equality is safe; the backend may still decline it.
-                    if a in SCALARS and "[" in b and b.split("[")[0] in SIZED - {"str", "bytes"}:
+                    if a in SCALARS and ((dict_lookup and b == "dict")
+                                         or ("[" in b and b.split("[")[0] in SIZED - {"str", "bytes"})):
                         continue
                     if a == b == "str" or a == b == "bytes":
                         continue

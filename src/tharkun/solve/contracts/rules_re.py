@@ -177,7 +177,7 @@ class ReSplit(Rule):
             tested_native=frozenset({"TypeError"}),
         ),
         may_raise_other=True,  # re.error: a pattern that can match an empty string used to warn/error in older Python; 3.7+ splits on it
-        returns=ReturnSpec("list[str | bytes]", "capturing groups in the pattern are INTERLEAVED into the result list, between the split pieces", tested=True),
+        returns=ReturnSpec("list[str | bytes | None]", "capturing groups in the pattern are INTERLEAVED into the result list, between the split pieces", tested=True),
         effects=Effects(deterministic=True, may_execute_callback=True),
         notes=(
             "SOUNDNESS FIX (found by the gatekeeper): an earlier draft used "

@@ -26,17 +26,25 @@ re-run concretely and replayed on the unmodified program before any FALSE.
 
 from __future__ import annotations
 
+from tharkun.sv.exact_unroll import EXACT_POW_MAX
 import ast
 import bisect
 import builtins
 import heapq
 import itertools
-from types import ModuleType
+from types import ModuleType, FunctionType
 import copy
 import operator
+import random
 import re
+import sys
 
 from tharkun.solve.contracts.rules import Refused, get_rule
+from tharkun.sv._symexec_streams import ProgramStreams, StreamHandle
+from tharkun.sv.exact_strings import is_string as _is_codepoint_string
+from tharkun.sv.exact_strings import literal as _codepoint_literal
+from tharkun.sv.exact_strings import variable as _codepoint_variable
+from tharkun.sv.exact_subset import type_identity_args
 from tharkun.sv.symexec_visitor import NATIVE_METHODS, NATIVE_MODULE_FUNCTIONS, CallCtx, SymexecVisitor
 
 import z3
@@ -57,11 +65,116 @@ class Unsupported(Exception):
     """The site's slice uses a construct this executor does not model."""
 
 
+class _WorkExhausted(Unsupported):
+    """Abort the whole invocation rather than skip one statement or return a prefix."""
+
+
+class _WorkBudget:
+    """One invocation's deadline, shared by construction, inline calls and solving."""
+
+    def __init__(self, timeout_ms, clock=None):
+        from time import monotonic
+        self.clock = clock or monotonic
+        self.deadline = self.clock() + timeout_ms / 1000
+
+    def remaining_ms(self):
+        left = self.deadline - self.clock()
+        if left <= 0:
+            raise _WorkExhausted("symbolic work deadline exhausted")
+        return max(1, int(left * 1000))
+
+    def check(self):
+        self.remaining_ms()
+
+
 #: sentinel: "no contract applies" ([internal ref] step 2), distinct from any legitimate
 #: return value (including ``None``, which some modelled calls return for real).
 _NO_CONTRACT = object()
 
-_NATIVE_MODULES = {"bisect": bisect, "heapq": heapq, "copy": copy, "itertools": itertools}
+
+class _ImportedDefs:
+    """The top-level ``def``s of ONE PROGRAM module parsed from the harness's ``module_sources``
+    (funcvals batch: imported-module calls, next to the direct name calls).
+
+    The executor inlines the body with the HARNESS globals, exactly like the imported-class paths
+    already do (``sv/_symexec_objects.py::ClassTable._closed``); a def that reads a name it neither
+    binds itself nor finds in ``builtins`` (a global of its own module would be a DIFFERENT binding
+    through the harness globals) stays refused, as do default / ``*args`` / ``**kwargs`` shapes.
+    Parsed once per (path, text)."""
+
+    _CACHE: dict = {}
+
+    @classmethod
+    def of(cls, src):
+        """``{name: (fd, lineno)}`` of the module source's closed top-level defs, else ``None``."""
+        if not src:
+            return None
+        key = (src[0], src[1])
+        got = cls._CACHE.get(key)
+        if got is None:
+            got = False
+            try:
+                node = ast.parse(src[1], src[0])
+            except (SyntaxError, ValueError, MemoryError, RecursionError):
+                node = None
+            if node is not None:
+                closed = {}
+                for fn in (n for n in node.body if isinstance(n, ast.FunctionDef)):
+                    try:
+                        cls._closed_binds(fn)
+                    except Unsupported:
+                        continue
+                    closed[fn.name] = fn
+                got = closed
+            cls._CACHE[key] = got
+        return got if got else None
+
+    @classmethod
+    def _closed_binds(cls, fd):
+        """Refuse unless every name the def READS down the leaves is one of its parameters, one of its own
+        writes (an assignment or a for / except target), or a builtin."""
+        if any(isinstance(n, (ast.Assert, ast.Raise)) for n in ast.walk(fd)):
+            # a def that itself asserts / raises is its caller's observation (inputs.works's
+            # own-assert rung route, sv[internal ref] train31 guards); the call stays unmodelled instead
+            raise Unsupported(f"the imported {fd.name} itself asserts or raises")
+        bound = set()
+        for a in ast.walk(fd.args):
+            if isinstance(a, ast.arg):
+                bound.add(a.arg)
+        for n in ast.walk(fd):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                bound.add(n.id)
+            if isinstance(n, ast.arg):
+                bound.add(n.arg)
+            if isinstance(n, ast.ExceptHandler) and n.name:
+                bound.add(n.name)
+        free = {x.id for x in ast.walk(fd) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)}
+        bad = {x for x in free - bound if x not in dir(builtins)}
+        if bad:
+            raise Unsupported(f"the imported {fd.name} reads the name {next(iter(sorted(bad)))}, which the harness globals do not answer")
+
+class _FuncVal:
+    """A program function held as a VALUE in the executor's state (funcvals batch).
+
+    Produced by a lambda expression, by a reference read of a top-level ``def``
+    (``f = g; y = f(2)``), or half of a returned ``lambda`` (``f = func(); f(x)``).
+    ``mode`` is ``"def"`` for a :class:`ast.FunctionDef` or ``"lambda"``; ``qual``
+    is the scope this call reports inline under. The BODY is not evaluated here:
+    each call inlines it, binding its argument terms to the parameters. A capture
+    shape the inline cannot model is refused where the value is created -- when in
+    doubt the value never comes into existence."""
+
+    __slots__ = ("mode", "fd", "qual")
+
+    def __init__(self, mode, fd, qual):
+        self.mode, self.fd, self.qual = mode, fd, qual
+
+    def __repr__(self):
+        return f"<_FuncVal {self.mode} {self.qual}>"
+
+
+_NATIVE_MODULES = {"bisect": bisect, "heapq": heapq, "copy": copy, "itertools": itertools, "random": random}
+_RANDOM_SEED = random.seed
 _NATIVE_CALLABLES = {
     name: _NATIVE_MODULES[name.split(".")[0]].__dict__[name.split(".")[1]]
     for name in NATIVE_MODULE_FUNCTIONS
@@ -196,10 +309,22 @@ def _num(v):
 
 
 def _truth(v):
+    if _is_codepoint_string(v):
+        return z3.Length(v) > 0
     if _is_sym(v):
         return v if z3.is_bool(v) else (z3.Length(v) > 0 if v.sort() == z3.StringSort() else v != 0)
     if isinstance(v, SymList):
         return v.length > 0
+    if isinstance(v, Union):
+        # [internal ref]: a value whose type depends on the path (``x if b else None``) is true where a TRUE member's guard
+        # holds -- never ``bool()`` of the Union object itself, which is always true and made ``if x:`` on an
+        # Optional a constant
+        parts = []
+        for g, m in v.members:
+            t = _truth(m)
+            if t is not False:
+                parts.append(_bool(g) if t is True else z3.And(_bool(g), _bool(t)))
+        return z3.Or(*parts) if parts else False
     return bool(v)
 
 
@@ -212,6 +337,10 @@ def _same_object(a, b):
 
 
 def _ite(c, a, b):
+    if _is_codepoint_string(a) or _is_codepoint_string(b):
+        if not (_is_codepoint_string(a) and _is_codepoint_string(b)):
+            raise Unsupported("merging a code-point string with another kind")
+        return z3.If(c, a, b)
     if isinstance(a, Ref) or isinstance(b, Ref):
         return _same_object(a, b)
     if isinstance(a, dict) and isinstance(b, dict):
@@ -290,28 +419,41 @@ _ARITH = {
 class _LazyIter:
     """The value of ``zip(...)``/``enumerate(...)``/``reversed(...)``: a one-shot iterator.
 
-    The contract-driven fold (``solve/contracts/adapters/concolic.py::concrete_fold``) builds
-    its items eagerly. Only a consumer that reads the iterator right away (a ``for``, a
+    The contract-driven fold retains the trusted native iterator. Only a consumer that reads it (a ``for``, a
     comprehension, ``list``/``tuple``/``sorted``/``sum``) unwraps it, through
     ``_Exec._seq``; every other use sees an object that is neither a list nor a tuple and
-    is ``Unsupported``. A second consumption is ``Unsupported`` too: a real iterator is
-    exhausted after the first, and this executor does not model that.
+    is ``Unsupported``. Later complete consumptions see the exhausted empty iterator.
+    Native iterator composition preserves shared cursors. Individual next/send calls,
+    cursor-dependent symbolic truth and user iterator protocols remain unmodelled.
     """
 
-    __slots__ = ("_items",)
+    __slots__ = ("_items", "_sources")
 
-    def __init__(self, items: list):
-        self._items = items
+    def __init__(self, items, sources=()):
+        self._items = iter(items)
+        self._sources = sources
 
-    def take(self) -> list:
+    def take(self, work_items) -> list:
         if self._items is None:
-            raise Unsupported("an iterator consumed twice")
-        items, self._items = self._items, None
-        return items
+            raise Unsupported("a failed iterator materialization")
+        try:
+            result = list(work_items(self._items))
+        except Exception:
+            self._items = None
+            raise
+        self._sources = ()
+        return result
 
 
 class _Exec:
-    def __init__(self, globals_: dict, env: dict, streams: dict):
+    def _merge_value(self, condition, a, b):
+        return _typed_ite(condition, a, b)
+
+    def _select_value(self, condition, a, b):
+        return _ite(condition, a, b)
+
+    def __init__(self, globals_: dict, env: dict, streams: dict, *, _work_budget=None):
+        self._work_budget = _work_budget if _work_budget is not None else _WorkBudget(10000)
         self.g = globals_
         self.env = env
         self.streams = streams          # param -> [symbolic draws]
@@ -319,15 +461,41 @@ class _Exec:
         self.pc = []                    # path conditions (control dependence)
 
     # --- expressions --------------------------------------------------------
+    def _check_work(self):
+        self._work_budget.check()
+
+    def _work_items(self, values):
+        self._check_work()
+        iterator = iter(values)
+        while True:
+            self._check_work()
+            try:
+                yield next(iterator)
+            except StopIteration:
+                return
+
+    def _work_members(self, value, guard=True):
+        self._check_work()
+        if not isinstance(value, Union):
+            yield guard, value
+            return
+        for g, member in self._work_items(value.members):
+            pair = (z3.And(guard, g) if guard is not True else g, member)
+            self._check_work()
+            yield pair
+
     def ev(self, n):
+        self._check_work()
         m = getattr(self, "ev_" + type(n).__name__, None)
         if m is None:
             raise Unsupported(type(n).__name__)
-        return m(n)
+        value = m(n)
+        self._check_work()
+        return value
 
     def _seq(self, v):
         """``v`` with a one-shot iterator unwrapped to the list it stands for."""
-        return v.take() if isinstance(v, _LazyIter) else v
+        return v.take(self._work_items) if type(v) is _LazyIter else v
 
     def ev_Constant(self, n):
         return n.value
@@ -339,8 +507,10 @@ class _Exec:
             v = self.g[n.id]
             if _exact_type(v, (int, float, bool, str, tuple, re.RegexFlag)) or v is None:
                 return v
-            if type(v) is list and all(_exact_type(x, (int, float, bool)) for x in v):
-                return list(v)
+            if type(v) is re.Pattern:
+                return v          # a compiled builtin pattern is immutable: its methods fold through the re rules
+            if type(v) is list and all(_exact_type(x, (int, float, bool)) for x in self._work_items(v)):
+                return list(self._work_items(v))
             # a module-level dict table with plain (hashable, comparable) scalar keys
             # ([internal ref], e.g. ``BODIES = {"sun": (...), ...}``) -- only KEYS need to be
             # simple here; a value this executor cannot later handle (ev_Subscript,
@@ -354,10 +524,10 @@ class _Exec:
         raise Unsupported(f"name {n.id}")
 
     def ev_Tuple(self, n):
-        return tuple(self.ev(e) for e in n.elts)
+        return tuple(self.ev(e) for e in self._work_items(n.elts))
 
     def ev_List(self, n):
-        return [self.ev(e) for e in n.elts]
+        return [self.ev(e) for e in self._work_items(n.elts)]
 
     def ev_Dict(self, n):
         out = {}
@@ -384,6 +554,10 @@ class _Exec:
     def ev_BinOp(self, n):
         a, b = self.ev(n.left), self.ev(n.right)
         op = type(n.op)
+        if _is_codepoint_string(a) or _is_codepoint_string(b):
+            if op is ast.Add and _is_codepoint_string(a) and _is_codepoint_string(b):
+                return z3.Concat(a, b)
+            raise Unsupported("unaudited code-point string operation")
         if op is ast.Mod and (type(a) is str or (_is_sym(a) and a.sort() == z3.StringSort())):
             return self._string_rule("str.__mod__", n, [a, b])
 
@@ -394,12 +568,18 @@ class _Exec:
             # 2**b (symbolic) or a << b (concrete) is computed in-process: bound it, so a
             # huge constant makes the run inexact instead of a MemoryError / memory spike
             raise Unsupported(f"shift by {b} > {MAX_SHIFT}")
+        if op is ast.Mult and type(a) in (int, bool) and type(b) is list:
+            a, b = b, a
         if isinstance(a, list) and op is ast.Mult and isinstance(b, int):
-            return a * b
+            if type(a) is not list or type(b) not in (int, bool) or not -sys.maxsize-1 <= b <= sys.maxsize:
+                raise Unsupported("list repetition requires a native primitive index")
+            if not a or b <= 0:
+                return []
+            return [v for _ in self._work_items(range(b)) for v in self._work_items(a)]
         if isinstance(a, list) and op is ast.Mult and _is_sym(b):
             return SymList(z3.If(b > 0, b, 0))
         if isinstance(a, list) and isinstance(b, list) and op is ast.Add:
-            return a + b
+            return [v for seq in (a, b) for v in self._work_items(seq)]
         if not (_is_sym(a) or _is_sym(b)):
             try:
                 return _PYOP[op](a, b)
@@ -421,7 +601,7 @@ class _Exec:
         if op is ast.Mod and isinstance(b, int) and b > 0:
             _int_term(a)
             return a % b                 # z3's mod is Euclidean: equal to Python's for b > 0
-        if op is ast.Pow and isinstance(b, int) and 0 <= b <= 8:
+        if op is ast.Pow and isinstance(b, int) and 0 <= b <= EXACT_POW_MAX:
             r = 1
             for _ in range(b):
                 r = r * a
@@ -446,10 +626,19 @@ class _Exec:
         return z3.And(*parts) if len(parts) > 1 else parts[0]
 
     def _cmp(self, op, a, b):
+        self._check_work()
+        if _is_codepoint_string(a) or _is_codepoint_string(b):
+            if not isinstance(op, (ast.Eq, ast.NotEq)):
+                raise Unsupported("unaudited code-point string comparison")
+            equal = a == b if _is_codepoint_string(a) and _is_codepoint_string(b) else False
+            return equal if isinstance(op, ast.Eq) else z3.Not(equal)
         if isinstance(op, (ast.In, ast.NotIn)):
             if type(b) is str or (_is_sym(b) and b.sort() == z3.StringSort()):
                 result = self._string_rule("str.__contains__", None, [b, a])
                 return (z3.Not(result) if _is_sym(result) else not result) if isinstance(op, ast.NotIn) else result
+            if isinstance(a, Union) or isinstance(b, Union) or (
+                    isinstance(b, (list, tuple)) and any(isinstance(x, Union) for x in self._work_items(b))):
+                raise Unsupported("membership involving a Union value")
             if isinstance(b, (list, tuple)) and not any(_is_sym(x) for x in b):
                 if _is_sym(a):
                     r = z3.Or(*[_num(a) == x for x in b]) if b else False
@@ -457,6 +646,23 @@ class _Exec:
                     r = a in b
                 return (z3.Not(r) if _is_sym(r) else not r) if isinstance(op, ast.NotIn) else r
             raise Unsupported("in")
+        if isinstance(op, (ast.Is, ast.IsNot)):
+            if _is_sym(a) and z3.is_bool(a) and type(b) is bool:
+                r = a if b else z3.Not(a)
+                return z3.Not(r) if isinstance(op, ast.IsNot) else r
+            r = a is b
+            return (not r) if isinstance(op, ast.IsNot) else r
+        if isinstance(op, (ast.Eq, ast.NotEq)) and isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+            if type(a) is not type(b):
+                return False if isinstance(op, ast.Eq) else True
+            if len(a) != len(b):
+                return False if isinstance(op, ast.Eq) else True
+            parts = [self._cmp(ast.Eq(), x, y) for x, y in self._work_items(zip(a, b))]
+            if not any(_is_sym(p) for p in parts):
+                r = all(parts)
+            else:
+                r = z3.And(*parts) if len(parts) > 1 else parts[0]
+            return r if isinstance(op, ast.Eq) else (z3.Not(r) if _is_sym(r) else not r)
         if not (_is_sym(a) or _is_sym(b)):
             try:
                 return _PYCMP[type(op)](a, b)
@@ -500,7 +706,7 @@ class _Exec:
         t = _truth(self.ev(n.test))
         if not _is_sym(t):
             return self.ev(n.body) if t else self.ev(n.orelse)
-        return _ite(t, self.ev(n.body), self.ev(n.orelse))
+        return self._merge_value(t, self.ev(n.body), self.ev(n.orelse))
 
     def ev_Subscript(self, n):
         c = self.ev(n.value)
@@ -524,7 +730,7 @@ class _Exec:
                 raise Unsupported("symbolic index into an empty list")
             out = c[-1]
             for i in range(len(c) - 2, -1, -1):
-                out = _ite(k == i, c[i], out)
+                out = self._select_value(k == i, c[i], out)
             return out
         raise Unsupported("subscript")
 
@@ -683,6 +889,8 @@ class _Exec:
             elif isinstance(v, dict):
                 for x in v.values():
                     walk(x)
+            elif type(v) is _LazyIter:
+                walk(v._sources)
 
         for env in [self.env, *getattr(self, "frames", [])]:
             for v in env.values():
@@ -711,7 +919,7 @@ class _Exec:
                 raise Unsupported("a list index that is not an int")
             m = len(c)
             self.pc.append(z3.And(k >= -m, k < m))
-            c = [_ite(z3.Or(k == i, k == i - m), v, x) for i, x in enumerate(c)]
+            c = [self._select_value(z3.Or(k == i, k == i - m), v, x) for i, x in enumerate(c)]
         elif _exact_type(k, (int, bool)):
             if not -len(c) <= k < len(c):
                 raise _Dead()                          # IndexError: the run ends here, as CPython's does
@@ -749,7 +957,7 @@ class _Exec:
             return v.length
         if _is_sym(v) and v.sort() == z3.StringSort():
             return z3.Length(v)
-        if isinstance(v, (list, tuple, str, dict)):
+        if type(v) in (list, tuple, str, bytes, dict):
             return len(v)
         raise Unsupported("len")
 
@@ -779,7 +987,48 @@ class _Exec:
 
     def _model_anyall(self, name, n):
         self._short_circuit_ok(n.args[0])
-        terms = [_truth(v) for v in self._iterate_expr(n.args[0])]
+
+        def pure_truth(item):
+            def admitted(value):
+                if isinstance(value, Union):
+                    return all(admitted(member) for _guard, member in self._work_items(value.members))
+                return (_is_sym(value) or isinstance(value, SymList) or type(value) in
+                        (int, bool, float, complex, str, bytes, list, tuple, dict, set, frozenset, range, type(None)))
+            if not admitted(item):
+                raise Unsupported("iterator element truth protocol is not modelled")
+            return _truth(item)
+
+        argument = n.args[0]
+        if isinstance(argument, ast.GeneratorExp):
+            raise Unsupported("short-circuit generator evaluation is not modelled")
+        if isinstance(argument, ast.ListComp):
+            values = self._iterate_expr(argument)
+        else:
+            value = self.ev(argument)
+            if type(value) is _LazyIter:
+                if value._items is None:
+                    raise Unsupported("a failed iterator materialization")
+                try:
+                    for item in self._work_items(value._items):
+                        truth = pure_truth(item)
+                        if _is_sym(truth):
+                            self._check_work()
+                            truth = z3.simplify(truth)
+                            self._check_work()
+                            if not (z3.is_true(truth) or z3.is_false(truth)):
+                                raise Unsupported("short-circuit iterator cursor depends on symbolic truth")
+                            truth = z3.is_true(truth)
+                        if truth == (name == "any"):
+                            return name == "any"
+                except Exception:
+                    value._items = None
+                    raise
+                value._sources = ()
+                return name == "all"
+            if type(value) not in self._SEQUENCES:
+                raise Unsupported("iterate")
+            values = value
+        terms = [pure_truth(v) for v in self._work_items(values)]
         if any(_is_sym(t) for t in terms):
             return z3.Or(*terms) if name == "any" else z3.And(*terms)
         return any(terms) if name == "any" else all(terms)
@@ -854,14 +1103,14 @@ class _Exec:
         elif n.keywords:
             start = self.ev(n.keywords[0].value)
         total = _num(start)
-        nums = [_num(v) for v in vals]
+        nums = [_num(v) for v in self._work_items(vals)]
         if not (_is_sym(total) or any(_is_sym(v) for v in nums)):
             # every term is concrete: CPython's own ``sum``.  Since 3.12 it adds floats with Neumaier compensation
             # (``sum([0.1] * 10)`` is ``1.0``), which a left fold does not
             if not _exact_type(total, (int, float)) or any(not _exact_type(v, (int, float)) for v in nums):
                 raise Unsupported("sum() of an unmodelled value")
             return get_rule("sum").native(nums, total)
-        for v in nums:
+        for v in self._work_items(nums):
             total = total + v
         return total
 
@@ -879,9 +1128,8 @@ class _Exec:
         return list(out)
 
     def _model_sorted(self, n):
-        # [internal ref]: only a CONCRETE, comparable sequence -- never a symbolic sort
-        # (this executor tracks no order relation over z3 terms), and dict
-        # iterates its keys just like list()/for-in already do above.  ``reverse=`` is a
+        # Concrete sequences retain native sorting; dicts iterate their keys.
+        # ``reverse=`` is a
         # concrete truth value, ``key=None`` is no key (a key function is a call per element).
         reverse = False
         for k in n.keywords:
@@ -898,8 +1146,22 @@ class _Exec:
             v = list(v)
         if not isinstance(v, (list, tuple)):
             raise Unsupported("sorted() of a non-sequence")
-        if any(_is_sym(x) for x in v):
-            raise Unsupported("sorted() of a symbolic sequence")
+        if any(_is_sym(x) or isinstance(x, Union) for x in self._work_items(v)):
+            if n.keywords or any(_pytype(m) not in (int, bool) for x in self._work_items(v) for _g, m in _members(x)):
+                raise Unsupported("symbolic sorting requires primitive int/bool values without keywords")
+            out = list(self._work_items(v))
+            # Stable insertion sort over the represented finite length; ties never swap.
+            for i in self._work_items(range(1, len(out))):
+                for j in self._work_items(range(i, 0, -1)):
+                    a, b = out[j - 1], out[j]
+                    swap = self._cmp(ast.Lt(), b, a)
+                    if type(swap) is bool:
+                        if swap:
+                            out[j - 1], out[j] = b, a
+                    else:
+                        out[j - 1] = self._merge_value(swap, b, a)
+                        out[j] = self._merge_value(swap, a, b)
+            return out
         try:
             return sorted(v, reverse=reverse)
         except TypeError:
@@ -922,13 +1184,14 @@ class _Exec:
                 continue
             else:
                 raise Unsupported(f"{name}() with the keyword {k.arg}")
-        vals = [_num(v) for v in self._iterate_expr(n.args[0])]
+        vals = [_num(v) for v in self._work_items(self._iterate_expr(n.args[0]))]
         if not vals:
             if has_default:
                 return default
-            raise Unsupported(f"{name}() of an empty iterable")
+            raise _Dead()                 # native ValueError ends this path, not an AssertionError goal
         best = vals[0]
-        for v in vals[1:]:
+        for index in self._work_items(range(1, len(vals))):
+            v = vals[index]
             if _is_sym(best) or _is_sym(v):
                 best = z3.If(v < best, v, best) if name == "min" else z3.If(v > best, v, best)
             elif (v < best) if name == "min" else (v > best):
@@ -955,7 +1218,7 @@ class _Exec:
     #: ``SymList`` and any user object are therefore refused, and no argument carries a user
     #: hook. A container's ELEMENTS may be anything (z3 terms included): none of these
     #: builtins looks at one.
-    _SEQUENCES = (list, tuple, str, dict)
+    _SEQUENCES = (list, tuple, str, bytes, range, dict)
     _FOLD_ARGS = {
         "ord": ((str,),), "chr": ((int, bool),), "tuple": (_SEQUENCES,), "list": (_SEQUENCES,),
         "enumerate": (_SEQUENCES, (int, bool)), "reversed": (_SEQUENCES,),
@@ -1001,17 +1264,26 @@ class _Exec:
                 raise Unsupported("keys snapshot of a non-exact dict")
             args = [self._through_rule("dict.keys", arg, args=(receiver,))]
         else:
-            args = [self._seq(self.ev(a)) for a in n.args]
+            args = [self.ev(a) for a in n.args]
+            if name in ("list", "tuple"):
+                args = [self._seq(a) for a in args]
         wanted = self._FOLD_ARGS.get(name)
         for i, a in enumerate(args):
             classes = wanted[i] if wanted is not None else self._SEQUENCES
-            if not _exact_type(a, classes):
+            internal_iterator = type(a) is _LazyIter and (name == "zip" or name == "enumerate" and i == 0)
+            if not internal_iterator and not _exact_type(a, classes):
                 raise Unsupported(f"{name}() of a symbolic or unmodelled argument")
+            if internal_iterator and a._items is None:
+                raise Unsupported("a failed iterator materialization")
         try:
-            out = fold(*args)
-        except (TypeError, ValueError):
+            native_args = [a._items if type(a) is _LazyIter else a for a in args]
+            out = (fold(self._work_items(args[0])) if name in ("list", "tuple") and args
+                   else fold(*native_args))
+            if name in self._LAZY_FOLDS:
+                out = _LazyIter(out, sources=tuple(args))
+        except (TypeError, ValueError, MemoryError):
             raise Unsupported(f"{name}() raises on these arguments") from None
-        return _LazyIter(list(out)) if name in self._LAZY_FOLDS else out
+        return out
 
     def _iterate_expr(self, n):
         """The values of a generator / list comprehension or a list, unrolled."""
@@ -1026,7 +1298,7 @@ class _Exec:
                 raise Unsupported("comprehension over a symbolic iterable")
             saved = self.env.get(gen.target.id, _MISSING)
             out = []
-            for x in it:
+            for x in self._work_items(it):
                 self.env[gen.target.id] = x
                 out.append(self.ev(n.elt))
             if saved is _MISSING:
@@ -1036,7 +1308,7 @@ class _Exec:
             return out
         v = self._seq(self.ev(n))
         if isinstance(v, (list, tuple)):
-            return list(v)
+            return list(self._work_items(v))
         raise Unsupported("iterate")
 
     def ev_ListComp(self, n):
@@ -1057,6 +1329,7 @@ class _Exec:
             self.st(st)
 
     def st(self, st):
+        self._check_work()
         if isinstance(st, ast.Assign):
             v = self.ev(st.value)
             for t in st.targets:
@@ -1087,7 +1360,7 @@ class _Exec:
             for k in set(then_env) | set(else_env):
                 if k in then_env and k in else_env:
                     a, b = then_env[k], else_env[k]
-                    merged[k] = a if a is b else _ite(t, a, b)
+                    merged[k] = a if a is b else self._merge_value(t, a, b)
                 else:
                     raise Unsupported(f"{k} defined on one arm only")
             self.env = merged
@@ -1117,16 +1390,44 @@ class _Exec:
             self.env[t.id] = v
         elif isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name):
             self._through_rule("list.__setitem__", t, args=(v,))
-        elif isinstance(t, ast.Tuple) and isinstance(v, tuple) and len(t.elts) == len(v):
-            for e, x in zip(t.elts, v):
-                self.assign(e, x)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            if _is_sym(v) or isinstance(v, SymList):
+                raise Unsupported("unpacking a symbolic sequence")
+            if not isinstance(v, (tuple, list)):
+                raise _Dead()                   # TypeError: cannot unpack non-iterable
+            items = list(v)
+            starred_indices = [i for i, elt in enumerate(t.elts) if isinstance(elt, ast.Starred)]
+            if len(starred_indices) > 1:
+                raise Unsupported("multiple starred targets")
+            if not starred_indices:
+                if len(t.elts) != len(items):
+                    raise _Dead()               # ValueError: not enough / too many values to unpack
+                for e, x in zip(t.elts, items):
+                    self.assign(e, x)
+            else:
+                star_idx = starred_indices[0]
+                min_len = len(t.elts) - 1
+                if len(items) < min_len:
+                    raise _Dead()               # ValueError: not enough values to unpack
+                suffix_len = len(t.elts) - 1 - star_idx
+                prefix = items[:star_idx]
+                if suffix_len > 0:
+                    starred_val = items[star_idx:-suffix_len]
+                    suffix = items[-suffix_len:]
+                else:
+                    starred_val = items[star_idx:]
+                    suffix = []
+                for e, x in zip(t.elts[:star_idx], prefix):
+                    self.assign(e, x)
+                self.assign(t.elts[star_idx].value, list(starred_val))
+                for e, x in zip(t.elts[star_idx + 1:], suffix):
+                    self.assign(e, x)
         else:
             raise Unsupported("assignment target")
 
 
 _MISSING = object()
 _NATIVE_ATTRS = frozenset(q.split(".", 1)[1] for q in NATIVE_METHODS)
-_NATIVE_LIMIT = 4096                    # the most items a native iterator of ``NATIVE_MODULE_FUNCTIONS`` is materialized to
 
 
 class _Lit(ast.expr):
@@ -1148,25 +1449,6 @@ _Exec.ev__Lit = _ev_lit
 def _int_term(a):
     if _is_sym(a) and a.sort() != z3.IntSort():
         raise Unsupported("integer operation on a non-integer term")
-
-
-def _py_floordiv_sym(a, b):
-    """``a // b`` for a symbolic, nonzero divisor, with Python's floor semantics over z3's Euclidean ``/``.
-
-    Euclidean division by a POSITIVE divisor is floor division, and ``floor(a / b) == floor(-a / -b)``, so a negative
-    divisor is flipped to a positive one: ``If(b > 0, a / b, (-a) / (-b))``.  This equals the earlier ``(a - r) / b`` with
-    ``r`` the Python remainder (an ``If`` over ``a % b`` with a divisor of either sign), but z3 never divides by a term of
-    unknown sign nor reasons about ``a % b`` and ``/ b`` together: ``-(a // -b) * b >= a`` over ``0 <= a, b <= 1024`` took
-    z3 about 8 s that way and 2 ms this way.  The same form as ``solve/terms_z3.py``."""
-    return z3.If(b > 0, a / b, (-a) / (-b))
-
-
-def _py_mod_sym(a, b):
-    """``a % b`` for a symbolic, nonzero divisor, with Python's sign-of-divisor semantics: ``a - b * (a // b)``, the
-    definition, over the SAME quotient term :func:`_py_floordiv_sym` builds (z3 shares it), so ``(a // b) * b + a % b == a``
-    is structural.  Measured: giving ``%`` its own positive-divisor form, ``If(b > 0, a % b, -((-a) % (-b)))``, made z3 give
-    up on that identity (10 s timeout; 0.05 s with the earlier encoding, 0.0 s with this one)."""
-    return a - b * _py_floordiv_sym(a, b)
 
 
 def _floordiv(a, k):
@@ -1257,7 +1539,7 @@ def solve_site(harness_text: str, module_globals: dict, fn_name: str, line: int,
             env[p] = list(streams[p])
         else:
             env[p] = _var(p, k)
-    ex = _Exec(module_globals, env, streams)
+    ex = _Exec(module_globals, env, streams, _work_budget=_WorkBudget(timeout_ms))
     # run the kept prefix, re-entering each enclosing if on the site's arm
     kept_ids = {id(s) for s in kept}
     conds = []
@@ -1356,6 +1638,8 @@ class Union:
 
 
 def _pytype(v):
+    if _is_codepoint_string(v):
+        return str
     if isinstance(v, (list, SymList)):
         return list
     if _is_sym(v):
@@ -1417,9 +1701,12 @@ class _Runner(_Exec):
     :class:`Unsupported`); the sites that statement could reach are reported
     ``unsupported`` instead of solved."""
 
-    def __init__(self, tree, globals_, env, streams, targets, call_targets=None, proven_classes=(),
-                 fresh_draws=None):
-        super().__init__(globals_, env, streams)
+    def __init__(self, tree, globals_, env, streams, targets, call_targets=None, proven_classes=(), module_sources=None,
+                 fresh_draws=None, world=None, _work_budget=None):
+        super().__init__(globals_, env, streams, _work_budget=_work_budget)
+        self.program_streams = ProgramStreams()
+        from tharkun.sv._symexec_world import WorldReads
+        self.world_reads = WorldReads(world) if world is not None else None
         #: ``{id(call node): kind}`` of the ``_sv_verifier.nondet_*()`` calls inside the program's own functions
         #: that a proof lets draw (``product_proof.py``): EACH EXECUTION of such a call is a fresh unconstrained
         #: ``kind`` term, which is what a draw is (the child's replayed vector hands every execution its own value).
@@ -1428,6 +1715,7 @@ class _Runner(_Exec):
         self.fresh_draws = fresh_draws or {}
         self.draw_count = 0
         self.defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        self.sources = module_sources or {}   # {module: [path, text]} of the program's own modules the harness imported
         self.targets = set(targets)      # harness lines of the sites to solve for
         self.goals = {line: [] for line in self.targets}
         self.unsupported: dict = {}      # target line -> why its statement was not modelled
@@ -1436,6 +1724,9 @@ class _Runner(_Exec):
         #: statements this executor ANSWERED but whose effect it does not track (``print``: what it writes): a search does not mind, a
         #: proof (``run_exact``) does -- the run is not exact
         self.inexact = []
+        #: calls whose symbolic operands were concretized (``symexec_visitor.py::SymexecVisitor._concretize``): the run
+        #: is an under-approximation, so a site it does not reach is ``unknown``, never ``unsat``/``unreached``
+        self.concretized = []
         self.bounded = False             # a loop was cut at LOOP_BOUND
         self.stream_use: dict = {}       # stream -> reads evaluated (bounds the positions read)
         self.frames = []                 # caller environments while a call is inlined
@@ -1445,12 +1736,12 @@ class _Runner(_Exec):
         self._pre = {}                   # receivers evaluated once for the object-call check, see ev_Call
         self.reach = _targets_by_function(self.defs, self.targets)
         #: user-class support ([internal ref], ``_symexec_objects.py``): on only when the call_target records were handed
-        #: in -- without them (``run_exact``, the proof) a call of a class stays unmodelled, as before
+        #: in. The audited plain-class proof installs its source-only table separately.
         self.objects = None
         if call_targets is not None:
             from tharkun.sv import _symexec_objects
 
-            self.objects = _symexec_objects.ObjectModel(self, tree, globals_, call_targets, proven_classes)
+            self.objects = _symexec_objects.ObjectModel(self, tree, globals_, call_targets, proven_classes, module_sources)
             self.reach = self.objects.build_reach(self.defs, self.targets)
 
     # --- helpers ------------------------------------------------------------
@@ -1487,9 +1778,14 @@ class _Runner(_Exec):
             hit = self._pre.get((id(n), self.depth), _MISSING)
             if hit is not _MISSING:
                 return hit
-        return super().ev(n)
+        value = super().ev(n)
+        if self.world_reads is not None:
+            self.world_reads.remember(n, value, self.env)
+        return value
 
     def ev_Name(self, n):
+        if n.id in self.defs:
+            return _FuncVal("def", self.defs[n.id], n.id)
         if n.id not in self.env and self.frames and n.id in self.frames[0]:
             v = self.frames[0][n.id]     # a callee reading a global the main block assigned
         else:
@@ -1500,6 +1796,24 @@ class _Runner(_Exec):
                 and not (self.frames and n.id in self.frames[0]):
             self.objects.check_class_name(n.id, v)      # a class read from the module's namespace, not a local
         return v
+
+    def ev_Lambda(self, n):
+        """A lambda VALUE (its body is not evaluated here): each later call inlines it.
+
+        Soundness gate: every name the body reads that is not one of its parameters must
+        come from the module level -- a global constant (read through :meth:`ev_Name`
+        into ``self.g`` as before) or a top-level ``def`` (a ``_FuncVal``). A capture
+        over a local of the enclosing scope, or a default / varargs / keyword-only
+        shape, is refused: those are the shapes the per-call inline cannot model."""
+        free = {x.id for x in ast.walk(n.body) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)}
+        params = {a.arg for a in n.args.args}
+        if n.args.defaults or n.args.kw_defaults or n.args.vararg or n.args.kwarg \
+                or n.args.posonlyargs or n.args.kwonlyargs:
+            raise Unsupported("a lambda with a default / *args / **kwargs / keyword-only shape")
+        badly = free - params - set(self.g) - set(self.defs)
+        if badly:
+            raise Unsupported(f"a lambda capturing a non-global name: {next(iter(sorted(badly)))}")
+        return _FuncVal("lambda", n, f"<lambda:{n.lineno}>")
 
     # --- typing ---------------------------------------------------------------
     def ev_BinOp(self, n):
@@ -1529,7 +1843,8 @@ class _Runner(_Exec):
             _int_term(a)
             _int_term(b)
             self._holds(b != 0)
-            return _py_floordiv_sym(a, b) if isinstance(op, ast.FloorDiv) else _py_mod_sym(a, b)
+            r = z3.If(b > 0, a % b, z3.If(a % b == 0, 0, a % b + b))
+            return r if isinstance(op, ast.Mod) else (a - r) / b
         return _Exec.ev_BinOp(self, ast.BinOp(_Lit(a), op, _Lit(b)))
 
     def _ok_binop(self, opname, a, b):
@@ -1586,7 +1901,7 @@ class _Runner(_Exec):
             if not _is_sym(t):
                 return go(i + 1) if bool(t) == is_and else v
             nxt = self._guarded(t if is_and else z3.Not(t), lambda: go(i + 1))
-            return _typed_ite(t, nxt, v) if is_and else _typed_ite(t, v, nxt)
+            return self._merge_value(t, nxt, v) if is_and else self._merge_value(t, v, nxt)
 
         return go(0)
 
@@ -1617,12 +1932,20 @@ class _Runner(_Exec):
             return self.ev(n.body) if t else self.ev(n.orelse)
         a = self._guarded(t, lambda: self.ev(n.body))
         b = self._guarded(z3.Not(t), lambda: self.ev(n.orelse))
-        return _typed_ite(t, a, b)
+        return self._merge_value(t, a, b)
 
     # --- containers ------------------------------------------------------------
     def ev_Subscript(self, n):
         c = self.ev(n.value)
         if isinstance(n.slice, ast.Slice):
+            if (self.world_reads is not None and _is_sym(c) and c.sort() == z3.StringSort()
+                    and c.sexpr() in self.world_reads.expressions):
+                key = n.slice
+                lo = self.ev(key.lower) if key.lower is not None else 0
+                hi = self.ev(key.upper) if key.upper is not None else None
+                if key.step is not None or type(lo) is not int or lo < 0 or (hi is not None and (type(hi) is not int or hi < lo)):
+                    raise Unsupported("world string slice: nonnegative constant bounds required")
+                return z3.SubString(c, lo, z3.Length(c) if hi is None else hi - lo)
             if type(c) is str:
                 return super().ev_Subscript(ast.Subscript(_Lit(c),n.slice,ast.Load()))
             raise Unsupported("slice")
@@ -1651,7 +1974,7 @@ class _Runner(_Exec):
             self._holds(z3.Or(*[_num(k) == x for x in keys]))
             out = c[keys[-1]]
             for x in reversed(keys[:-1]):
-                out = _ite(_num(k) == x, c[x], out)
+                out = self._select_value(_num(k) == x, c[x], out)
             return out
         if _exact_type(c, (list, tuple)) and _is_sym(k):
             k = _num(k)
@@ -1662,22 +1985,60 @@ class _Runner(_Exec):
                 raise _Dead()
             self._holds(z3.And(k >= -m, k < m))    # else IndexError ends the run
             out = c[-1]
-            for i in range(m - 2, -1, -1):
-                out = _ite(z3.Or(k == i, k == i - m), c[i], out)
+            for i in self._work_items(range(m - 2, -1, -1)):
+                out = self._select_value(z3.Or(k == i, k == i - m), c[i], out)
             return out
         if _exact_type(c, (list, tuple, str)) and _exact_type(k, (int, bool)) and not -len(c) <= k < len(c):
             raise _Dead()
         return super().ev_Subscript(ast.Subscript(_Lit(c), _Lit(k), ast.Load()))
 
     def _cmp(self, op, a, b):
+        self._check_work()
+        if isinstance(a, Union) or isinstance(b, Union):
+            return self._cmp_union(op, a, b)
         if isinstance(op, (ast.In, ast.NotIn)) and isinstance(b, (dict, list, tuple)):
-            items = list(b.keys()) if isinstance(b, dict) else list(b)
-            if _is_sym(a) or any(_is_sym(x) for x in items):
-                r = z3.Or(*[_num(a) == _num(x) for x in items]) if items else False
+            if any(isinstance(x, Union) for x in self._work_items(b)):
+                raise Unsupported("membership involving a Union value")
+            items = b.keys() if isinstance(b, dict) else b
+            if _is_sym(a) or any(_is_sym(x) for x in self._work_items(items)):
+                r = z3.Or(*[_num(a) == _num(x) for x in self._work_items(items)]) if items else False
             else:
                 r = a in items
             return (z3.Not(r) if _is_sym(r) else not r) if isinstance(op, ast.NotIn) else r
         return super()._cmp(op, a, b)
+
+    def _cmp_union(self, op, a, b):
+        """A comparison with an operand whose type depends on the path ([internal ref]: an ``Optional[int]`` drawn as ``x if b
+        else None``), member by member: ``==`` / ``!=`` of two types that are not both numbers is ``False`` / ``True``
+        (what CPython's builtins answer), an ordering of such types raises ``TypeError`` and ends those paths, and
+        the rest is the comparison of the members.  Before, the Union OBJECT was compared concretely (``==`` by
+        identity, always ``False``), so ``x == 7`` on an Optional was "no modelled run fires it"."""
+        self._check_work()
+        if not isinstance(op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+            raise Unsupported("a membership or identity test of a value whose type depends on the path")
+        numeric = {int, bool, float}
+        out, bad = [], []
+        for ga, ma in self._work_members(a):
+            for gb, mb in self._work_members(b):
+                g = _conj([ga, gb])
+                ta, tb = _pytype(ma), _pytype(mb)
+                if ta is tb or {ta, tb} <= numeric:
+                    self._check_work()
+                    r = self._cmp(op, ma, mb)
+                    self._check_work()
+                elif isinstance(op, (ast.Eq, ast.NotEq)):
+                    r = isinstance(op, ast.NotEq)
+                else:
+                    bad.append(g)
+                    continue
+                if r is not False:
+                    out.append(_bool(g) if r is True else z3.And(_bool(g), _bool(r)))
+        if bad:                         # those members raise TypeError here: the path ends
+            self._holds(z3.Not(z3.Or(*[_bool(g) for g in self._work_items(bad)])))
+        self._check_work()
+        result = z3.Or(*out) if out else False
+        self._check_work()
+        return result
 
     def assign(self, t, v):
         if isinstance(t, ast.Attribute) and self.objects is not None:
@@ -1701,6 +2062,10 @@ class _Runner(_Exec):
 
     def ev_Attribute(self, n):
         """``obj.attr`` and ``Cls.attr`` through the object model (``math.pi`` and the like stay with the base)."""
+        if isinstance(n.value, ast.Name) and isinstance(self.env.get(n.value.id), StreamHandle):
+            if n.attr == "closed":
+                return self.env[self.env[n.value.id].key + "closed"]
+            raise Unsupported(f"program stream attribute {n.attr}")
         if self.objects is None:
             return super().ev_Attribute(n)
         base = n.value
@@ -1775,9 +2140,9 @@ class _Runner(_Exec):
         """A function of a standard-library module run by CPython itself (``Rule.native``) on concrete operands ([internal ref] step 2): the
         arguments of ``NATIVE_MODULE_FUNCTIONS``' functions are exact lists, tuples, strs, dicts, ints, or concrete scalars; a function
         that mutates its first argument runs on a COPY and rebinds the name (``_mutable``); one that compares elements needs every
-        element concrete; an iterator comes back as a one-shot ``_LazyIter`` and a result of more than ``_NATIVE_LIMIT`` items is
-        refused.  ``IndexError`` / ``KeyError`` / ``ValueError`` end the path, any other exception refuses."""
-        import itertools
+        element concrete; trusted native iterators remain lazy until a consumer traverses them
+        under the shared invocation deadline. ``IndexError`` / ``KeyError`` / ``ValueError`` end the path,
+        any other exception refuses."""
 
         mutates, compares = NATIVE_MODULE_FUNCTIONS[qualname]
         args = [self.ev(a) for a in n.args]
@@ -1786,8 +2151,9 @@ class _Runner(_Exec):
             if k.arg is None:
                 raise Unsupported(f"{qualname}: keyword expansion")
             kwargs[k.arg] = self.ev(k.value)
-        containers = (list, tuple, str, dict)
+        containers = self._SEQUENCES
         if any(not (_exact_type(a, containers) or self._concrete(a) or
+                    (qualname.startswith("itertools.") and type(a) is _LazyIter) or
                     (qualname == "copy.copy" and _is_sym(a))) for a in args):
             raise Unsupported(f"{qualname}: a symbolic or unmodelled operand")
         elems = [x for a in args if _exact_type(a, (list, tuple)) for x in a]
@@ -1806,8 +2172,9 @@ class _Runner(_Exec):
                 raise Unsupported("copy.deepcopy of a symbolic or unmodelled value")
         elif qualname in ("itertools.chain", "itertools.combinations", "itertools.permutations", "itertools.product", "itertools.islice"):
             iterables = args if qualname in ("itertools.chain", "itertools.product") else args[:1]
-            if not iterables or any(not _exact_type(a, containers) for a in iterables):
-                raise Unsupported(f"{qualname}: an iterable that is not an exact list, tuple, str or dict")
+            if ((not iterables and qualname not in ("itertools.chain", "itertools.product"))
+                    or any(not (_exact_type(a, containers) or type(a) is _LazyIter) for a in iterables)):
+                raise Unsupported(f"{qualname}: an iterable outside the exact builtin sequence model")
             rest = args[len(iterables):] if qualname not in ("itertools.chain", "itertools.product") else []
             if any(not _exact_type(a, (int, bool, type(None))) for a in rest) or any(not _exact_type(v, (int, bool)) for v in kwargs.values()):
                 raise Unsupported(f"{qualname}: a symbolic or non-int count")
@@ -1825,11 +2192,15 @@ class _Runner(_Exec):
         target = list(args[0]) if mutates else None
         call_args = ([target, *args[1:]] if mutates else args)
         try:
-            out = rule.native(*call_args, **kwargs)
             if qualname.startswith("itertools."):
-                out = list(itertools.islice(out, _NATIVE_LIMIT + 1))
-                if len(out) > _NATIVE_LIMIT:
-                    raise Unsupported(f"{qualname}: more than {_NATIVE_LIMIT} items")
+                call_args = list(call_args)
+                for index, value in enumerate(iterables):
+                    if type(value) is _LazyIter:
+                        if value._items is None:
+                            raise Unsupported("a failed iterator materialization")
+                        value = value._items
+                    call_args[index] = self._work_items(value)
+            out = rule.native(*call_args, **kwargs)
         except (IndexError, KeyError, ValueError):
             raise _Dead() from None
         except Unsupported:
@@ -1841,7 +2212,7 @@ class _Runner(_Exec):
             self._mutable(name, (list,))
             self.env[name] = target
             return out
-        return _LazyIter(out) if qualname.startswith("itertools.") else out
+        return _LazyIter(out, sources=tuple(iterables)) if qualname.startswith("itertools.") else out
 
     def _deep_concrete(self, v, depth=0) -> bool:
         if self._concrete(v):
@@ -1870,6 +2241,39 @@ class _Runner(_Exec):
         self._holds(z3.And(idx >= 0, idx < m))
         return _choice_ite(idx, seq)
 
+    def _model_random_seed(self, n):
+        from tharkun.solve.contracts import get
+        contract=get('random.seed')
+        if contract is None or not contract.tested or contract.returns is None or not contract.returns.tested or contract.returns.type!='None':
+            raise Unsupported('random.seed: no tested None return contract')
+        f=n.func
+        name=f.value.id if isinstance(f,ast.Attribute) and isinstance(f.value,ast.Name) else f.id if isinstance(f,ast.Name) else None
+        if name is None or name in self.env or name in self.defs or (self.frames and name in self.frames[0]):
+            raise Unsupported('random.seed: callee is shadowed or unresolved')
+        target=self.g.get(name)
+        if not ((isinstance(f,ast.Attribute) and f.attr=='seed' and target is random and random.__dict__.get('seed') is _RANDOM_SEED)
+                or (isinstance(f,ast.Name) and target is _RANDOM_SEED)):
+            raise Unsupported('random.seed: callee identity is not the native function')
+        if len(n.args)>2 or any(isinstance(x,ast.Starred) for x in n.args):
+            raise Unsupported('random.seed: binding is outside the transfer')
+        bound=dict(zip(('a','version'),[self.ev(x) for x in n.args]))
+        for keyword in n.keywords:
+            if keyword.arg not in ('a','version') or keyword.arg in bound:
+                raise Unsupported('random.seed: binding is outside the transfer')
+            bound[keyword.arg]=self.ev(keyword.value)
+        value,version=bound.get('a'),bound.get('version',2)
+        if not _exact_type(version,(int,bool,float,str,bytes,type(None))):
+            raise Unsupported('random.seed: version comparison is not a closed scalar')
+        numeric=_is_sym(value) and value.sort() in (z3.IntSort(),z3.RealSort(),z3.BoolSort())
+        if value is None or not (numeric or _exact_type(value,(int,bool,float,str,bytes,bytearray))):
+            raise Unsupported('random.seed: seed is not an explicit native scalar')
+        if type(value)is bytearray and version!=2:
+            raise Unsupported('random.seed: native bytearray hashing raises TypeError')
+        if type(value)is str and any(0xd800<=ord(c)<=0xdfff for c in value):
+            raise Unsupported('random.seed: surrogate encoding is outside the transfer')
+        # Modelled RNG reads cover every generator state; reseeding cannot mutate the class heap.
+        return None
+
     def _model_list_append(self, n):
         cur = self._mutable(n.func.value.id, (list,))
         v = self.ev(n.args[0])
@@ -1883,7 +2287,7 @@ class _Runner(_Exec):
             return d.get(k, dflt)
         out = dflt
         for x in reversed([x for x in d if isinstance(x, (int, bool))]):
-            out = _typed_ite(_num(k) == x, d[x], out)
+            out = self._merge_value(_num(k) == x, d[x], out)
         return out
 
     def _short_circuit_ok(self, node):
@@ -1910,14 +2314,76 @@ class _Runner(_Exec):
             while len(self._pre) > mark:
                 self._pre.popitem()
 
+    def _import_def(self, f):
+        """`(fd,)` for an ``ast.Attribute`` chain whose tail names a closed top-level def of one of the
+        program's own modules (the module object is in the harness globals; the source is in ``module_sources``),
+        else ``None`` -- every other attribute call goes on to its usual dispatch (an imported CLASS still goes
+        through the object model below; the generic refuser stays the last resort)."""
+        node = f
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return None
+        mod = self.g.get(node.id)
+        for attr in reversed(parts[:-1]):
+            if not isinstance(mod, ModuleType):
+                return None
+            mod = getattr(mod, attr, None)
+        if not isinstance(mod, ModuleType):
+            return None
+        src = self.sources.get(mod.__name__)
+        if not src:
+            return None
+        path = getattr(sys.modules.get(mod.__name__, None), "__file__", None)
+        if not path or os.path.abspath(path) != os.path.abspath(src[0]):
+            return None
+        closed = _ImportedDefs.of(src)
+        if closed is not None and parts[-1] in closed:
+            return closed[parts[-1]]
+        return None
+
     def _ev_call(self, n):
         f = n.func
+        factory = self.program_streams.constructor(self, f)
+        if factory is not None:
+            return self.program_streams.create(self, factory, n)
+        if isinstance(f, ast.Name) and f.id == "print" and self._is_builtin("print") and any(k.arg == "file" for k in n.keywords):
+            return self.program_streams.print(self, n)
+        if isinstance(f, ast.Attribute):
+            handle = (self.env.get(f.value.id) if isinstance(f.value, ast.Name) else
+                      f.value.value if isinstance(f.value, _Lit) else None)
+            if isinstance(handle, StreamHandle):
+                return self.program_streams.call(self, handle, f.attr, n)
+        if self.world_reads is not None and isinstance(f, ast.Attribute):
+            from tharkun.sv._symexec_world import ReadHandle
+            receiver = f.value
+            handle = (self.env.get(receiver.id) if isinstance(receiver, ast.Name) else
+                      receiver.value if isinstance(receiver, _Lit) else None)
+            if isinstance(handle, ReadHandle):
+                return self.world_reads.call(self, handle, f.attr, n)
+            if (isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name)
+                    and receiver.func.id == "open" and self._is_builtin("open")):
+                handle = self.ev(receiver)
+                if isinstance(handle, ReadHandle):
+                    return self.world_reads.call(self, handle, f.attr, n)
         if isinstance(f, ast.Attribute) and f.attr == "get" and 1 <= len(n.args) <= 2 and not n.keywords:
             d = self.ev(f.value)
             if isinstance(d, dict):
                 return self._through_rule("dict.get", n, args=(d,))
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "__SV_POS":
             return None                  # the harness's own bookkeeping
+        if (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                and f.value.id in {"_sv_verifier", "__sv_v"} and f.attr == "check_type"):
+            val = self.ev(n.args[0])
+            hint = self.ev(n.args[1])
+            res = self._isinstance(val, hint)
+            if res is False:
+                raise _Dead()
+            if _is_sym(res):
+                self._holds(res)
+            return None
         if isinstance(f, ast.Name) and f.id == "__sv_next":
             # the stream is an array and its position a term of the path: paths that took
             # different branches read different elements next, and merge like any value
@@ -1933,9 +2399,47 @@ class _Runner(_Exec):
             return z3.Select(self.streams[p], pos)
         if isinstance(f, ast.Name) and f.id == "__sv_ok_binop":
             return self._ok_binop(n.args[0].value, self.ev(n.args[1]), self.ev(n.args[2]))
+        callee_val = None
+        if isinstance(f, ast.Name):
+            for fr in reversed(self.frames):
+                if f.id in fr:
+                    callee_val = fr[f.id]
+                    break
+            else:
+                callee_val = self.env.get(f.id)
+        elif isinstance(f, (ast.Subscript, ast.Call, ast.Lambda)):
+            try:
+                callee_val = self.ev(f)
+            except Unsupported:
+                callee_val = None
+
+        if isinstance(callee_val, _FuncVal):
+            # a call whose callee is a program function held as a value, inlined per call
+            # exactly like the direct name call below (funcvals batch)
+            return self._inline(callee_val.fd, [self.ev(a) for a in n.args], n, qualname=callee_val.qual)
         if isinstance(f, ast.Name) and f.id in self.defs and not f.id.startswith("__sv") \
                 and f.id not in self.env:
             return self._inline(self.defs[f.id], [self.ev(a) for a in n.args], n)
+        if isinstance(f, ast.Name) and f.id not in self.env and isinstance(self.g.get(f.id), FunctionType):
+            # a def IMPORTED from one of the program's own modules (from to_import import func):
+            # the file's source came with the harness (module_sources); the def inlines like a
+            # harness def when it binds every name it reads (funcvals batch)
+            fn = self.g[f.id]
+            if getattr(fn, "__qualname__", None) == f.id and f.id not in self.defs:
+                fd = _ImportedDefs.of((self.sources or {}).get(fn.__module__)) if self.sources is not None else None
+                if fd is not None and f.id in fd:
+                    return self._inline(fd[f.id], [self.ev(a) for a in n.args], n, qualname=f"{fn.__module__}.{f.id}")
+        if isinstance(f, ast.Attribute) and self.sources:
+            # mod.func(...) with mod one of the program's own modules (import to_import; a = to_import.func(n)),
+            # the chain resolved through the live module objects (to_import.to_import2.func too); the sources
+            # gate is whats keeps a refused alias of a stdlib module untouched (no module-attribute read runs)
+            resolved = self._import_def(f)
+            if resolved is not None:
+                fd = resolved
+                args = [self.ev(a) for a in n.args]
+                return self._inline(fd, args, n, qualname=ast.unparse(f))
+        if isinstance(f,ast.Name) and self.g.get(f.id) is _RANDOM_SEED and f.id not in self.env and f.id not in self.defs:
+            return self._through_rule('random.seed',n)
         if isinstance(f, ast.Attribute) and f.attr == "append" and isinstance(f.value, ast.Name) \
                 and len(n.args) == 1 and not n.keywords:
             return self._through_rule("list.append", n)
@@ -1957,11 +2461,33 @@ class _Runner(_Exec):
         if isinstance(f, ast.Name) and f.id == "range" and not n.keywords and self._is_builtin("range"):
             return self._through_rule("range", n)
         if isinstance(f, ast.Name) and f.id == "open" and self._is_builtin("open"):
+            from tharkun.solve.environment import open_effect
+            if self.world_reads is not None and open_effect(n) == "read":
+                out = self._visit_rule("open.read", CallCtx(n))
+                if out is _NO_CONTRACT:
+                    raise Unsupported("world open: no tested open.read contract")
+                return out
             return self._open_output(n)
         if (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
                 and isinstance(self.env.get(f.value.id), _OutHandle)):
             return self._handle_call(self.env[f.value.id], f.attr, n)
         return super().ev_Call(n)
+
+    def _model_int(self, n):
+        if self.world_reads is not None:
+            value = self.ev(n.args[0])
+            if _is_sym(value) and value.sort() == z3.StringSort() and value.sexpr() in self.world_reads.expressions:
+                from tharkun.solve.world import _Terms
+                terms = _Terms(value)
+                number = terms.term(ast.parse("int(content)", mode="eval").body)
+                content_vars = z3.z3util.get_vars(value)
+                replacements = [(v, z3.FreshConst(v.sort(), "world int"))
+                                for v in z3.z3util.get_vars(z3.And(*terms.constraints))
+                                if not any(z3.eq(v, content) for content in content_vars)]
+                self._holds(z3.substitute(z3.And(*terms.constraints), *replacements))
+                return z3.substitute(number, *replacements)
+            return super()._model_int(ast.Call(n.func, [_Lit(value)], n.keywords))
+        return super()._model_int(n)
 
     def _is_builtin(self, name):
         """``name`` still means the builtin: nothing of the harness binds it."""
@@ -2125,29 +2651,44 @@ class _Runner(_Exec):
         ``__exit__`` closes it and returns ``None`` (the body's exception propagates unchanged).
         A body that leaves by ``return``/``break``/``continue`` is Unsupported (this executor runs
         a ``with`` body as a block).  Any other context manager is Unsupported, as before."""
-        handles = []
-        for item in st.items:
-            handle = self.ev(item.context_expr)
-            if not isinstance(handle, _OutHandle):
-                raise Unsupported("With")
-            handles.append((item, handle))
+        handles = self._with_enter(st)
         for node in ast.walk(ast.Module(body=st.body, type_ignores=[])):
             if isinstance(node, (ast.Return, ast.Break, ast.Continue)):
                 raise Unsupported("loop control in a with body")
+        self.run(st.body)
+        self._with_exit(handles)
+
+    def _with_enter(self, st):
+        handles = []
+        for item in st.items:
+            handle = self.ev(item.context_expr)
+            from tharkun.sv._symexec_world import ReadHandle
+            if not isinstance(handle, (_OutHandle, ReadHandle)):
+                raise Unsupported("With")
+            handles.append((item, handle))
         for item, handle in handles:
             enter = ast.Call(func=ast.Name(id="__enter__", ctx=ast.Load()), args=[], keywords=[])
             ast.copy_location(enter, item.context_expr)
-            self._handle_call(handle, "__enter__", enter)
+            if isinstance(handle, ReadHandle):
+                self.world_reads.call(self, handle, "__enter__", enter)
+            else:
+                self._handle_call(handle, "__enter__", enter)
             if item.optional_vars is not None:
                 if not isinstance(item.optional_vars, ast.Name):
                     raise Unsupported("With target")
                 self.assign(item.optional_vars, handle)
-        self.run(st.body)
+        return handles
+
+    def _with_exit(self, handles):
+        from tharkun.sv._symexec_world import ReadHandle
         for item, handle in reversed(handles):
             exit_call = ast.Call(func=ast.Name(id="__exit__", ctx=ast.Load()),
                                  args=[_Lit(None), _Lit(None), _Lit(None)], keywords=[])
             ast.copy_location(exit_call, item.context_expr)
-            self._handle_call(handle, "__exit__", exit_call)
+            if isinstance(handle, ReadHandle):
+                self.world_reads.call(self, handle, "__exit__", exit_call)
+            else:
+                self._handle_call(handle, "__exit__", exit_call)
 
     def _range_loop(self, st, r):
         """``for target in <SymRange>``: iteration ``k`` (``k = 0, 1, ...``) runs exactly when
@@ -2189,6 +2730,8 @@ class _Runner(_Exec):
             for name, canonical in _NATIVE_MODULES.items():
                 if module is canonical and type(module) is ModuleType:
                     qualname = f"{name}.{f.attr}"
+                    if qualname=='random.seed':
+                        return self._through_rule(qualname,n)
                     rule = get_rule(qualname)
                     if qualname in NATIVE_MODULE_FUNCTIONS and rule is not None and module.__dict__.get(f.attr) is _NATIVE_CALLABLES[qualname]:
                         return self._through_rule(qualname, n)
@@ -2269,8 +2812,8 @@ class _Runner(_Exec):
         class table's business (it checked the live object), a function's are refused as before."""
         if call.keywords or len(args) != len(fd.args.args) or fd.args.vararg or fd.args.kwarg \
                 or (ctx is not None and (fd.args.posonlyargs or fd.args.kwonlyargs)) \
-                or (fd.decorator_list and ctx is None):
-            raise Unsupported(f"call shape of {fd.name}")
+                or (getattr(fd, "decorator_list", None) and ctx is None):
+            raise Unsupported(f"call shape of {getattr(fd, 'name', '<lambda>')}")
         if any(isinstance(x, (ast.Global, ast.Nonlocal)) for x in ast.walk(fd)):
             raise Unsupported(f"{fd.name} writes a global")
         if self.depth >= CALL_DEPTH:
@@ -2278,16 +2821,20 @@ class _Runner(_Exec):
         saved_env = self.env
         self.frames.append(saved_env)
         self.env = {a.arg: v for a, v in zip(fd.args.args, args)}
+        self.env.update({k: v for k, v in saved_env.items() if k.startswith("\0program stream:")})
         self.depth += 1
         self.scope_stack.append(qualname or fd.name)
         self.ctx_stack.append(None if ctx is None else (ctx[0], ctx[1], fd.args.args[0].arg if fd.args.args else None))
         try:
-            return self._exec_fn(list(fd.body))
+            body = fd.body if isinstance(fd, ast.FunctionDef) \
+                else [ast.copy_location(ast.Return(fd.body), fd.body)]  # a lambda: one expression as its sole return
+            return self._exec_fn(list(body))
         finally:
             self.ctx_stack.pop()
             self.scope_stack.pop()
             self.depth -= 1
             self.frames.pop()
+            saved_env.update({k: v for k, v in self.env.items() if k.startswith("\0program stream:")})
             self.env = saved_env
 
     def run_body(self, stmts):
@@ -2303,6 +2850,31 @@ class _Runner(_Exec):
         """Run a function body; its value is merged over the paths that return.  ``top``: the harness body
         itself (:meth:`run_body`), whose plain statements are skipped and poisoned, not propagated."""
         for i, st in enumerate(stmts):
+            if isinstance(st, ast.With) and self.world_reads is not None and _returns(st):
+                from tharkun.sv._symexec_world import ReadHandle
+                handles = self._with_enter(st)
+                if any(not isinstance(handle, ReadHandle) for _, handle in handles):
+                    raise Unsupported("world with: mixed output contexts")
+                # Return paths close before leaving; fallthrough closes before the continuation.
+                exits = [ast.copy_location(ast.Expr(ast.Call(
+                    ast.Attribute(_Lit(handle), "close", ast.Load()), [], [])), st)
+                    for _, handle in reversed(handles)]
+
+                class CloseReturns(ast.NodeTransformer):
+                    def visit_Return(self, node):
+                        name = f"\0world return:{id(node)}"
+                        value = ast.copy_location(ast.Assign([ast.Name(name, ast.Store())], node.value or ast.Constant(None)), node)
+                        ret = ast.copy_location(ast.Return(ast.Name(name, ast.Load())), node)
+                        return [value, *exits, ret]
+
+                    def visit_FunctionDef(self, node):
+                        return node
+
+                    def visit_With(self, node):
+                        raise Unsupported("nested world with containing return")
+
+                body = CloseReturns().visit(copy.deepcopy(ast.Module(body=st.body, type_ignores=[]))).body
+                return self._exec_fn(body + exits + stmts[i + 1:], top)
             if isinstance(st, ast.Return):
                 if st.value is None:
                     return None
@@ -2339,7 +2911,7 @@ class _Runner(_Exec):
                 if base_heap is not None:
                     self.objects.heap = self.objects.merge(_bool(vals[0][0]), vals[0][2], vals[1][2])
                 self._either(vals[0][0], vals[1][0], t)
-                return _typed_ite(_bool(vals[0][0]), vals[0][1], vals[1][1])
+                return self._merge_value(_bool(vals[0][0]), vals[0][1], vals[1][1])
             if top:
                 self.run([st])
             else:
@@ -2360,13 +2932,16 @@ class _Runner(_Exec):
             try:
                 self.st(st)
             except Unsupported as e:
+                if isinstance(e, _WorkExhausted):
+                    raise
                 self.pc = pc
                 self.skipped.append(f"line {st.lineno}: {e}")
                 if self.objects is not None:
                     self.objects.after_skip(st, version, str(e))
                 if _stores(st) or _has_draw(st) or any(
                         isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in self.defs
-                        for n in ast.walk(st)) or (self.objects is not None and self.objects.may_run_user_code(st)):
+                        for n in ast.walk(st)) or (self.objects is not None and self.objects.may_run_user_code(st)) or (
+                        self.program_streams.serial and any(isinstance(n, ast.Call) for n in ast.walk(st))):
                     # a skipped ``print(...)`` changes nothing a later site reads
                     self.poisoned.append(f"line {st.lineno}: {e}")
                 for line in self._targets_in(st):
@@ -2378,6 +2953,7 @@ class _Runner(_Exec):
                         self.env[_POS + p] = POISON
 
     def st(self, st):
+        self._check_work()
         # a site marker: record a target's condition, skip the others
         if isinstance(st, ast.If) and len(st.body) == 1 and isinstance(st.body[0], ast.Expr) \
                 and isinstance(st.body[0].value, ast.Call) \
@@ -2413,6 +2989,16 @@ class _Runner(_Exec):
         if isinstance(st, ast.For):
             _check_loop(st)
             it = self._seq(self.ev(st.iter))
+            from tharkun.sv._symexec_world import ReadHandle
+            if isinstance(it, ReadHandle):
+                for _ in range(LOOP_BOUND):
+                    read = ast.copy_location(ast.Call(ast.Name("readline", ast.Load()), [], []), st)
+                    line = self.world_reads.call(self, it, "readline", read)
+                    assign = ast.copy_location(ast.Assign([st.target], _Lit(line)), st)
+                    self._merge_if(line != "", [assign, *st.body], [])
+                self.bounded = True
+                self._holds(self.env[it.key + "pos"] == z3.Length(self.world_reads.contents[it.path]))
+                return
             if isinstance(it, SymRange):
                 self._range_loop(st, it)
                 return
@@ -2491,7 +3077,7 @@ class _Runner(_Exec):
                 merged[k] = POISON
             else:
                 try:
-                    merged[k] = _typed_ite(_bool(ga), a, b)
+                    merged[k] = self._merge_value(_bool(ga), a, b)
                 except Unsupported:
                     merged[k] = POISON
         self.env = merged
@@ -2534,7 +3120,7 @@ def _targets_by_function(defs: dict, targets) -> dict:
 
 def solve_targets(harness_text: str, module_globals: dict, fn_name: str, lines, params: list,
                   kinds: list, stream_lens: dict, timeout_ms: int = 10000, call_targets=None,
-                  proven_classes=()) -> dict:
+                  proven_classes=(), *, world=None, world_results=None, module_sources=None) -> dict:
     """``{line: (outcome, inputs_or_reason)}`` for every target line, from ONE symbolic run
     of the whole harness: calls inlined, loops whose trip count depends on a draw
     unrolled up to :data:`LOOP_BOUND` under their guards, values whose type depends on
@@ -2567,11 +3153,14 @@ def solve_targets(harness_text: str, module_globals: dict, fn_name: str, lines, 
             env[p] = POISON              # read only through __sv_next
         else:
             env[p] = _var(p, k)
-    r = _Runner(tree, module_globals, env, streams, lines, call_targets, proven_classes)
+    r = _Runner(tree, module_globals, env, streams, lines, call_targets, proven_classes, module_sources, world=world,
+                _work_budget=_WorkBudget(timeout_ms))
     try:
         r.run_body(fn.body)
     except _Dead:
         pass
+    except _WorkExhausted as error:
+        return {line: ("unsupported", str(error)) for line in lines}
     bound = f" (loops cut at {LOOP_BOUND} iterations)" if r.bounded else ""
     out = {}
     for line in lines:
@@ -2581,15 +3170,67 @@ def solve_targets(harness_text: str, module_globals: dict, fn_name: str, lines, 
                 out[line] = ("unsupported", r.unsupported[line])
             elif r.poisoned:
                 out[line] = ("unsupported", f"not reached; unmodelled: {r.poisoned[0]}")
+            elif r.concretized:
+                out[line] = ("unknown", f"not reached under concretization ({r.concretized[0]})")
+            elif world is not None:
+                out[line] = ("unknown", "not reached in the searched world")
             else:
                 out[line] = ("unreached", "no modelled run gets there" + bound)
             continue
         s = z3.Solver()
         s.set("timeout", timeout_ms)
-        s.add(z3.Or(*[_bool(g) for g in goals]))
-        res = s.check()
+        goal = z3.Or(*[_bool(g) for g in goals])
+        if r.world_reads is not None:
+            try:
+                s.add(*r.world_reads.constraints())
+            except (ValueError, TypeError, z3.Z3Exception) as exc:
+                out[line] = ("unsupported", f"world facts: {exc}")
+                continue
+            # Search each reached path separately: deeply nested readline cursors make
+            # a disjunction of all bounded loop iterations needlessly expensive.
+            import time
+            deadline = time.monotonic() + timeout_ms / 1000
+            res = z3.unsat
+            for reached_goal in goals:
+                s.set(timeout=max(1, int(1000 * (deadline - time.monotonic()))))
+                s.push()
+                goal = _bool(reached_goal)
+                s.add(goal)
+                unchanged = [text == r.world_reads.store.get(path).concrete.decode("utf-8")
+                             for path, text in r.world_reads.contents.items()]
+                res = s.check(*unchanged)
+                if res != z3.sat:
+                    s.set(timeout=max(1, int(1000 * (deadline - time.monotonic()))))
+                    res = s.check()
+                if res == z3.sat:
+                    break
+                s.pop()
+                if res == z3.unknown or time.monotonic() >= deadline:
+                    res = z3.unknown
+                    break
+        else:
+            s.add(goal)
+            res = s.check()
         if res == z3.sat:
             m = s.model()
+            if r.world_reads is not None:
+                from tharkun.solve.world import WorldRefused
+                try:
+                    snapshot = r.world_reads.snapshot(m, goal)
+                    materialized = [term == snapshot[path]["content"]
+                                    for path, term in r.world_reads.contents.items()]
+                    s.set(timeout=max(1, int(1000 * (deadline - time.monotonic()))))
+                    if s.check(*materialized) == z3.sat:
+                        m = s.model()
+                    else:
+                        snapshot = r.world_reads.snapshot(m, goal, exact=True)
+                except WorldRefused as exc:
+                    out[line] = ("unknown", f"world materialization refused: {exc}")
+                    continue
+                if world_results is None:
+                    out[line] = ("unknown", "world candidate requires a snapshot receiver")
+                    continue
+                world_results[line] = snapshot
             inputs = {}
             for p, k in zip(params, kinds):
                 base = k[5:] if k.startswith("list:") else k
@@ -2603,6 +3244,10 @@ def solve_targets(harness_text: str, module_globals: dict, fn_name: str, lines, 
             out[line] = ("sat", inputs)
         elif line in r.unsupported:
             out[line] = ("unsupported", r.unsupported[line])
+        elif res == z3.unsat and r.concretized:
+            out[line] = ("unknown", f"unsat only under concretization ({r.concretized[0]})")
+        elif res == z3.unsat and world is not None:
+            out[line] = ("unknown", "no model in the searched world")
         elif res == z3.unsat:
             out[line] = ("unsat", "no modelled run fires it" + bound)
         else:
@@ -2628,8 +3273,207 @@ def model_value(model, term, kind):
     return _value(model, term, kind)
 
 
+class _ExactRunner(_Runner):
+    """The whole interpreter with proof-only code-point strings, never search strings."""
+
+    def ev_Constant(self, node):
+        return _codepoint_literal(node.value) if type(node.value) is str else super().ev_Constant(node)
+
+    def _model_len(self, node):
+        value = self.ev(node.args[0])
+        if _is_codepoint_string(value):
+            return z3.Length(value)
+        return super()._model_len(ast.Call(node.func, [_Lit(value)], node.keywords))
+
+    def _fresh_draw(self, kind):
+        if kind == "str":
+            self.draw_count += 1
+            return _codepoint_variable(f"fresh draw #{self.draw_count}")
+        return super()._fresh_draw(kind)
+
+    def _ev_call(self, node):
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {"startswith", "endswith"}:
+            receiver = self.ev(node.func.value)
+            values = [self.ev(arg) for arg in node.args]
+            if node.keywords or not 1 <= len(values) <= 3 or not _is_codepoint_string(receiver):
+                raise Unsupported("exact string edge requires a code-point string and positional bounds")
+            def check_prefix(value):
+                if isinstance(value, Union):
+                    raise Unsupported("path-dependent string edge prefix kind")
+                if type(value) is tuple:
+                    for item in self._work_items(value):
+                        check_prefix(item)
+                elif _pytype(value) is str and not _is_codepoint_string(value):
+                    raise Unsupported("string edge prefix requires the code-point model")
+            check_prefix(values[0])
+            from tharkun.solve.contracts.visitors import ProductVisitor
+            rule = get_rule("str." + node.func.attr)
+            if rule is None or rule.accept(ProductVisitor()) is not True:
+                raise Unsupported("no tested string edge contract")
+            bounds = []
+            for value in values[1:]:
+                if value is None:
+                    bounds.append(None)
+                else:
+                    value = _num(value)
+                    _int_term(value)
+                    bounds.append(value)
+            from tharkun.sv.exact_strings import edge
+            result, continuation = edge(receiver, values[0], *(bounds + [None] * (2 - len(bounds))),
+                                        suffix=node.func.attr == "endswith", check_work=self._check_work)
+            self._holds(continuation)
+            return result
+        if id(node) in getattr(self, "exact_type_checks", {}):
+            value = self.ev(node.args[0])
+            succeeds = self._checker_success(node, value)
+            # The tested success contract is usable only when every reaching path succeeds.
+            self.type_obligations.append(_conj([*self.pc, z3.Not(succeeds)]))
+            return None
+        return super()._ev_call(node)
+
+    def _checker_success(self, node, value):
+        if isinstance(node.args[1], ast.BinOp) and self.objects is not None:
+            from tharkun.sv.exact_classes import hint_names
+            names = hint_names(node.args[1], self.objects.table.g)
+            if names is None:
+                raise Unsupported("checker union requires authenticated plain type names")
+            return z3.Or(*[self._checker_success(ast.Call(node.func, [node.args[0], ast.Name(name, ast.Load())], []), value)
+                           for name in self._work_items(names)])
+        hint = node.args[1].id
+        allowed = {"bool": (bool,), "int": (int, bool), "str": (str,)}.get(hint)
+        expected = self.objects.table.g.get(hint) if self.objects is not None else None
+        if allowed is None and expected is None:
+            raise Unsupported("checker success requires an authenticated primitive or plain-class hint")
+        return z3.Or(*[_bool(guard) for guard, member in self._work_members(value)
+                      if (_pytype(member) in allowed if allowed is not None else
+                          isinstance(member, Ref) and member.cls is expected)])
+
+
+class _TypeIdentityRunner(_ExactRunner):
+    """Type observations need bool/int distinctions even inside merged cells/returns."""
+
+    def _merge_value(self, condition, a, b):
+        self._check_work()
+        if isinstance(a, (list, tuple)) and type(a) is type(b):
+            if len(a) != len(b):
+                raise Unsupported("type-observed sequences with different lengths")
+            return type(a)(self._merge_value(condition, x, y) for x, y in self._work_items(zip(a, b)))
+        if isinstance(a, dict) or isinstance(b, dict):
+            raise Unsupported("type-observed dict merges are not audited")
+        if isinstance(a, Union) or isinstance(b, Union) or _pytype(a) is not _pytype(b):
+            return Union([pair for value, guard in ((a, condition), (b, z3.Not(condition)))
+                          for pair in self._work_members(value, guard)])
+        return _ite(condition, a, b)
+
+    _select_value = _merge_value
+
+    def ev_Compare(self, node):
+        observed = type_identity_args(node)
+        if observed is None:
+            return super().ev_Compare(node)
+        if not self._is_builtin("type"):
+            raise Unsupported("type identity requires the builtin")
+        left, right = (self.ev(arg) for arg in observed)
+        same = z3.Or(*[_bool(_conj([ga, gb])) for ga, a in self._work_members(left) for gb, b in self._work_members(right)
+                       if (a.cls if isinstance(a, Ref) else _pytype(a))
+                       is (b.cls if isinstance(b, Ref) else _pytype(b))])
+        return z3.Not(same) if isinstance(node.ops[0], ast.IsNot) else same
+
+
+class _PrimitiveTypeExitRunner(_TypeIdentityRunner):
+    """An authenticated int/bool-hint mismatch on exact primitives ends without hooks."""
+
+    def _ev_call(self, node):
+        if id(node) in self.exact_type_checks:
+            if not isinstance(node.args[1], ast.Name) or node.args[1].id not in {"int", "bool"}:
+                # A retry must retain string/class success obligations, not erase
+                # their failures as unreachable paths.
+                return super()._ev_call(node)
+            value = self.ev(node.args[0])
+            members = _members(value)
+            if any(_pytype(member) not in (int, bool, str) for _, member in members):
+                raise Unsupported("checker exit requires exact int/bool/string values")
+            # Primitive int/bool-hint mismatches cannot invoke user hooks.
+            self._holds(self._checker_success(node, value))
+            return None
+        return super()._ev_call(node)
+
+
+class _ClosedCallableMixin:
+    """Exact source-def identity, guarded dispatch, and evaluate-once keyword binding."""
+
+    def _merge_value(self, condition, a, b):
+        members = [pair for value in (a, b) for pair in self._work_members(value)]
+        if any(isinstance(value, _FuncVal) for _, value in self._work_items(members)):
+            if not all(isinstance(value, _FuncVal) and value.mode == "def" for _, value in self._work_items(members)):
+                raise Unsupported("closed callable merged with a non-def value")
+            return Union([pair for value, guard in ((a, condition), (b, z3.Not(condition)))
+                          for pair in self._work_members(value, guard)])
+        return super()._merge_value(condition, a, b)
+
+    _select_value = _merge_value
+
+    def ev_Compare(self, node):
+        if (len(node.ops) == 1 and isinstance(node.ops[0], (ast.Is, ast.IsNot))
+                and type_identity_args(node) is None):
+            a, b = self.ev(node.left), self.ev(node.comparators[0])
+            if not all(isinstance(value, _FuncVal) and value.mode == "def"
+                       for _, value in _members(a) + _members(b)):
+                raise Unsupported("identity requires closed source defs")
+            same = z3.Or(*[_bool(_conj([ga, gb])) for ga, fa in _members(a) for gb, fb in _members(b)
+                           if fa.fd is fb.fd])
+            return z3.Not(same) if isinstance(node.ops[0], ast.IsNot) else same
+        return super().ev_Compare(node)
+
+    def _ev_call(self, node):
+        if not isinstance(node.func, ast.Name) or id(node) in self.exact_type_checks:
+            return super()._ev_call(node)
+        try:
+            callee = self.ev(node.func)
+        except Unsupported:
+            return super()._ev_call(node)
+        members = _members(callee)
+        if not all(isinstance(fn, _FuncVal) and fn.mode == "def" for _, fn in members):
+            return super()._ev_call(node)
+        from tharkun.sv.exact_callables import binding
+        positions = [binding(fn.fd, node) for _, fn in members]
+        if any(p is None for p in positions):
+            raise Unsupported("unsupported closed callable binding")
+        # Python evaluates positional arguments, then keywords in written order, once before dispatch.
+        values = [self.ev(arg) for arg in node.args] + [self.ev(k.value) for k in node.keywords]
+        call = ast.copy_location(ast.Call(node.func, node.args, []), node)
+        base_pc, results = list(self.pc), []
+        try:
+            for (guard, fn), indices in zip(members, positions):
+                self.pc = [*base_pc, guard]
+                try:
+                    value = self._inline(fn.fd, [values[i] for i in indices], call, qualname=fn.qual)
+                    results.append((_conj(self.pc), value))
+                except _Dead:
+                    pass
+        finally:
+            self.pc = base_pc
+        if not results:
+            raise _Dead()
+        self._holds(z3.Or(*[_bool(guard) for guard, _ in results]))
+        out = results[-1][1]
+        for guard, value in reversed(results[:-1]):
+            out = self._merge_value(_bool(guard), value, out)
+        return out
+
+
+class _ClosedCallableRunner(_ClosedCallableMixin, _TypeIdentityRunner):
+    pass
+
+
+class _ClosedCallableExitRunner(_ClosedCallableMixin, _PrimitiveTypeExitRunner):
+    pass
+
+
 def run_exact(tree: "ast.Module", module_globals: dict, env: dict, body: list, lines,
-              fresh_draws: dict | None = None) -> dict:
+              fresh_draws: dict | None = None, guarded_type_checks: set | None = None,
+              primitive_type_exits: bool = False, closed_callables: bool = False,
+              plain_classes: bool = False, _work_budget=None) -> dict:
     """Run ``body`` (a statement list drawn from ``tree``, e.g. a module's own top
     level with its draws already pre-bound into ``env`` and its declarations
     stripped) through the SAME whole-program interpreter :func:`solve_targets` uses
@@ -2653,14 +3497,47 @@ def run_exact(tree: "ast.Module", module_globals: dict, env: dict, body: list, l
     into a run, which a caller should treat the same as "not exact".
 
     ``fresh_draws`` is ``{id(call node): kind}`` for the ``_sv_verifier.nondet_*()`` calls the caller let sit
-    inside the program's functions (``product_proof.py``): each EXECUTION of such a call is a fresh unconstrained
+    at their own sites (``product_proof.py``): each EXECUTION of such a call is a fresh unconstrained
     term of its kind (a function called twice draws twice), so the run covers every vector of draws, whatever
-    path consumes them."""
-    r = _Runner(tree, module_globals, env, {}, lines, fresh_draws=fresh_draws)
+    path consumes them. ``guarded_type_checks`` contains source-authenticated,
+    unused int-hint calls; the returned ``type_obligations`` must also be UNSAT
+    before using the tested success contract to prove the original property.
+    ``primitive_type_exits`` is a separate AssertionError-only model: exact string
+    mismatches end their path after argument evaluation. It refuses other values;
+    callers must retain the whole-source audit and authenticated int-hint calls.
+    ``closed_callables`` requires the scalar closed-def-flow audit: only source
+    defs may occupy callable positions, bindings are checked for every candidate,
+    and identity is observed only between those authenticated function values.
+    ``plain_classes`` requires the whole-source plain-class audit; the source
+    table reuses the same heap and inlines every constructor and method body."""
+    from tharkun.sv.exact_strings import has_edge_calls
+    strings = (any(_is_codepoint_string(v) for v in env.values()) or "str" in (fresh_draws or {}).values()
+               or has_edge_calls(tree))
+    runner = (_TypeIdentityRunner if guarded_type_checks is not None or any(type_identity_args(n) is not None for n in ast.walk(tree))
+              else _ExactRunner if strings else _Runner)
+    if primitive_type_exits:
+        if guarded_type_checks is None:
+            raise Unsupported("primitive checker exits require authenticated guarded calls")
+        runner = _PrimitiveTypeExitRunner
+    if closed_callables:
+        runner = _ClosedCallableExitRunner if primitive_type_exits else _ClosedCallableRunner
+    if plain_classes:
+        from tharkun.sv.exact_identity import IdentityMixin, active
+        if active(tree):
+            runner = type("_IdentityRunner", (IdentityMixin, runner), {})
+    budget = _work_budget if _work_budget is not None else _WorkBudget(10000)
+    budget.check()
+    r = runner(tree, module_globals, env, {}, lines, fresh_draws=fresh_draws, _work_budget=budget)
+    if plain_classes:
+        from tharkun.sv.exact_classes import attach
+        attach(r, tree)
+    r.exact_type_checks = guarded_type_checks or set()
+    r.type_obligations = []
     try:
         r.run(list(body))
     except _Dead:
         pass
+    budget.check()
     if r.bounded:
         return {"exact": False, "reason": "a loop was cut at the unroll bound", "goals": {}}
     if r.poisoned or r.skipped or r.inexact:
@@ -2674,8 +3551,9 @@ def run_exact(tree: "ast.Module", module_globals: dict, env: dict, body: list, l
     if r.unsupported:
         first = next(iter(r.unsupported.values()))
         return {"exact": False, "reason": f"not fully modelled: {first}", "goals": {}}
-    return {"exact": True, "reason": "",
-            "goals": {line: [g for g in r.goals.get(line) or () if g is not False] for line in lines}}
+    return {"exact": True, "reason": "", "identity_choices": getattr(r, "identity_enabled", False),
+            "goals": {line: [g for g in r.goals.get(line) or () if g is not False] for line in lines},
+            "type_obligations": r.type_obligations}
 
 
 def _native_model(qualname):

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from tharkun.solve.contracts._helpers import dunder_propagation_claims, never_claims
 from tharkun.solve.contracts.rules import Rule, register_rule
-from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec
+from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec, RaiseArgsCase, ScopedArgsRaiseClaim
 
 _DOCS = "https://docs.python.org/3.14/library/stdtypes.html#list"
 
@@ -287,19 +287,24 @@ class ListGetitem(Rule):
     names = ("list.__getitem__",)
     CONTRACT = Contract(
         qualname="list.__getitem__",
-        raises=dunder_propagation_claims(
+        raises=tuple(ScopedArgsRaiseClaim(c.exc,c.condition,c.tested,args_cases=(
+            RaiseArgsCase('native-bounds','exact builtin receiver and exact int/bool key representable as Py_ssize_t, outside -len(self) <= key < len(self)',
+                          ('list index out of range',),True),
+            RaiseArgsCase('oversized-int','exact builtin receiver and exact int key outside Py_ssize_t range; conversion fails before length adjustment',
+                          ("cannot fit 'int' into an index-sized integer",),True),
+        )) if c.exc=='IndexError' else c for c in dunder_propagation_claims(
             "the key argument's __index__ (for an int key; a slice key never raises IndexError/TypeError-for-bounds)",
             native={
                 "TypeError": "key is neither an int-like object (has __index__) nor a slice",
-                "IndexError": "key is an int-like index outside [-len(self), len(self))",
+                "IndexError": "integer conversion does not fit Py_ssize_t, or converted index is outside [-len(self), len(self)), or key.__index__ raises IndexError",
             },
             tested_native=frozenset({"TypeError", "IndexError"}),
-        ),
+        )),
         may_raise_other=True,
         returns=ReturnSpec("the element type, or list for a slice key", tested=True),
         effects=Effects(deterministic=True),
         notes="a slice key (list[a:b:c]) never raises IndexError -- out-of-range bounds are clamped, matching Nagini's list___getitem_slice__ having no bounds precondition.",
-        source=(_DOCS, "CPython Objects/listobject.c::list_subscript"),
+        source=(_DOCS, "https://github.com/python/cpython/blob/3.14/Objects/listobject.c", "CPython 3.14::list_subscript"),
         tested=True,
     )
 
@@ -330,4 +335,117 @@ class ListSetitem(Rule):
     )
 
 
-__all__ = ["ListAppend", "ListExtend", "ListInsert", "ListPop", "ListRemove", "ListIndex", "ListCount", "ListClear", "ListCopy", "ListReverse", "ListSort", "ListGetitem", "ListSetitem"]
+@register_rule
+class ListDelitem(Rule):
+    """The rule of ``del xs[key]`` (``list.__delitem__``)."""
+
+    SAMPLES = {'list.__delitem__': 'xs = [3, 1, 2]\ndel xs[0]\n'}
+    TWINS = {}
+
+    names = ("list.__delitem__",)
+    CONTRACT = Contract(
+        qualname="list.__delitem__",
+        raises=dunder_propagation_claims(
+            "the key argument's __index__ (for an int key, or a component of a slice key)",
+            native={
+                "TypeError": "key is neither an int-like object (has __index__) nor a slice",
+                "IndexError": "integer conversion does not fit Py_ssize_t, or converted index is outside [-len(self), len(self)), or key.__index__ raises IndexError",
+            },
+            tested_native=frozenset({"TypeError", "IndexError"}),
+        ),
+        may_raise_other=True,  # a slice with step 0: ValueError
+        returns=None,
+        effects=Effects(mutates_receiver=True),
+        notes="a slice key never raises IndexError (out-of-range bounds clamp) and never raises for a length mismatch, unlike __setitem__.",
+        source=(_DOCS, "CPython Objects/listobject.c::list_ass_subscript"),
+        tested=True,
+    )
+
+
+@register_rule
+class ListContains(Rule):
+    """The rule of ``x in xs`` (``list.__contains__``)."""
+
+    SAMPLES = {'list.__contains__': 'xs = [3, 1, 2]\nb = 1 in xs\n'}
+    TWINS = {}
+
+    names = ("list.__contains__",)
+    CONTRACT = Contract(
+        qualname="list.__contains__",
+        raises=dunder_propagation_claims(
+            "__eq__ (of an element, compared with the argument; identity short-circuits) or the __bool__ of its result",
+            native={},
+            tested_native=frozenset(),
+        ),
+        may_raise_other=True,
+        returns=ReturnSpec("bool", "True iff some element is the argument or compares equal to it; scans left to right and stops at the first match", tested=True),
+        effects=Effects(deterministic=True),
+        source=(_DOCS, "CPython Objects/listobject.c::list_contains"),
+        tested=True,
+    )
+
+
+def _list_operator(name, dunder, native, returns, inplace):
+    return Contract(
+        qualname=f"list.__{name}__",
+        raises=dunder_propagation_claims(dunder, native={"TypeError": native}, tested_native=frozenset({"TypeError"})),
+        may_raise_other=True,  # MemoryError / OverflowError for a huge repeat count, or whatever a hook raises
+        returns=returns,
+        effects=Effects(mutates_receiver=True) if inplace else Effects(deterministic=True),
+        source=(_DOCS, "CPython Objects/listobject.c::list_concat, list_inplace_concat, list_repeat, list_inplace_repeat"),
+        tested=True,
+    )
+
+
+_RIGHT = "the right operand's reflected method (__radd__ / __rmul__ run BEFORE the list's own sequence slot) or __index__ / __iter__"
+
+
+@register_rule
+class ListAdd(Rule):
+    """The rule of ``xs + ys`` (``list.__add__``)."""
+
+    SAMPLES = {'list.__add__': 'xs = [1]\nys = xs + [2]\n'}
+    TWINS = {'list.__add__': 'xs = [1]\nys = xs + 5\n'}
+
+    names = ("list.__add__",)
+    CONTRACT = _list_operator("add", _RIGHT, "the right operand is not a list (a tuple included) and has no __radd__ that accepts the list",
+                              ReturnSpec("list", "a NEW list of the elements of both; neither operand changes", tested=True), False)
+
+
+@register_rule
+class ListIadd(Rule):
+    """The rule of ``xs += it`` (``list.__iadd__``)."""
+
+    SAMPLES = {'list.__iadd__': 'xs = [1]\nxs += [2]\n'}
+    TWINS = {'list.__iadd__': 'xs = [1]\nxs += 5\n'}
+
+    names = ("list.__iadd__",)
+    CONTRACT = _list_operator("iadd", "the right operand's __iter__ / __next__ (any iterable is accepted, unlike +)", "the right operand is not iterable",
+                              ReturnSpec("list", "the receiver itself (the same object), extended in place", tested=True), True)
+
+
+@register_rule
+class ListMul(Rule):
+    """The rule of ``xs * n`` (``list.__mul__``)."""
+
+    SAMPLES = {'list.__mul__': 'xs = [1]\nys = xs * 2\n'}
+    TWINS = {'list.__mul__': 'xs = [1]\nys = xs * "a"\n'}
+
+    names = ("list.__mul__",)
+    CONTRACT = _list_operator("mul", _RIGHT, "the count has no __index__ (a float, str or list) and no __rmul__ accepts the list",
+                              ReturnSpec("list", "a NEW list repeating the elements n times (shared, not copied); [] for n <= 0", tested=True), False)
+
+
+@register_rule
+class ListImul(Rule):
+    """The rule of ``xs *= n`` (``list.__imul__``)."""
+
+    SAMPLES = {'list.__imul__': 'xs = [1]\nxs *= 2\n'}
+    TWINS = {'list.__imul__': 'xs = [1]\nxs *= "a"\n'}
+
+    names = ("list.__imul__",)
+    CONTRACT = _list_operator("imul", _RIGHT, "the count has no __index__ (a float, str or list) and no __rmul__ accepts the list",
+                              ReturnSpec("list", "the receiver itself (the same object), repeated in place; cleared for n <= 0", tested=True), True)
+
+
+__all__ = ["ListAppend", "ListExtend", "ListInsert", "ListPop", "ListRemove", "ListIndex", "ListCount", "ListClear", "ListCopy", "ListReverse", "ListSort", "ListGetitem", "ListSetitem", "ListDelitem", "ListContains", "ListAdd", "ListIadd", "ListMul", "ListImul"]

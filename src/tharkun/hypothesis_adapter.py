@@ -70,17 +70,23 @@ def _infer_param_types(
 ) -> dict[str, str]:
     """Extract parameter names and inferred types.
 
-    Uses three sources (in priority order):
-    1. Tharkun's condition solver type inference (if lineno provided)
-    2. Cross-function type propagation
-    3. Function signature annotations
-    4. Fallback to "Any"
+    Uses these sources (in priority order):
+    1. The declared annotation or type comment, then a callee's annotation propagated back to an unannotated
+       parameter: ``tharkun.typeinfer.infer_params`` sources 1 and 4, as the text the source gave
+       (``strategies.strategy_for_type`` reads the spelling)
+    2. Tharkun's condition solver type inference (if lineno provided), for what is still ``Any``
+    3. Fallback to "Any"
     """
+    from tharkun.solve.frontend.import_resolver import parse_with_type_comments
+    from tharkun.typeinfer import infer_params
+
     rp = os.path.realpath(source_path)
     try:
         source = Path(rp).read_text(encoding="utf-8", errors="ignore")
-        tree = ast.parse(source)
-    except (OSError, SyntaxError):
+    except OSError:
+        return {}
+    tree = parse_with_type_comments(source)
+    if tree is None:
         return {}
 
     func_def = None
@@ -92,31 +98,17 @@ def _infer_param_types(
     if func_def is None:
         return {}
 
+    try:
+        reports = infer_params(source_path, func_def, sources=(1, 4))
+    except Exception:  # propagation reads other files; as before, it must not take the search down
+        reports = {}
     result: dict[str, str] = {}
-
-    # Start with annotations
     for arg in func_def.args.args:
         name = arg.arg
         if name in ("self", "cls"):
             continue
-        if arg.annotation:
-            try:
-                ann = ast.unparse(arg.annotation)
-            except Exception:
-                ann = None
-            result[name] = ann if ann else "Any"
-        else:
-            result[name] = "Any"
-
-    # Try type propagation for unannotated params
-    try:
-        from tharkun.solve.frontend.type_propagation import propagate_types
-        propagated = propagate_types(source_path, callable_id)
-        for name, type_str in propagated.items():
-            if name in result and result[name] == "Any":
-                result[name] = type_str
-    except Exception:
-        pass
+        report = reports.get(name)
+        result[name] = report.candidates[0].text if report is not None and report.candidates else "Any"
 
     # Try tharkun's guard-level type inference if lineno is provided
     if lineno:
@@ -175,6 +167,7 @@ def hypothesis_solve_branch(
         from hypothesis import find, settings, HealthCheck, Verbosity
         from hypothesis import strategies as st
         from hypothesis.errors import NoSuchExample
+        from tharkun.solve import seed as _seed
     except ImportError:
         return None
 
@@ -290,6 +283,9 @@ def hypothesis_solve_branch(
                 database=None,
                 derandomize=derandom,
             ),
+            # [internal ref]: a randomized search draws from the request's one seed (tharkun.solve.seed); a derandomized one
+            # is a function of the predicate already
+            random=None if derandom else _seed.hypothesis_random(f"hypothesis_adapter:{callable_id}:{lineno}"),
         )
         return result
     except NoSuchExample:

@@ -47,4 +47,48 @@ def nonempty_seed_for_type(type_name: str) -> object | None:
     return _NONEMPTY_SEED[type_name]
 
 
-__all__ = ["nonempty_seed_for_type"]
+def stdlib_admission(qualname: str) -> str | None:
+    """Why a standard-library callable may NOT be named by a recipe, or ``None`` when it may ([internal ref]).
+
+    A callable is admitted when it has a TESTED
+    contract that says no file, network, process, clock, environment or randomness effect (``Effects``), and
+    refused -- with the reason as data -- when the registry has no contract for it, the contract is untested,
+    it declares such an effect, or it is an unbounded attribute lookup. This is the native-dispatch policy, not a whole-operation
+    purity certificate: declared receiver mutation and arbitrary user callbacks still apply
+    (``types.Effects``). Consumers must not erase those effects after admitting a name.
+    """
+    from tharkun.solve.contracts.registry import get
+
+    # builtins' contracts are registered by their bare name (`type`, `len`); a recipe names them `builtins.type` ([internal ref])
+    contract = get(qualname) or (get(qualname[len("builtins."):]) if qualname.startswith("builtins.") else None)
+    if contract is None:
+        return f"stdlib-no-contract:{qualname}"
+    if not contract.tested:
+        return f"stdlib-untested-contract:{qualname}"
+    if qualname in ('dataclasses._is_dataclass_instance', 'json.JSONEncoder.default',
+                    'inspect.getattr_static', 'inspect.getmembers_static'):
+        return f'stdlib-unbounded-lookup:{qualname}'
+
+    if qualname in ('getattr', 'builtins.getattr'):
+        return f'stdlib-unbounded-lookup:{qualname}'
+    if qualname == 'functools.wraps':
+        return f'stdlib-deferred-callback:{qualname}'
+    effects = contract.effects
+    for label, present in (("io", effects.io), ("randomness", effects.randomness), ("clock-or-env", effects.clock_or_env),
+                           ("nondeterministic", not effects.deterministic)):
+        if present:
+            return f"stdlib-effect-{label}:{qualname}"
+    return None
+
+
+def factories() -> tuple:
+    """Every admitted value factory (:class:`~tharkun.solve.contracts.rules_factories.FactorySpec`), qualname-sorted."""
+    from tharkun.solve.contracts.rules import Refused, all_rules
+
+    visitor = AvengersVisitor()
+    found = [out for rule in all_rules() if rule.kind == "stdlib_factory"
+             if not isinstance(out := rule.accept(visitor), Refused)]
+    return tuple(found)
+
+
+__all__ = ["nonempty_seed_for_type", "stdlib_admission", "factories"]

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from tharkun.solve.contracts._helpers import dunder_propagation_claims, never_claims
 from tharkun.solve.contracts.rules import Rule, Shape, register_rule
-from tharkun.solve.contracts.types import Contract, Effects, ReturnSpec
+from tharkun.solve.contracts.types import Contract, Effects, OtherRaiseClaim, ReturnSpec, RaiseArgsCase, ScopedArgsRaiseClaim
 
 _DOCS = "https://docs.python.org/3.14/library/functions.html"
 
@@ -73,10 +73,38 @@ class Int(Rule):
     TWINS = {}
 
     names = ("int",)
+
+    @staticmethod
+    def literal_valid(s, base):
+        """Exact str lexical grammar, before the separate process digit-limit check."""
+        import unicodedata
+        if base != 0 and not 2 <= base <= 36:
+            return False
+        normalized = ''.join(' ' if ord(c)>127 and c.isspace() else
+                             str(unicodedata.decimal(c)) if c.isdecimal() else c for c in s)
+        digits = normalized.strip(' \t\n\r\v\f')
+        if digits[:1] in ('+', '-'):
+            digits = digits[1:]
+        if not digits:
+            return False
+        prefix = {'0b':2, '0o':8, '0x':16}.get(digits[:2].lower())
+        if prefix is not None and base in (0, prefix):
+            base, digits = prefix, digits[2:]
+            if digits.startswith('_'):
+                digits = digits[1:]
+        elif base == 0:
+            base = 10
+            if digits.startswith('0') and any(c not in '0_' for c in digits):
+                return False
+        if not digits or digits.startswith('_') or digits.endswith('_') or '__' in digits:
+            return False
+        alphabet = '0123456789abcdefghijklmnopqrstuvwxyz'
+        return all(c == '_' or c.isascii() and c.lower() in alphabet[:base] for c in digits)
+
     CONTRACT = Contract(
         qualname="int",
         raises=dunder_propagation_claims(
-            "__int__ (tried first), then __index__",
+            "__int__ (tried first), then __index__; explicit base coercion can call base.__index__",
             native={
                 "TypeError": (
                     "single-arg form: x has neither __int__ nor __index__ and is not "
@@ -84,22 +112,33 @@ class Int(Rule):
                     "returns something that is not an int (or subclass); or the "
                     "invoked __int__/__index__ itself raises TypeError. "
                     "__trunc__ is NOT consulted (removed; folk wisdom from Python 2). "
-                    "two-arg form int(x, base): raised whenever x is not "
-                    "str/bytes/bytearray, regardless of any dunders x defines -- no "
-                    "dunder is invoked in this form at all"
+                    "two-arg form int(x, base): after successful base coercion, x is not "
+                    "str/bytes/bytearray (input conversion dunders are not used); or base "
+                    "cannot supply an integer index, returns the wrong type, or its __index__ raises TypeError; "
+                    "wrong argument binding also raises TypeError"
                 ),
             },
             tested_native=frozenset({"TypeError"}),
         ),
         may_raise_other=True,  # unparseable str, out-of-range base: ValueError
         returns=ReturnSpec("int", tested=True),
-        effects=Effects(deterministic=True),
+        effects=Effects(deterministic=False, clock_or_env=True,
+                        notes='non-power-of-two string conversion observes sys.int_max_str_digits; user coercion callbacks remain open'),
         source=(
-            f"{_DOCS}#int", "CPython Objects/longobject.c::long_new_impl",
+            f"{_DOCS}#int", "https://github.com/python/cpython/blob/3.14/Objects/longobject.c",
+            "https://docs.python.org/3.14/library/stdtypes.html#integer-string-conversion-length-limitation",
             "CPython Objects/abstract.c::PyNumber_Long",
             "CPython Lib/test/test_int.py::IntSubclassTests (v3.14.4, __trunc__ non-fallback)",
         ),
-        notes="two-arg form has NO dunder-propagation path (see condition text); tests cover both forms separately.",
+        other_raises=(
+            OtherRaiseClaim('ValueError', 'exact str s and exact int/bool base: base is neither 0 nor in [2,36]',
+                            ('int() base must be >= 2 and <= 36, or 0',), True, 'invalid-base'),
+            OtherRaiseClaim('ValueError', 'exact str s, valid exact int/bool base, and Int.literal_valid(s,base) is false',
+                            ('invalid literal for int() with base {base}: {literal_repr}',), True, 'invalid-literal'),
+            OtherRaiseClaim('ValueError', 'exact str s has valid lexical syntax in a non-power-of-two effective base; enabled sys.int_max_str_digits is exceeded by the digit count (sign, whitespace, underscores and prefix excluded)',
+                            ('Exceeds the limit ({limit} digits) for integer string conversion: value has {digits} digits; use sys.set_int_max_str_digits() to increase the limit',), True, 'digit-limit'),
+        ),
+        notes='Explicit-base form does not call the string input conversion hooks, but base.__index__ can run. Literal claims are scoped to exact str and primitive bases; arbitrary callback exceptions remain open.',
         tested=True,
     )
 
@@ -146,20 +185,16 @@ class Str(Rule):
     CONTRACT = Contract(
         qualname="str",
         raises=dunder_propagation_claims(
-            "__str__",
+            "__str__/__repr__, or codec/error-handler callbacks in object/decoded-buffer forms",
             native={
-                "TypeError": "__str__ is defined and returns something that is not a str",
+                "TypeError": "wrong binding; non-str __str__/__repr__ result; failed decoded-form buffer acquisition (its error is converted), invalid encoding/errors kinds, or codec/error-handler callback propagation",
             },
             tested_native=frozenset({"TypeError"}),
         ),
         may_raise_other=True,
         returns=ReturnSpec("str", tested=True),
-        effects=Effects(deterministic=True),
-        notes=(
-            "every object has a __str__ (object.__str__ falls back to __repr__), so "
-            "str(x) never raises for 'missing protocol' the way len()/int() do -- the "
-            "only native TypeError is a bad __str__ return value."
-        ),
+        effects=Effects(deterministic=False,clock_or_env=True,may_execute_callback=True,notes="decoded forms can observe codec/error-handler registries"),
+        notes="The object form falls back from object.__str__ to __repr__; decoded forms accept buffer providers plus encoding/errors. Failed buffer acquisition is rewritten to TypeError, while codec/error-handler exceptions propagate. str() with no arguments returns the empty str.",
         source=(f"{_DOCS}#func-str", "CPython Objects/object.c::object_str"),
         tested=True,
     )
@@ -229,6 +264,21 @@ class Round(Rule):
     )
 
 
+_DIVMOD_TYPES=('int','bool','float','str','NoneType','list','tuple','dict')
+_DIVMOD_NUMERIC=frozenset(('int','bool','float'))
+_DIVMOD_TYPE_CASES=tuple(
+    RaiseArgsCase('native-types-'+left+'-'+right,
+        f'exact builtin {left} and {right} operands; no target hook; native operation is unsupported',
+        (f"unsupported operand type(s) for divmod(): '{left}' and '{right}'",),True)
+    for left in _DIVMOD_TYPES for right in _DIVMOD_TYPES
+    if not {left,right} <= _DIVMOD_NUMERIC)
+_DIVMOD_BINDING_CASES=tuple(RaiseArgsCase('native-arity-'+str(n),
+    f'no keywords and exactly {n} positional arguments; binding fails before operand protocols',
+    (f'divmod expected 2 arguments, got {n}',),True) for n in range(9) if n!=2)+(RaiseArgsCase(
+    'native-keywords','one or more keywords; native positional-only binding rejects them',
+    ('divmod() takes no keyword arguments',),True),)
+
+
 @register_rule
 class Divmod(Rule):
     """The rule of ``divmod``."""
@@ -239,18 +289,23 @@ class Divmod(Rule):
     names = ("divmod",)
     CONTRACT = Contract(
         qualname="divmod",
-        raises=dunder_propagation_claims(
-            "__divmod__",
+        raises=tuple(ScopedArgsRaiseClaim(c.exc,c.condition,c.tested,args_cases=(
+                RaiseArgsCase('native-zero','exact builtin int/bool/float operands, successful numeric conversion, divisor equals 0 or signed 0.0',
+                              ('division by zero',),True),)) if c.exc=='ZeroDivisionError' else
+                     ScopedArgsRaiseClaim(c.exc,c.condition,c.tested,args_cases=_DIVMOD_TYPE_CASES+_DIVMOD_BINDING_CASES)
+                     if c.exc=='TypeError' else c for c in dunder_propagation_claims(
+            "__divmod__/__rdivmod__ (their exceptions and arbitrary return values propagate)",
             native={
-                "TypeError": "the operand types have no __divmod__/__rdivmod__ (e.g. divmod(complex, ...), divmod('a','b'))",
-                "ZeroDivisionError": "the second argument is a numeric zero (int 0, float 0.0)",
+                "TypeError": "wrong positional-only binding, unsupported operand types (including complex), or an operand protocol raises TypeError",
+                "ZeroDivisionError": "supported builtin numeric operands after successful conversion: divisor is zero; also propagates operand-hook ZeroDivisionError with arbitrary args",
             },
             tested_native=frozenset({"TypeError", "ZeroDivisionError"}),
-        ),
+        )),
         may_raise_other=True,
-        returns=ReturnSpec("tuple[int, int] | tuple[float, float]", "(a // b, a % b)", tested=True),
-        effects=Effects(deterministic=True),
-        source=(f"{_DOCS}#divmod", "CPython Objects/abstract.c::PyNumber_Divmod"),
+        returns=ReturnSpec("object", "builtin int/bool operands return tuple[int,int]; a float operand returns tuple[float,float]; an open __divmod__/__rdivmod__ can return any object", tested=True),
+        effects=Effects(deterministic=True,may_execute_callback=True),
+        source=(f"{_DOCS}#divmod", "https://github.com/python/cpython/blob/3.14/Objects/abstract.c", "CPython3.14 Objects/longobject.c and floatobject.c numeric slots"),
+        notes="Mixed int/float conversion can raise OverflowError before a zero divisor is checked; arbitrary-precision int/int divmod has no float conversion. Float rounding/NaN/infinity semantics are native, not an exact-real identity.",
         tested=True,
     )
 
@@ -284,14 +339,15 @@ class Pow(Rule):
             tested_native=frozenset({"TypeError", "ZeroDivisionError"}),
         ),
         may_raise_other=True,  # pow(x, y, 0) and mod-inverse failure are ValueError
-        returns=ReturnSpec("int | float | complex", tested=True),
+        returns=ReturnSpec("object", "numeric result for builtin numbers; a user power hook may return any object", tested=True),
         effects=Effects(deterministic=True),
         notes=(
             "pow(x, y, 0) raises ValueError ('pow() 3rd argument cannot be 0'), NOT "
             "ZeroDivisionError -- despite the name, confirmed on 3.14.4; only the "
             "2-argument pow(0-or-0.0-or-0j, negative) path raises ZeroDivisionError."
         ),
-        source=(f"{_DOCS}#pow", "CPython Objects/abstract.c::ternary_op"),
+        source=("https://docs.python.org/3.14/library/functions.html#pow",
+                "https://github.com/python/cpython/blob/3.14/Objects/abstract.c"),
         tested=True,
     )
 
@@ -372,7 +428,7 @@ class Sum(Rule):
             tested_native=frozenset({"TypeError"}),
         ),
         may_raise_other=True,
-        returns=ReturnSpec("numeric (matches the +-closure of start and the elements)", "start + sum(iterable)", tested=True),
+        returns=ReturnSpec("object", "start for an empty iterable; otherwise the native addition result, including lists and arbitrary custom addition results; builtin float/complex sums use their native compensated algorithm", tested=True),
         effects=Effects(deterministic=True),
         notes="sum(['a','b'], '') raises TypeError even though start='' is a str -- confirmed on 3.14.4.",
         source=(f"{_DOCS}#sum", "CPython Python/bltinmodule.c::builtin_sum_impl"),

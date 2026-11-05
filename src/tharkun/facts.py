@@ -243,8 +243,8 @@ class FactStore:
         a different type.
 
         Collapsing to a single winner throws that away and points a generator at one
-        shape. The rest of the codebase already knows better: ``type_hints`` fuses
-        signals into a TypeDistribution and ``candidate_typings`` enumerates joint
+        shape. The rest of the codebase already knows better: ``tharkun.typeinfer`` fuses
+        signals into ranked candidates and ``candidate_typings`` enumerates joint
         typings so a sound decider can solve each. This is the same idea for the store —
         callers should generate over the union rather than bet on the mode.
 

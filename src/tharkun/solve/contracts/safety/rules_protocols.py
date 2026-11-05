@@ -222,6 +222,14 @@ def protocol_cases(qualname: str, exception: str, binding: Binding) -> tuple[Cas
         return _truthiness_cases(binding)
     if qualname == "protocol.iteration":
         return _iteration_cases(binding)
+    if qualname == "protocol.contains_fallback":
+        values = _operands(binding, 1, {"In", "NotIn"}) if binding.op is not None else _operands(binding, 1, None)
+        if isinstance(values, Refused):
+            return values
+        return tuple(
+            _make_case(values, pair, not (pair[0] == "str" and pair[1] == "str"))
+            for pair in product(SCALAR_TAG_ORDER, repeat=2)
+        )
     if qualname == "protocol.comparison":
         values = _operands(binding, 1, _COMPARISON_OPS)
         if isinstance(values, Refused):
@@ -265,6 +273,7 @@ CASES_BUILDERS = {
     ("protocol.attribute_access", "TypeError"): attribute_cases,
     ("protocol.truthiness", "TypeError"): protocol_cases,
     ("protocol.iteration", "TypeError"): protocol_cases,
+    ("protocol.contains_fallback", "TypeError"): protocol_cases,
     ("protocol.comparison", "TypeError"): protocol_cases,
     ("protocol.binary_operator", "TypeError"): protocol_cases,
     ("protocol.binary_operator", "ZeroDivisionError"): protocol_cases,

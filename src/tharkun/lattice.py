@@ -416,7 +416,8 @@ class FactState(_Lattice):
             return BOTTOM
         merged = {name: self.vars.get(name, VarState()).meet(other.vars.get(name, VarState()))
                   for name in set(self.vars) | set(other.vars)}
-        return FactState(merged, self.clauses.meet(other.clauses))
+        clauses = self.clauses.meet(other.clauses)
+        return FactState(merged, clauses, bool(clauses.contradictions()))
 
     def is_top(self) -> bool:
         return not self.unreachable and not self.vars and self.clauses.is_top()

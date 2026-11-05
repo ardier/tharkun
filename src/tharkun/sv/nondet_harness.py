@@ -141,7 +141,7 @@ def drive(program: str, draws: list, target_line: int | None = None, *, files=No
             try:
                 # Execute the admitted snapshot; trusted import-root probes ran before confinement.
                 sys.argv = _child.initial_argv(real_path, source)
-                if b"orig_argv" in source:
+                if _child.references_orig_argv(source):
                     _child._State.flags.add("orig_argv")
                 if _child.references_stack(source):
                     _child._State.flags.add("stack_unmodelled")

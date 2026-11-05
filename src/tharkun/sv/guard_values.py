@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import math
 import time
 
 from tharkun.solve.arith import free_names, solve_int_guard
@@ -195,6 +196,91 @@ def _is_kind(kind: str, v) -> bool:
     return isinstance(v, str)
 
 
+def proved_lines(records) -> set:
+    """Skip a source line only when every published check there is safe."""
+    safe = {}
+    for record in records or ():
+        line = record.get("line")
+        safe[line] = safe.get(line, True) and record.get("status") == "safe"
+    return {line for line, proven in safe.items() if proven}
+
+
+def record_seeds(tree, records, *, solve=False, budget_seconds=3.0) -> dict:
+    """Site-local draw candidates, constrained by absint's failure state; never global input bounds."""
+    deadline = time.process_time() + budget_seconds
+    bodies = {"<main>": [tree.body], "<module>": [tree.body]}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bodies.setdefault(node.name, []).append(node.body)
+    scopes, out = {}, {}
+    for record in records or ():
+        if time.process_time() >= deadline:
+            break
+        if record.get("status") != "may_raise" or not record.get("residual"):
+            continue
+        function = record.get("function", "<main>")
+        if len(bodies.get(function, ())) != 1:
+            continue
+        if function not in scopes:
+            scopes[function] = _Scope(bodies[function][0])
+        scope = scopes[function]
+        parts = []
+        for text in [*record.get("scope", ()), record["residual"]]:
+            try:
+                expression = ast.parse(text, mode="eval").body
+                expression = _Inline(scope, record["line"]).visit(expression)
+            except (TypeError, SyntaxError, ValueError, RecursionError):
+                continue
+            if free_names(expression) <= scope.draws.keys():
+                parts.append(expression)
+        if not parts:
+            continue
+        names = set().union(*(free_names(part) for part in parts))
+        if solve and names and all(scope.draws[name] == "int" for name in names):
+            result = solve_int_guard(ast.BoolOp(op=ast.And(), values=parts), names)
+            if result.status == "sat":
+                for value in result.witness.values():
+                    if value not in out.setdefault("int", []):
+                        out["int"].append(value)
+        bounds = {}
+        for part in parts:
+            if (not isinstance(part, ast.Compare) or len(part.ops) != 1 or len(part.comparators) != 1
+                    or not isinstance(part.left, ast.Name)):
+                continue
+            name, other, op = part.left.id, part.comparators[0], part.ops[0]
+            kind = scope.draws.get(name)
+            try:
+                bound = ast.literal_eval(other)
+            except (ValueError, SyntaxError, TypeError):
+                continue
+            if (kind not in ("int", "float") or type(bound) not in (int, float)
+                    or kind == "int" and type(bound) is not int):
+                continue
+            lo, hi = bounds.get((name, kind), (None, None))
+            try:
+                value = float(bound) if kind == "float" else bound
+            except OverflowError:
+                continue
+            if kind == "float" and not math.isfinite(value):
+                continue
+            if isinstance(op, (ast.Gt, ast.GtE, ast.Eq)):
+                lower = ((math.nextafter(value, math.inf) if kind == "float" else value + 1)
+                         if isinstance(op, ast.Gt) else value)
+                lo = lower if lo is None else max(lo, lower)
+            if isinstance(op, (ast.Lt, ast.LtE, ast.Eq)):
+                upper = ((math.nextafter(value, -math.inf) if kind == "float" else value - 1)
+                         if isinstance(op, ast.Lt) else value)
+                hi = upper if hi is None else min(hi, upper)
+            bounds[(name, kind)] = lo, hi
+        for (_name, kind), (lo, hi) in bounds.items():
+            if lo is not None and hi is not None and lo > hi:
+                continue
+            for value in (lo, hi):
+                if value is not None and value not in out.setdefault(kind, []):
+                    out[kind].append(value)
+    return out
+
+
 def _solve_line(program: str, lineno: int, polarity: bool, draws: dict) -> dict:
     """``solve_condition``'s first verified answer for the guard at ``lineno``, values decoded."""
     from tharkun.solve.condition import solve_condition
@@ -224,7 +310,7 @@ def _solve_line(program: str, lineno: int, polarity: bool, draws: dict) -> dict:
 
 
 def seed_values(program: str, *, max_guards: int = 400, budget_seconds: float = 3.0,
-                log=None) -> dict[str, list]:
+                log=None, records=None) -> dict[str, list]:
     """Candidate draw values, per kind, solved from ``program``'s guards."""
     say = log or (lambda msg: None)
     try:
@@ -236,8 +322,9 @@ def seed_values(program: str, *, max_guards: int = 400, budget_seconds: float = 
     t0 = time.process_time()
     bodies = [tree.body] + [n.body for n in ast.walk(tree)
                             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
-    out: dict[str, list] = {}
-    seen: set = set()
+    out: dict[str, list] = record_seeds(tree, records, solve=True, budget_seconds=budget_seconds) if records else {}
+    seen: set = {(kind, repr(value)) for kind, values in out.items() for value in values}
+    safe = proved_lines(records)
     solved = tried = 0
 
     def add(kind, v):
@@ -252,6 +339,8 @@ def seed_values(program: str, *, max_guards: int = 400, budget_seconds: float = 
             continue
         ints = {n for n, k in scope.draws.items() if k == "int"}
         for lineno, parts in _guards(body):
+            if lineno in safe:
+                continue
             if tried >= max_guards or time.process_time() - t0 > budget_seconds:
                 say(f"guard_values: cap reached after {tried} guards")
                 return out

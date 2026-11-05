@@ -260,7 +260,7 @@ _CONTRACTS = (
             tested_native=frozenset({"TypeError"}),
         ),
         may_raise_other=True,
-        returns=ReturnSpec("float", "an exact, order-independent sum -- unlike sum(), immune to float-addition rounding drift", tested=True),
+        returns=ReturnSpec("float", "accurate floating-point sum rounded to float; intermediate overflow and platform rounding can depend on evaluation order", tested=True),
         effects=Effects(deterministic=True),
         notes="ValueError for -inf + inf; OverflowError for an intermediate overflow or an int too large for a float.",
         source=(f"{_DOCS}#math.fsum", "CPython Modules/mathmodule.c::math_fsum"),

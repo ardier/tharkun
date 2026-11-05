@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from tharkun.solve.contracts._helpers import dunder_propagation_claims, never_claims
 from tharkun.solve.contracts.rules import Rule, Shape, register_rule
-from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec
+from tharkun.solve.contracts.types import ALL_PROPERTY_CLASSES, Contract, Effects, ReturnSpec, RaiseArgsCase, ScopedArgsRaiseClaim
 
 _DOCS = "https://docs.python.org/3.14/library/stdtypes.html#str"
 _ALL_TESTED = frozenset(ALL_PROPERTY_CLASSES)
@@ -57,7 +57,7 @@ class StrJoin(Rule):
             tested_native=frozenset({"TypeError"}),
         ),
         may_raise_other=True,  # INHERITED REVIEW FIX: the iterable's __iter__/__next__ is arbitrary user code; may raise ValueError, a custom exception, etc.
-        returns=ReturnSpec("str", "self.join(iterable of N strs) has length sum(len(s) for s in iterable) + len(self) * (N - 1)", tested=True),
+        returns=ReturnSpec("str", "self.join(iterable of N strs) has length sum(len(s) for s in iterable) + len(self) * max(N - 1, 0)", tested=True),
         effects=Effects(deterministic=True, may_execute_callback=True),
         source=(_DOCS, "CPython Objects/stringlib/join.h::STRINGLIB(join)"),
         tested=True,
@@ -243,14 +243,15 @@ class StrEncode(Rule):
     names = ("str.encode",)
     CONTRACT = Contract(
         qualname="str.encode",
-        raises=never_claims(
-            native={"TypeError": "encoding or errors is given and is not a str"},
-            tested=_ALL_TESTED,
+        raises=dunder_propagation_claims(
+            "codec-registry search, encoder or error-handler callbacks",
+            native={"TypeError": "encoding/errors is not a str, wrong binding, or a codec callback propagates TypeError"},
+            tested_native=frozenset({"TypeError"}),
         ),
         may_raise_other=True,  # LookupError: unknown encoding/errors handler; UnicodeEncodeError (a ValueError subclass)
         returns=ReturnSpec("bytes", tested=True),
-        effects=Effects(deterministic=True),
-        notes="the receiver is a real str and encoding/errors are type-checked directly, so no property class ever fires here -- only LookupError/UnicodeEncodeError, neither of which is one of the 7.",
+        effects=Effects(deterministic=False, clock_or_env=True, may_execute_callback=True, notes="reads the process codec and error-handler registries"),
+        notes="Names are type-checked as str, but encoding lookup, custom encoders and error handlers execute registered user callbacks whose exceptions propagate.",
         source=(_DOCS, "CPython Objects/unicodeobject.c::PyUnicode_AsEncodedString"),
         tested=True,
     )
@@ -293,18 +294,23 @@ class StrGetitem(Rule):
     names = ("str.__getitem__",)
     CONTRACT = Contract(
         qualname="str.__getitem__",
-        raises=dunder_propagation_claims(
+        raises=tuple(ScopedArgsRaiseClaim(c.exc,c.condition,c.tested,args_cases=(
+            RaiseArgsCase('native-bounds','exact builtin receiver and exact int/bool key representable as Py_ssize_t, outside -len(self) <= key < len(self)',
+                          ('string index out of range',),True),
+            RaiseArgsCase('oversized-int','exact builtin receiver and exact int key outside Py_ssize_t range; conversion fails before length adjustment',
+                          ("cannot fit 'int' into an index-sized integer",),True),
+        )) if c.exc=='IndexError' else c for c in dunder_propagation_claims(
             "the key argument's __index__ (for an int key)",
             native={
                 "TypeError": "key is neither an int-like object nor a slice",
-                "IndexError": "key is an int-like index outside [-len(self), len(self))",
+                "IndexError": "integer conversion does not fit Py_ssize_t, or converted index is outside [-len(self), len(self)), or key.__index__ raises IndexError",
             },
             tested_native=frozenset({"TypeError", "IndexError"}),
-        ),
+        )),
         may_raise_other=True,
         returns=ReturnSpec("str", "a single-character str for an int key, or str for a slice key; a slice never raises IndexError (out-of-range bounds are clamped)", tested=True),
         effects=Effects(deterministic=True),
-        source=(_DOCS, "CPython Objects/unicodeobject.c::unicode_subscript"),
+        source=(_DOCS, "https://github.com/python/cpython/blob/3.14/Objects/unicodeobject.c", "CPython 3.14::unicode_subscript"),
         tested=True,
     )
 
@@ -313,6 +319,12 @@ class StrGetitem(Rule):
 
 def _string_contract(name, result, type_error, notes):
     callbacks = name in {"center","count","expandtabs","find","format_map","ljust","rfind","rindex","rjust","rsplit","splitlines","translate","zfill"}
+    if name in {"center", "ljust", "rjust"}:
+        notes += (f"; CPython 3.14.4 TypeError args ('{name} expected at least 1 argument, got 0',) for missing width; "
+                  "(\"'str' object cannot be interpreted as an integer\",) for str width; "
+                  "('The fill character must be exactly one character long',) for invalid fill length; "
+                  "('The fill character must be a unicode character, not int',) for int fill; "
+                  f"('str.{name}() takes no keyword arguments',) for keywords")
     native = {"TypeError": type_error}
     if name == "format_map":
         native["KeyError"] = "missing named replacement field"
@@ -529,7 +541,10 @@ class StrPartition(Rule):
     names = ('str.partition',)
     SAMPLES = {'str.partition': 'x = "a:b".partition(":")\n'}
     TWINS = {}
-    CONTRACT = _string_contract('partition', 'tuple[str,str,str]', 'sep is not str; wrong argument count', 'ValueError if sep is empty')
+    CONTRACT = _string_contract('partition', 'tuple[str,str,str]', 'sep is not str; wrong argument count or keywords',
+        "ValueError args ('empty separator',) if sep is empty; TypeError args ('must be str, not int',) for int sep; "
+        "('str.partition() takes exactly one argument (0 given)',) for missing sep; "
+        "('str.partition() takes no keyword arguments',) for keywords (CPython 3.14.4)")
 
 
 @register_rule
@@ -577,7 +592,10 @@ class StrRpartition(Rule):
     names = ('str.rpartition',)
     SAMPLES = {'str.rpartition': 'x = "a:b".rpartition(":")\n'}
     TWINS = {}
-    CONTRACT = _string_contract('rpartition', 'tuple[str,str,str]', 'sep is not str; wrong argument count', 'ValueError if sep is empty')
+    CONTRACT = _string_contract('rpartition', 'tuple[str,str,str]', 'sep is not str; wrong argument count or keywords',
+        "ValueError args ('empty separator',) if sep is empty; TypeError args ('must be str, not int',) for int sep; "
+        "('str.rpartition() takes exactly one argument (0 given)',) for missing sep; "
+        "('str.rpartition() takes no keyword arguments',) for keywords (CPython 3.14.4)")
 
 
 @register_rule

@@ -66,8 +66,10 @@ from tharkun.sv.store_witness import bind_route
 
 
 def prove_static(program: str, classes, *, remaining=None, log=None, files=None):
-    """``proof:no-site`` (``solve/census.py``): no construct of the program can raise
-    ``classes``.  Static and instant; a TRUE ``Verdict`` or None."""
+    """``proof:no-site``: a complete inventory route excludes uncaught ``classes``.
+
+    Static only; a TRUE ``Verdict`` or None. Caught sites need not be absent.
+    """
     from tharkun.solve.census import site_census
     from tharkun.sv.engine import Verdict, read_source
 
@@ -115,7 +117,6 @@ def prove(program: str, classes, *, python: str | None = None, budget: float = 6
 PROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_probe.py")
 HASH_SEEDS = (0, 1)
 MAX_RUNS = 400
-MAX_FINITE = 64
 
 
 
@@ -169,7 +170,7 @@ def _read(program: str, say):
 
 def prove_dynamic(program: str, classes, *, python: str, remaining, jobs: int = 1, log=None,
                   run_timeout: float = 120.0, memory_bytes: int | None = None, knowledge=None,
-                  files=None):
+                  files=None, exact_attempted=False):
     """The proofs that run the program: a TRUE/FALSE ``Verdict`` or ``None``.  Today
     ``proof:stationary``.  ``remaining()`` is the CPU budget left, which the caller keeps.
 
@@ -187,6 +188,12 @@ def prove_dynamic(program: str, classes, *, python: str, remaining, jobs: int = 
     # exception class error-site anchor reaches; it must not blind the
     # determinism census to order-sensitivity elsewhere in the program ([internal ref]).
     det = determinism_census(original, program, declared_files=files or ())
+    class_only = False
+    if not det.ok:
+        # The independent census still refuses every in-flight exception observer and callback.
+        det = determinism_census(original, program, declared_files=files or (),
+                                 class_only_exceptions=True)
+        class_only = det.ok
     if not det.ok:
         # "deterministic between draws" is what makes one run per stand-in vector enough
         say(f"prove: stationary: determinism not certified ({det.reason})")
@@ -209,7 +216,13 @@ def prove_dynamic(program: str, classes, *, python: str, remaining, jobs: int = 
             return None
     verdict = _stationary(program, classes, plan, python=python, remaining=remaining,
                           run_timeout=run_timeout, memory_bytes=memory_bytes, jobs=jobs, say=say,
-                          knowledge=knowledge, files=files)
+                          knowledge=knowledge, files=files, exact_attempted=exact_attempted)
+    if class_only:
+        # Only a TRUE proof may rely on class-only determinism.
+        if verdict is None or verdict.verdict != "true":
+            return None
+        verdict.reason += "; exceptions judged by class (no in-flight observer)"
+        verdict.detail["class_only_exceptions"] = True
     if route_parents is None:
         return verdict
     return bind_route(verdict, "stationary", original, program, classes,
@@ -237,8 +250,24 @@ def _write_loop_trip_count(knowledge, res: dict) -> None:
 
 
 def _stationary(program, classes, plan, *, python, remaining, run_timeout, memory_bytes, jobs, say,
-                knowledge=None, files=None):
+                knowledge=None, files=None, exact_attempted=False):
     from tharkun.sv.engine import Outcome, Verdict, _replayed, _resource_exhausted, _witness, run_once
+    if any(site.kind == "value" for site in plan.draws):
+        if exact_attempted:
+            say("prove: stationary: full-domain integer values need an exact whole-program proof")
+            return None
+        # A raw integer is not a stationary loop count or a sampled finite domain.
+        from tharkun.sv import product_proof
+        source = _read(program, say)
+        left = remaining()
+        if source is None or left <= 1:
+            return None
+        verdict = product_proof.prove(source, tuple(classes), program=program, python=python,
+                                     timeout_ms=product_proof.z3_timeout_ms(left),
+                                     run_timeout=max(1.0, min(run_timeout, left)))
+        if verdict is None:
+            say("prove: stationary: full-domain integer values need an exact whole-program proof")
+        return verdict
     files = files if files is not None else [os.path.abspath(program)]
     loops = [{"line": lp.line, "col": lp.col, "dead": list(lp.dead), "m": max(lp.offset, 1)}
              for lp in plan.loops]
@@ -255,8 +284,8 @@ def _stationary(program, classes, plan, *, python, remaining, run_timeout, memor
         if kind == "bool":
             return [False, True]
         if kind == "rindex":
-            n = int(rec.get("n") or 0)
-            return list(range(n)) if 0 < n <= MAX_FINITE else None
+            n = rec.get("n")
+            return range(n) if type(n) is int and n > 0 else None
         if kind == "str":
             # [internal ref] follow-up: a str draw plan_draws classified "str_truthy" (used
             # ONLY for truthiness and as open()'s own path -- see drawflow.py's own
@@ -275,16 +304,16 @@ def _stationary(program, classes, plan, *, python, remaining, run_timeout, memor
             return None
         if site.kind == "trip":
             m = max(site.offset, 1)
-            return list(range(0, m + 2 - site.offset))
+            return range(0, m + 2 - site.offset)
         if site.kind == "quotient":
             mod = res.get("moduli", {}).get(str(index))
             if mod is None:
                 # the reduction never ran: the run ended first, the same for every value
                 return [0] if index == len(res.get("draws", [])) - 1 else None
             tname, k = mod
-            if tname != "int" or not isinstance(k, int) or abs(k) > MAX_FINITE:
+            if tname != "int" or type(k) is not int:
                 return None
-            return list(range(abs(k))) or [0]
+            return range(abs(k)) or [0]
         return None
 
     def check(res: dict) -> str | None:
@@ -323,6 +352,9 @@ def _stationary(program, classes, plan, *, python, remaining, run_timeout, memor
                                                       timeout=timeout, hashseed=vs[1],
                                                       memory_bytes=child_memory, output_files=plan.output_files, files=files), jobs_list))
             runs += len(jobs_list)
+            if remaining() <= 0:
+                say("prove: stationary: out of budget")
+                return None
             by_vec = {}
             for (vec, seed), res in zip(jobs_list, outs):
                 by_vec.setdefault(json.dumps(vec), []).append(res)
@@ -373,6 +405,18 @@ def _stationary(program, classes, plan, *, python, remaining, run_timeout, memor
                             f"({rec.get('kind')}) has no finite stand-in domain")
                         return None
                     executed = draws0[j]["value"]
+                    # These ranges have unit step; their cardinality can exceed
+                    # Py_ssize_t, so neither len(range) nor a list is safe here.
+                    size = dom.stop - dom.start if isinstance(dom, range) else len(dom)
+                    covered = (isinstance(executed, int) and executed in dom
+                               if isinstance(dom, range) else executed in dom)
+                    available = (MAX_RUNS - runs) // len(HASH_SEEDS) - len(work)
+                    if size - int(covered) > available:
+                        say(f"prove: stationary: more than {MAX_RUNS} runs needed")
+                        return None
+                    if remaining() <= 0:
+                        say("prove: stationary: out of budget")
+                        return None
                     for v in dom:
                         if v == executed or (rec["kind"] == "bool" and bool(v) == bool(executed)):
                             continue
@@ -381,12 +425,15 @@ def _stationary(program, classes, plan, *, python, remaining, run_timeout, memor
                         if key not in done_vectors:
                             done_vectors.add(key)
                             work.append(child)
+    if remaining() <= 0:
+        say("prove: stationary: out of budget")
+        return None
     facts = [f"loop at line {lp.line}: trip count {lp.offset} + abs(draw), "
              f"state at head {max(lp.offset, 1) + 1} == head {max(lp.offset, 1) + 2}"
              for lp in plan.loops]
     for d in plan.draws:
         if d.kind == "quotient":
-            facts.append(f"draw at line {d.line}: reaches the program only as abs(d) % M")
+            facts.append(f"draw at line {d.line}: reaches the program only as abs(d) % M or d % M")
     v = Verdict("true", reason=f"proof:stationary: {runs} probe runs, {checked} stationary "
                                f"loop instance(s); " + "; ".join(facts))
     v.component, v.runs = "proof:stationary", runs
